@@ -1142,6 +1142,53 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_violation_on_update() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE u (id INT PRIMARY KEY, email TEXT UNIQUE)", None).unwrap();
+        engine.execute_sql("INSERT INTO u VALUES (1, 'a@x.com')", None).unwrap();
+        engine.execute_sql("INSERT INTO u VALUES (2, 'b@x.com')", None).unwrap();
+        let r = engine.execute_sql("UPDATE u SET email = 'a@x.com' WHERE id = 2", None);
+        assert!(r.is_err(), "updating to a duplicate UNIQUE value should fail");
+        // Updating row to its own value should work
+        engine.execute_sql("UPDATE u SET email = 'b@x.com' WHERE id = 2", None).unwrap();
+    }
+
+    #[test]
+    fn test_check_violation_on_update() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, age INT, CHECK (age >= 0))", None).unwrap();
+        engine.execute_sql("INSERT INTO c VALUES (1, 10)", None).unwrap();
+        let r = engine.execute_sql("UPDATE c SET age = -1 WHERE id = 1", None);
+        assert!(r.is_err(), "UPDATE that violates CHECK should fail");
+    }
+
+    #[test]
+    fn test_fk_violation_on_update() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE p (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))", None).unwrap();
+        engine.execute_sql("INSERT INTO p VALUES (1), (2)", None).unwrap();
+        engine.execute_sql("INSERT INTO c VALUES (10, 1)", None).unwrap();
+        let r = engine.execute_sql("UPDATE c SET pid = 99 WHERE id = 10", None);
+        assert!(r.is_err(), "UPDATE pointing to missing parent should fail");
+        engine.execute_sql("UPDATE c SET pid = 2 WHERE id = 10", None).unwrap();
+    }
+
+    #[test]
+    fn test_fk_restrict_on_delete() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE p (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id))", None).unwrap();
+        engine.execute_sql("INSERT INTO p VALUES (1)", None).unwrap();
+        engine.execute_sql("INSERT INTO c VALUES (10, 1)", None).unwrap();
+        let r = engine.execute_sql("DELETE FROM p WHERE id = 1", None);
+        assert!(r.is_err(), "DELETE of referenced parent should fail (RESTRICT)");
+        // Remove child first, then parent succeeds
+        engine.execute_sql("DELETE FROM c WHERE id = 10", None).unwrap();
+        engine.execute_sql("DELETE FROM p WHERE id = 1", None).unwrap();
+    }
+
+    #[test]
     fn test_serial_autoincrement() {
         let engine = setup_engine();
         engine.execute_sql("CREATE TABLE s (id SERIAL, name TEXT)", None).unwrap();

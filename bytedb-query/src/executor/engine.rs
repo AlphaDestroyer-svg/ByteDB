@@ -697,9 +697,7 @@ impl QueryEngine {
                     for (_, other_data) in &all {
                         if let Some(other) = Tuple::deserialize(other_data) {
                             if other.get(i) == Some(val) {
-                                return Err(QueryError::Execution(
-                                    format!("UNIQUE constraint violated for column '{}'", col.name)
-                                ));
+                                return Err(QueryError::unique_violation(&col.name));
                             }
                         }
                     }
@@ -711,9 +709,7 @@ impl QueryEngine {
                 let tup = Tuple::new(row_values.clone());
                 for chk in &table_data.check_exprs {
                     if !self.eval_predicate(chk, &tup, &table_data.schema) {
-                        return Err(QueryError::Execution(
-                            format!("CHECK constraint failed on table '{}'", table)
-                        ));
+                        return Err(QueryError::check_violation(table));
                     }
                 }
             }
@@ -746,9 +742,7 @@ impl QueryEngine {
                     }
                 }
                 if !found {
-                    return Err(QueryError::Execution(
-                        format!("FOREIGN KEY violation: no matching row in '{}'", fk.ref_table)
-                    ));
+                    return Err(QueryError::fk_violation(&fk.ref_table));
                 }
             }
 
@@ -853,11 +847,75 @@ impl QueryEngine {
                         if !col.nullable {
                             if let Some(val) = tuple.get(i) {
                                 if val.is_null() {
-                                    return Err(QueryError::Execution(
-                                        format!("NOT NULL constraint violated for column '{}'", col.name)
-                                    ));
+                                    return Err(QueryError::not_null_violation(&col.name));
                                 }
                             }
+                        }
+                    }
+
+                    // UNIQUE enforcement (skip current row by key)
+                    for (i, col) in table_data.schema.columns.iter().enumerate() {
+                        if col.unique && !col.primary_key {
+                            if let Some(val) = tuple.get(i) {
+                                if !val.is_null() {
+                                    let all = table_data.index.scan_all()
+                                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                                    for (other_key, other_data) in &all {
+                                        if other_key == &key { continue; }
+                                        if let Some(other) = Tuple::deserialize(other_data) {
+                                            if other.get(i) == Some(val) {
+                                                return Err(QueryError::Execution(
+                                                    format!("UNIQUE constraint violated for column '{}'", col.name)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // CHECK
+                    for chk in &table_data.check_exprs {
+                        if !self.eval_predicate(chk, &tuple, &table_data.schema) {
+                            return Err(QueryError::Execution(
+                                format!("CHECK constraint failed on table '{}'", table)
+                            ));
+                        }
+                    }
+
+                    // FOREIGN KEY (child→parent) on UPDATE
+                    for fk in &table_data.schema.foreign_keys {
+                        let mut child_vals: Vec<Value> = Vec::new();
+                        let mut any_null = false;
+                        for cname in &fk.columns {
+                            if let Some(idx) = table_data.schema.column_index(cname) {
+                                let v = tuple.get(idx).cloned().unwrap_or(Value::Null);
+                                if v.is_null() { any_null = true; break; }
+                                child_vals.push(v);
+                            }
+                        }
+                        if any_null { continue; }
+                        let parent = tables.get(&fk.ref_table)
+                            .ok_or_else(|| QueryError::Execution(format!("FK references unknown table '{}'", fk.ref_table)))?;
+                        let parent_idxs: Vec<usize> = fk.ref_columns.iter()
+                            .filter_map(|c| parent.schema.column_index(c)).collect();
+                        let parent_all = parent.index.scan_all()
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        let mut found = false;
+                        for (_, pdata) in &parent_all {
+                            if let Some(pt) = Tuple::deserialize(pdata) {
+                                let mut all_eq = true;
+                                for (j, pi) in parent_idxs.iter().enumerate() {
+                                    if pt.get(*pi) != Some(&child_vals[j]) { all_eq = false; break; }
+                                }
+                                if all_eq { found = true; break; }
+                            }
+                        }
+                        if !found {
+                            return Err(QueryError::Execution(
+                                format!("FOREIGN KEY violation: no matching row in '{}'", fk.ref_table)
+                            ));
                         }
                     }
 
@@ -922,6 +980,38 @@ impl QueryEngine {
                     true
                 };
                 if matches {
+                    // Referential integrity (RESTRICT): refuse delete if a child row references this row.
+                    for (other_name, other_td) in tables.iter() {
+                        if other_name == table { continue; }
+                        for fk in &other_td.schema.foreign_keys {
+                            if fk.ref_table != table { continue; }
+                            let parent_idxs: Vec<usize> = fk.ref_columns.iter()
+                                .filter_map(|c| table_data.schema.column_index(c)).collect();
+                            let mut parent_vals: Vec<Value> = Vec::new();
+                            let mut any_null = false;
+                            for pi in &parent_idxs {
+                                let v = tuple.get(*pi).cloned().unwrap_or(Value::Null);
+                                if v.is_null() { any_null = true; break; }
+                                parent_vals.push(v);
+                            }
+                            if any_null { continue; }
+                            let child_idxs: Vec<usize> = fk.columns.iter()
+                                .filter_map(|c| other_td.schema.column_index(c)).collect();
+                            let child_all = other_td.index.scan_all()
+                                .map_err(|e| QueryError::Execution(e.to_string()))?;
+                            for (_, cdata) in &child_all {
+                                if let Some(ct) = Tuple::deserialize(cdata) {
+                                    let mut all_eq = true;
+                                    for (j, ci) in child_idxs.iter().enumerate() {
+                                        if ct.get(*ci) != Some(&parent_vals[j]) { all_eq = false; break; }
+                                    }
+                                    if all_eq {
+                                        return Err(QueryError::fk_referenced(other_name));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(tid) = txn_id {
                         self.wal_append(LogRecord::Delete {
                             txn_id: tid,

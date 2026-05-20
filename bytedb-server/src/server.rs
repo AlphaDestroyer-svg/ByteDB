@@ -105,7 +105,11 @@ impl Server {
             let mut sequences: HashMap<String, Arc<SequenceGenerator>> = HashMap::new();
             for c in &schema.columns {
                 if c.auto_increment {
-                    sequences.insert(c.name.clone(), Arc::new(SequenceGenerator::new(1)));
+                    let start = table_snap.sequences.iter()
+                        .find(|(n, _)| n == &c.name)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1);
+                    sequences.insert(c.name.clone(), Arc::new(SequenceGenerator::new(start)));
                 }
             }
             let meta = TableMeta::new(table_snap.name.clone(), schema.clone(), table_snap.table_id);
@@ -126,11 +130,15 @@ impl Server {
 
         for (name, table_data) in tables.iter() {
             let entries = table_data.index.scan_all().unwrap_or_default();
+            let sequences: Vec<(String, i64)> = table_data.sequences.iter()
+                .map(|(c, s)| (c.clone(), s.counter.load(std::sync::atomic::Ordering::SeqCst)))
+                .collect();
             table_snapshots.push(TableSnapshot {
                 name: name.clone(),
                 table_id: table_data.schema.columns.len() as u32,
                 schema: table_data.schema.clone(),
                 entries,
+                sequences,
             });
         }
         drop(tables);

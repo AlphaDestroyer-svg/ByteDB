@@ -22,6 +22,33 @@ pub enum QueryError {
 
     #[error("Type error: {0}")]
     TypeError(String),
+
+    #[error("Constraint violation: {0}")]
+    Constraint(String),
+
+    #[error("Table '{0}' not found")]
+    TableNotFound(String),
+
+    #[error("Column '{0}' not found")]
+    ColumnNotFound(String),
+}
+
+impl QueryError {
+    pub fn unique_violation(col: &str) -> Self {
+        QueryError::Constraint(format!("UNIQUE constraint violated for column '{}'", col))
+    }
+    pub fn not_null_violation(col: &str) -> Self {
+        QueryError::Constraint(format!("NOT NULL constraint violated for column '{}'", col))
+    }
+    pub fn check_violation(table: &str) -> Self {
+        QueryError::Constraint(format!("CHECK constraint failed on table '{}'", table))
+    }
+    pub fn fk_violation(parent: &str) -> Self {
+        QueryError::Constraint(format!("FOREIGN KEY violation: no matching row in '{}'", parent))
+    }
+    pub fn fk_referenced(child: &str) -> Self {
+        QueryError::Constraint(format!("FOREIGN KEY violation: row in '{}' references this row", child))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;

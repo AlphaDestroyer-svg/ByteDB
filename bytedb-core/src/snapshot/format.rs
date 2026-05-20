@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use crate::tuple::schema::Schema;
 
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"BSDB";
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotFormat {
@@ -24,6 +24,9 @@ pub struct TableSnapshot {
     pub table_id: u32,
     pub schema: Schema,
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// (column_name, next_value) for SERIAL/auto-increment columns.
+    #[serde(default)]
+    pub sequences: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

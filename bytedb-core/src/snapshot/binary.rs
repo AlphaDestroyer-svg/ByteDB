@@ -45,6 +45,19 @@ pub fn serialize_snapshot<W: Write>(snapshot: &FullSnapshot, writer: &mut W) -> 
             writer.write_all(value)
                 .map_err(|e| CoreError::Internal(e.to_string()))?;
         }
+
+        // sequences (v2+)
+        writer.write_all(&(table.sequences.len() as u32).to_le_bytes())
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        for (col, val) in &table.sequences {
+            let cb = col.as_bytes();
+            writer.write_all(&(cb.len() as u32).to_le_bytes())
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
+            writer.write_all(cb)
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
+            writer.write_all(&val.to_le_bytes())
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
+        }
     }
 
     let checksum = crc32fast::hash(&[]);
@@ -67,7 +80,7 @@ pub fn deserialize_snapshot<R: Read>(reader: &mut R) -> Result<FullSnapshot> {
 
     reader.read_exact(&mut buf4).map_err(|e| CoreError::Internal(e.to_string()))?;
     let version = u32::from_le_bytes(buf4);
-    if version != SNAPSHOT_VERSION {
+    if version > SNAPSHOT_VERSION {
         return Err(CoreError::Internal(format!("Unsupported snapshot version: {}", version)));
     }
 
@@ -117,7 +130,26 @@ pub fn deserialize_snapshot<R: Read>(reader: &mut R) -> Result<FullSnapshot> {
             entries.push((key, value));
         }
 
-        tables.push(TableSnapshot { name, table_id, schema, entries });
+        let sequences = if version >= 2 {
+            reader.read_exact(&mut buf4).map_err(|e| CoreError::Internal(e.to_string()))?;
+            let n = u32::from_le_bytes(buf4) as usize;
+            let mut seqs = Vec::with_capacity(n);
+            for _ in 0..n {
+                reader.read_exact(&mut buf4).map_err(|e| CoreError::Internal(e.to_string()))?;
+                let cl = u32::from_le_bytes(buf4) as usize;
+                let mut cb = vec![0u8; cl];
+                reader.read_exact(&mut cb).map_err(|e| CoreError::Internal(e.to_string()))?;
+                let col = String::from_utf8(cb).map_err(|e| CoreError::Internal(e.to_string()))?;
+                reader.read_exact(&mut buf8).map_err(|e| CoreError::Internal(e.to_string()))?;
+                let v = i64::from_le_bytes(buf8);
+                seqs.push((col, v));
+            }
+            seqs
+        } else {
+            Vec::new()
+        };
+
+        tables.push(TableSnapshot { name, table_id, schema, entries, sequences });
     }
 
     Ok(FullSnapshot {
