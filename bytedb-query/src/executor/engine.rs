@@ -73,6 +73,9 @@ pub struct QueryEngine {
     tables: Arc<parking_lot::RwLock<HashMap<String, TableData>>>,
     wal: Option<Arc<LogManager>>,
     stmt_cache: parking_lot::Mutex<StmtCache>,
+    /// Logical database catalog (names only). Default db is `database.name()`.
+    databases: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
+    current_db: Arc<parking_lot::RwLock<String>>,
 }
 
 pub struct TableData {
@@ -85,22 +88,32 @@ pub struct TableData {
 
 impl QueryEngine {
     pub fn new(database: Arc<Database>, txn_manager: Arc<TransactionManager>) -> Self {
+        let default_name = database.name().to_string();
+        let mut dbs = std::collections::HashSet::new();
+        dbs.insert(default_name.clone());
         QueryEngine {
             database,
             txn_manager,
             tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             wal: None,
             stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
+            databases: Arc::new(parking_lot::RwLock::new(dbs)),
+            current_db: Arc::new(parking_lot::RwLock::new(default_name)),
         }
     }
 
     pub fn with_wal(database: Arc<Database>, txn_manager: Arc<TransactionManager>, wal: Arc<LogManager>) -> Self {
+        let default_name = database.name().to_string();
+        let mut dbs = std::collections::HashSet::new();
+        dbs.insert(default_name.clone());
         QueryEngine {
             database,
             txn_manager,
             tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             wal: Some(wal),
             stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
+            databases: Arc::new(parking_lot::RwLock::new(dbs)),
+            current_db: Arc::new(parking_lot::RwLock::new(default_name)),
         }
     }
 
@@ -229,6 +242,48 @@ impl QueryEngine {
                 Err(QueryError::Execution("Use Document engine for DOC operations".into()))
             }
             Statement::AlterTable(alter) => self.exec_alter_table(alter),
+            Statement::CreateDatabase { name, if_not_exists } => {
+                let mut dbs = self.databases.write();
+                if dbs.contains(&name) {
+                    if if_not_exists {
+                        return Ok(ExecutionResult::Ok(format!("Database {} already exists", name)));
+                    }
+                    return Err(QueryError::Execution(format!("Database '{}' already exists", name)));
+                }
+                dbs.insert(name.clone());
+                Ok(ExecutionResult::Ok(format!("Database {} created", name)))
+            }
+            Statement::DropDatabase { name, if_exists } => {
+                let current = self.current_db.read().clone();
+                if name == current {
+                    return Err(QueryError::Execution("Cannot drop the current database; USE another first".into()));
+                }
+                let mut dbs = self.databases.write();
+                if !dbs.contains(&name) {
+                    if if_exists {
+                        return Ok(ExecutionResult::Ok("OK".into()));
+                    }
+                    return Err(QueryError::Execution(format!("Database '{}' not found", name)));
+                }
+                dbs.remove(&name);
+                Ok(ExecutionResult::Ok(format!("Database {} dropped", name)))
+            }
+            Statement::UseDatabase(name) => {
+                let dbs = self.databases.read();
+                if !dbs.contains(&name) {
+                    return Err(QueryError::Execution(format!("Database '{}' not found", name)));
+                }
+                drop(dbs);
+                *self.current_db.write() = name.clone();
+                Ok(ExecutionResult::Ok(format!("Now using database {}", name)))
+            }
+            Statement::ShowDatabases => {
+                let dbs = self.databases.read();
+                let mut names: Vec<String> = dbs.iter().cloned().collect();
+                names.sort();
+                let rows: Vec<Vec<Value>> = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
+                Ok(ExecutionResult::Rows { columns: vec!["database".into()], rows })
+            }
             Statement::Union(left, right, all) => self.exec_union(*left, *right, all, txn_id),
             Statement::Intersect(left, right, all) => self.exec_intersect(*left, *right, all, txn_id),
             Statement::Except(left, right, all) => self.exec_except(*left, *right, all, txn_id),
@@ -405,11 +460,13 @@ impl QueryEngine {
 
         let mut schema = Schema::new(ct.name.clone(), columns);
         schema.check_constraints = ct.check_constraints.iter().map(|e| format!("{:?}", e)).collect();
-        schema.foreign_keys = ct.foreign_keys.iter().map(|(cols, t, rc)| {
+        schema.foreign_keys = ct.foreign_keys.iter().map(|fk| {
             bytedb_core::tuple::schema::ForeignKey {
-                columns: cols.clone(),
-                ref_table: t.clone(),
-                ref_columns: rc.clone(),
+                columns: fk.columns.clone(),
+                ref_table: fk.ref_table.clone(),
+                ref_columns: fk.ref_columns.clone(),
+                on_delete: ast_fk_action_to_core(fk.on_delete),
+                on_update: ast_fk_action_to_core(fk.on_update),
             }
         }).collect();
         // Per-column REFERENCES → foreign_keys
@@ -419,6 +476,8 @@ impl QueryEngine {
                     columns: vec![c.name.clone()],
                     ref_table: rt.clone(),
                     ref_columns: vec![rc.clone()],
+                    on_delete: ast_fk_action_to_core(c.on_delete),
+                    on_update: ast_fk_action_to_core(c.on_update),
                 });
             }
         }
@@ -681,14 +740,45 @@ impl QueryEngine {
                         }
                     }
                 }
+                // Auto-coerce string literals to native typed values
+                if !row_values[i].is_null() {
+                    if let Value::Text(s) = &row_values[i] {
+                        match col.data_type {
+                            DataType::Date => {
+                                if let Some(d) = bytedb_core::tuple::value::parse_date(s) {
+                                    row_values[i] = Value::Date(d);
+                                }
+                            }
+                            DataType::Uuid => {
+                                if let Some(b) = bytedb_core::tuple::value::parse_uuid(s) {
+                                    row_values[i] = Value::Uuid(b);
+                                }
+                            }
+                            DataType::Decimal => {
+                                if let Some((m, sc)) = bytedb_core::tuple::value::parse_decimal(s) {
+                                    row_values[i] = Value::Decimal(m, sc);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let Value::Int64(n) = &row_values[i] {
+                        if matches!(col.data_type, DataType::Decimal) {
+                            row_values[i] = Value::Decimal(*n as i128, 0);
+                        }
+                    } else if let Value::Float64(f) = &row_values[i] {
+                        if matches!(col.data_type, DataType::Decimal) {
+                            if let Some((m, sc)) = bytedb_core::tuple::value::parse_decimal(&f.to_string()) {
+                                row_values[i] = Value::Decimal(m, sc);
+                            }
+                        }
+                    }
+                }
                 if row_values[i].is_null() && !col.nullable {
-                    return Err(QueryError::Execution(
-                        format!("NOT NULL constraint violated for column '{}'", col.name)
-                    ));
+                    return Err(QueryError::not_null_violation(&col.name));
                 }
             }
 
-            // UNIQUE enforcement (skip if also PK — PK handled by key collision below)
+            // UNIQUE enforcement (skip if also PK - PK handled by key collision below)
             for (i, col) in table_data.schema.columns.iter().enumerate() {
                 if col.unique && !col.primary_key && !row_values[i].is_null() {
                     let val = &row_values[i];
@@ -980,7 +1070,9 @@ impl QueryEngine {
                     true
                 };
                 if matches {
-                    // Referential integrity (RESTRICT): refuse delete if a child row references this row.
+                    // Referential integrity: handle RESTRICT / CASCADE / SET NULL
+                    // Collect (child_table, action, child_keys) so we can mutate after dropping the read lock.
+                    let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
                     for (other_name, other_td) in tables.iter() {
                         if other_name == table { continue; }
                         for fk in &other_td.schema.foreign_keys {
@@ -999,17 +1091,45 @@ impl QueryEngine {
                                 .filter_map(|c| other_td.schema.column_index(c)).collect();
                             let child_all = other_td.index.scan_all()
                                 .map_err(|e| QueryError::Execution(e.to_string()))?;
-                            for (_, cdata) in &child_all {
+                            for (ck, cdata) in &child_all {
                                 if let Some(ct) = Tuple::deserialize(cdata) {
                                     let mut all_eq = true;
                                     for (j, ci) in child_idxs.iter().enumerate() {
                                         if ct.get(*ci) != Some(&parent_vals[j]) { all_eq = false; break; }
                                     }
                                     if all_eq {
-                                        return Err(QueryError::fk_referenced(other_name));
+                                        match fk.on_delete {
+                                            bytedb_core::tuple::schema::FkAction::Restrict => {
+                                                return Err(QueryError::fk_referenced(other_name));
+                                            }
+                                            other => {
+                                                cascade_targets.push((other_name.clone(), other, ck.clone(), child_idxs.clone()));
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Apply cascade actions
+                    for (cname, action, ck, child_idxs) in &cascade_targets {
+                        let ctd = tables.get(cname).unwrap();
+                        match action {
+                            bytedb_core::tuple::schema::FkAction::Cascade => {
+                                ctd.index.delete(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
+                            }
+                            bytedb_core::tuple::schema::FkAction::SetNull => {
+                                if let Some(d) = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))? {
+                                    if let Some(mut ct) = Tuple::deserialize(&d) {
+                                        for ci in child_idxs {
+                                            ct.set(*ci, Value::Null);
+                                        }
+                                        ctd.index.insert(ck.clone(), ct.serialize())
+                                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if let Some(tid) = txn_id {
@@ -1250,7 +1370,7 @@ impl QueryEngine {
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
-                // Full scan — sequential, no filter
+                // Full scan - sequential, no filter
                 table_data.index.for_each(|_key, data| {
                     if let Some(tuple) = Tuple::deserialize(data) {
                         rows.push(tuple.values);
@@ -2472,7 +2592,7 @@ impl QueryEngine {
             return None;
         }
 
-        // Single group key, TEXT type — common case (GROUP BY category)
+        // Single group key, TEXT type - common case (GROUP BY category)
         // Aggregate directly from raw bytes
         struct GroupAcc {
             count: i64,
@@ -3395,6 +3515,9 @@ fn cast_value(val: Value, target: DataType) -> Value {
             Value::Int64(n) => Value::Text(n.to_string()),
             Value::Float64(f) => Value::Text(f.to_string()),
             Value::Bool(b) => Value::Text(b.to_string()),
+            Value::Date(d) => Value::Text(bytedb_core::tuple::value::format_date(d)),
+            Value::Decimal(m, s) => Value::Text(bytedb_core::tuple::value::format_decimal(m, s)),
+            Value::Uuid(b) => Value::Text(bytedb_core::tuple::value::format_uuid(&b)),
             Value::Null => Value::Null,
             _ => Value::Text(format!("{:?}", val)),
         },
@@ -3406,6 +3529,23 @@ fn cast_value(val: Value, target: DataType) -> Value {
                 "false" | "f" | "0" | "no" => Value::Bool(false),
                 _ => Value::Null,
             },
+            _ => Value::Null,
+        },
+        DataType::Date => match val {
+            Value::Date(_) => val,
+            Value::Text(s) => bytedb_core::tuple::value::parse_date(&s).map(Value::Date).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        DataType::Uuid => match val {
+            Value::Uuid(_) => val,
+            Value::Text(s) => bytedb_core::tuple::value::parse_uuid(&s).map(Value::Uuid).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        DataType::Decimal => match val {
+            Value::Decimal(_, _) => val,
+            Value::Int64(n) => Value::Decimal(n as i128, 0),
+            Value::Float64(f) => bytedb_core::tuple::value::parse_decimal(&f.to_string()).map(|(m, s)| Value::Decimal(m, s)).unwrap_or(Value::Null),
+            Value::Text(s) => bytedb_core::tuple::value::parse_decimal(&s).map(|(m, s)| Value::Decimal(m, s)).unwrap_or(Value::Null),
             _ => Value::Null,
         },
         _ => val,
@@ -3480,5 +3620,15 @@ fn like_match_inner(s: &[char], p: &[char]) -> bool {
         c => {
             !s.is_empty() && s[0] == c && like_match_inner(&s[1..], &p[1..])
         }
+    }
+}
+
+fn ast_fk_action_to_core(a: crate::parser::ast::FkAction) -> bytedb_core::tuple::schema::FkAction {
+    use crate::parser::ast::FkAction as A;
+    use bytedb_core::tuple::schema::FkAction as C;
+    match a {
+        A::Restrict => C::Restrict,
+        A::Cascade => C::Cascade,
+        A::SetNull => C::SetNull,
     }
 }

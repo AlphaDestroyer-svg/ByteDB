@@ -126,6 +126,9 @@ const TAG_TEXT: u8 = 4;
 const TAG_BYTES: u8 = 5;
 const TAG_JSON: u8 = 6;
 const TAG_TIMESTAMP: u8 = 7;
+const TAG_DATE: u8 = 8;
+const TAG_DECIMAL: u8 = 9;
+const TAG_UUID: u8 = 10;
 
 fn encode_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
@@ -163,6 +166,19 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
         Value::Timestamp(t) => {
             buf.push(TAG_TIMESTAMP);
             buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Date(d) => {
+            buf.push(TAG_DATE);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Decimal(m, s) => {
+            buf.push(TAG_DECIMAL);
+            buf.extend_from_slice(&m.to_le_bytes());
+            buf.push(*s);
+        }
+        Value::Uuid(b) => {
+            buf.push(TAG_UUID);
+            buf.extend_from_slice(b);
         }
     }
 }
@@ -220,6 +236,23 @@ fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
             let t = i64::from_le_bytes(data[p..p+8].try_into().ok()?);
             Some((Value::Timestamp(t), p + 8))
         }
+        TAG_DATE => {
+            if p + 4 > data.len() { return None; }
+            let d = i32::from_le_bytes(data[p..p+4].try_into().ok()?);
+            Some((Value::Date(d), p + 4))
+        }
+        TAG_DECIMAL => {
+            if p + 17 > data.len() { return None; }
+            let m = i128::from_le_bytes(data[p..p+16].try_into().ok()?);
+            let s = data[p+16];
+            Some((Value::Decimal(m, s), p + 17))
+        }
+        TAG_UUID => {
+            if p + 16 > data.len() { return None; }
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&data[p..p+16]);
+            Some((Value::Uuid(b), p + 16))
+        }
         _ => None,
     }
 }
@@ -234,6 +267,9 @@ fn skip_value(data: &[u8], pos: usize) -> Option<usize> {
         TAG_NULL => Some(p),
         TAG_BOOL => Some(p + 1),
         TAG_INT64 | TAG_FLOAT64 | TAG_TIMESTAMP => Some(p + 8),
+        TAG_DATE => Some(p + 4),
+        TAG_UUID => Some(p + 16),
+        TAG_DECIMAL => Some(p + 17),
         TAG_TEXT | TAG_BYTES | TAG_JSON => {
             if p + 4 > data.len() { return None; }
             let len = u32::from_le_bytes(data[p..p+4].try_into().ok()?) as usize;

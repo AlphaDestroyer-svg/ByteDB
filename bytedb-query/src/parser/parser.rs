@@ -50,6 +50,12 @@ impl Parser {
             Token::Doc => self.parse_doc(),
             Token::Show => self.parse_show(),
             Token::Truncate => self.parse_truncate(),
+            Token::Use => {
+                self.advance();
+                if self.current() == &Token::Database { self.advance(); }
+                let name = self.expect_ident()?;
+                Ok(Statement::UseDatabase(name))
+            }
             _ => Err(QueryError::Parse(format!("Unexpected token: {:?}", self.current()))),
         }
     }
@@ -489,7 +495,18 @@ impl Parser {
         match self.current().clone() {
             Token::Table => self.parse_create_table(),
             Token::Index => { self.advance(); self.parse_create_index(false) }
-            _ => Err(QueryError::Parse("Expected TABLE or INDEX after CREATE".into())),
+            Token::Database => {
+                self.advance();
+                let if_not_exists = if self.current() == &Token::If {
+                    self.advance();
+                    self.expect(Token::Not)?;
+                    self.expect(Token::Exists)?;
+                    true
+                } else { false };
+                let name = self.expect_ident()?;
+                Ok(Statement::CreateDatabase { name, if_not_exists })
+            }
+            _ => Err(QueryError::Parse("Expected TABLE, INDEX or DATABASE after CREATE".into())),
         }
     }
 
@@ -510,7 +527,7 @@ impl Parser {
 
         let mut columns = Vec::new();
         let mut table_checks: Vec<Expr> = Vec::new();
-        let mut table_fks: Vec<(Vec<String>, String, Vec<String>)> = Vec::new();
+        let mut table_fks: Vec<ForeignKeyDef> = Vec::new();
         loop {
             // Table-level constraint?
             if self.current() == &Token::Unique || self.current() == &Token::Primary
@@ -542,7 +559,14 @@ impl Parser {
                     self.expect(Token::LParen)?;
                     let ref_cols = self.parse_ident_list()?;
                     self.expect(Token::RParen)?;
-                    table_fks.push((cols, ref_table, ref_cols));
+                    let (on_delete, on_update) = self.parse_fk_actions()?;
+                    table_fks.push(ForeignKeyDef {
+                        columns: cols,
+                        ref_table,
+                        ref_columns: ref_cols,
+                        on_delete,
+                        on_update,
+                    });
                 } else {
                     return Err(QueryError::Parse(format!("Unexpected constraint token: {:?}", self.current())));
                 }
@@ -561,6 +585,8 @@ impl Parser {
             let mut default = None;
             let mut check = None;
             let mut references = None;
+            let mut col_on_delete = FkAction::Restrict;
+            let mut col_on_update = FkAction::Restrict;
 
             // SERIAL implies auto-increment
             if matches!(data_type, bytedb_core::tuple::value::DataType::Int64)
@@ -606,6 +632,9 @@ impl Parser {
                             "id".to_string()
                         };
                         references = Some((ref_table, ref_col));
+                        let (od, ou) = self.parse_fk_actions()?;
+                        col_on_delete = od;
+                        col_on_update = ou;
                     }
                     _ => break,
                 }
@@ -628,6 +657,8 @@ impl Parser {
                 default,
                 check,
                 references,
+                on_delete: col_on_delete,
+                on_update: col_on_update,
             });
 
             if self.current() != &Token::Comma {
@@ -678,7 +709,17 @@ impl Parser {
                 let name = self.expect_ident()?;
                 Ok(Statement::DropIndex(name))
             }
-            _ => Err(QueryError::Parse("Expected TABLE or INDEX after DROP".into())),
+            Token::Database => {
+                self.advance();
+                let if_exists = if self.current() == &Token::If {
+                    self.advance();
+                    self.expect(Token::Exists)?;
+                    true
+                } else { false };
+                let name = self.expect_ident()?;
+                Ok(Statement::DropDatabase { name, if_exists })
+            }
+            _ => Err(QueryError::Parse("Expected TABLE, INDEX or DATABASE after DROP".into())),
         }
     }
 
@@ -723,6 +764,8 @@ impl Parser {
                     default: None,
                     check: None,
                     references: None,
+                    on_delete: FkAction::Restrict,
+                    on_update: FkAction::Restrict,
                 })
             }
             Token::Drop => {
@@ -815,7 +858,11 @@ impl Parser {
                 let table = self.expect_ident()?;
                 Ok(Statement::ShowCreateTable(table))
             }
-            _ => Err(QueryError::Parse("Expected TABLES, COLUMNS, or CREATE after SHOW".into())),
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("DATABASES") => {
+                self.advance();
+                Ok(Statement::ShowDatabases)
+            }
+            _ => Err(QueryError::Parse("Expected TABLES, COLUMNS, CREATE, or DATABASES after SHOW".into())),
         }
     }
 
@@ -1357,20 +1404,20 @@ impl Parser {
             Token::Float => DataType::Float64,
             Token::Real => DataType::Float64,
             Token::DoublePrecision => DataType::Float64,
-            Token::Numeric => DataType::Float64,
+            Token::Numeric => DataType::Decimal,
             Token::Text => DataType::Text,
             Token::Varchar => DataType::Text,
             Token::Bool => DataType::Bool,
             Token::Bytes => DataType::Bytes,
             Token::Json => DataType::Json,
             Token::Timestamp => DataType::Timestamp,
-            Token::Date => DataType::Timestamp,
-            Token::Uuid => DataType::Text,
+            Token::Date => DataType::Date,
+            Token::Uuid => DataType::Uuid,
             _ => return Err(QueryError::Parse(format!("Expected data type, got {:?}", self.current()))),
         };
         self.advance();
         // consume "PRECISION" after DOUBLE
-        if dt == DataType::Float64 {
+        if matches!(dt, DataType::Float64 | DataType::Decimal) {
             if let Token::Ident(s) = self.current() {
                 if s.to_uppercase() == "PRECISION" {
                     self.advance();
@@ -1447,6 +1494,41 @@ impl Parser {
             Token::IntLit(n) => { self.advance(); Ok(n) }
             _ => Err(QueryError::Parse(format!("Expected integer, got {:?}", self.current()))),
         }
+    }
+
+    fn parse_fk_actions(&mut self) -> Result<(FkAction, FkAction)> {
+        let mut on_delete = FkAction::Restrict;
+        let mut on_update = FkAction::Restrict;
+        loop {
+            if self.current() != &Token::On { break; }
+            self.advance();
+            let which = match self.current().clone() {
+                Token::Delete => { self.advance(); 0 }
+                Token::Update => { self.advance(); 1 }
+                _ => return Err(QueryError::Parse("Expected DELETE or UPDATE after ON".into())),
+            };
+            let action = match self.current().clone() {
+                Token::Cascade => { self.advance(); FkAction::Cascade }
+                Token::Restrict => { self.advance(); FkAction::Restrict }
+                Token::Set => {
+                    self.advance();
+                    if self.current() == &Token::NullLit { self.advance(); FkAction::SetNull }
+                    else { return Err(QueryError::Parse("Expected NULL after SET".into())); }
+                }
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("NO") => {
+                    self.advance();
+                    if matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("ACTION")) {
+                        self.advance();
+                        FkAction::Restrict
+                    } else {
+                        return Err(QueryError::Parse("Expected ACTION after NO".into()));
+                    }
+                }
+                _ => return Err(QueryError::Parse(format!("Expected CASCADE/RESTRICT/SET NULL, got {:?}", self.current()))),
+            };
+            if which == 0 { on_delete = action; } else { on_update = action; }
+        }
+        Ok((on_delete, on_update))
     }
 
     fn try_parse_alias(&mut self) -> Option<String> {

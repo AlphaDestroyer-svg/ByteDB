@@ -97,5 +97,8 @@ fn format_value(val: &Value) -> String {
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
         Value::Json(j) => j.to_string(),
         Value::Timestamp(t) => format!("ts:{}", t),
+        Value::Date(d) => bytedb_core::tuple::value::format_date(*d),
+        Value::Decimal(m, s) => bytedb_core::tuple::value::format_decimal(*m, *s),
+        Value::Uuid(b) => bytedb_core::tuple::value::format_uuid(b),
     }
 }

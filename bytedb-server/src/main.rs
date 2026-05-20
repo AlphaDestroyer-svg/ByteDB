@@ -25,7 +25,7 @@ async fn main() {
 |____/ \__, |\__\___|____/|____/
        |___/
     "#);
-    println!("ByteDB v0.1.0 — Universal Database Engine");
+    println!("ByteDB v0.1.0 - Universal Database Engine");
     println!("Listening on {}:{}", config.host, config.port);
     println!();
 

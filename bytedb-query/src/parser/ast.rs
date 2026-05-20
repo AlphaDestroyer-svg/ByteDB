@@ -39,6 +39,26 @@ pub enum Statement {
     Describe(String),
     Explain(Box<Statement>, bool),
     Truncate(String),
+    CreateDatabase { name: String, if_not_exists: bool },
+    DropDatabase { name: String, if_exists: bool },
+    UseDatabase(String),
+    ShowDatabases,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    Restrict,
+    Cascade,
+    SetNull,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKeyDef {
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +67,7 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDef>,
     pub if_not_exists: bool,
     pub check_constraints: Vec<Expr>,
-    pub foreign_keys: Vec<(Vec<String>, String, Vec<String>)>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +81,8 @@ pub struct ColumnDef {
     pub default: Option<Expr>,
     pub check: Option<Expr>,
     pub references: Option<(String, String)>, // (table, column)
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
 }
 
 #[derive(Debug, Clone)]

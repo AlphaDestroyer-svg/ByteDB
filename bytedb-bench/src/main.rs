@@ -126,7 +126,7 @@ fn main() {
     let order_dur = start.elapsed();
     println!("  6. ORDER BY+LIMIT x{}:      {:>9.2}ms  ({} queries/s)", order_iters, order_dur.as_secs_f64() * 1000.0, format_rate(order_iters, order_dur));
 
-    // === SELECT LIMIT (no sort — pushdown) ===
+    // === SELECT LIMIT (no sort - pushdown) ===
     let limit_iters = 1000;
     let start = Instant::now();
     for _ in 0..limit_iters {

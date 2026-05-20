@@ -359,7 +359,7 @@ mod tests {
         let mut p = Parser::new("INSERT INTO accounts VALUES (1, 1000)").unwrap();
         engine.execute(p.parse().unwrap(), Some(txn1_id)).unwrap();
 
-        // Start txn2 — should NOT see txn1's uncommitted data
+        // Start txn2 - should NOT see txn1's uncommitted data
         let mut p = Parser::new("BEGIN").unwrap();
         let result = engine.execute(p.parse().unwrap(), None).unwrap();
         let txn2_id = match result {
@@ -1040,7 +1040,7 @@ mod tests {
         // Insert with all columns
         engine.execute_sql("INSERT INTO products VALUES (1, 'Widget', 'sold', 5)", None).unwrap();
 
-        // Insert with partial columns — defaults should fill in
+        // Insert with partial columns - defaults should fill in
         engine.execute_sql("INSERT INTO products (id, name) VALUES (2, 'Gadget')", None).unwrap();
 
         let result = engine.execute_sql("SELECT id, name, status, quantity FROM products WHERE id = 1", None).unwrap();
@@ -1139,6 +1139,105 @@ mod tests {
         engine.execute_sql("INSERT INTO child VALUES (10, 1)", None).unwrap();
         let r = engine.execute_sql("INSERT INTO child VALUES (11, 99)", None);
         assert!(r.is_err(), "FK pointing to missing parent should fail");
+    }
+
+    #[test]
+    fn test_native_date_type() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE events (id INT PRIMARY KEY, dt DATE)", None).unwrap();
+        engine.execute_sql("INSERT INTO events VALUES (1, '2026-05-20')", None).unwrap();
+        let r = engine.execute_sql("SELECT dt FROM events", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Date(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_native_uuid_type() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE u (id INT PRIMARY KEY, uid UUID)", None).unwrap();
+        engine.execute_sql("INSERT INTO u VALUES (1, '550e8400-e29b-41d4-a716-446655440000')", None).unwrap();
+        let r = engine.execute_sql("SELECT uid FROM u", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Uuid(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_native_decimal_type() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE prices (id INT PRIMARY KEY, p NUMERIC(10,2))", None).unwrap();
+        engine.execute_sql("INSERT INTO prices VALUES (1, '123.45')", None).unwrap();
+        engine.execute_sql("INSERT INTO prices VALUES (2, 99)", None).unwrap();
+        let r = engine.execute_sql("SELECT p FROM prices ORDER BY id", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Decimal(_, _)));
+                assert!(matches!(rows[1][0], Value::Decimal(_, _)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_fk_cascade_delete() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE p (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE CASCADE)", None).unwrap();
+        engine.execute_sql("INSERT INTO p VALUES (1), (2)", None).unwrap();
+        engine.execute_sql("INSERT INTO c VALUES (10, 1), (11, 1), (12, 2)", None).unwrap();
+        engine.execute_sql("DELETE FROM p WHERE id = 1", None).unwrap();
+        let r = engine.execute_sql("SELECT id FROM c", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Int64(12));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_fk_set_null_delete() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE p (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE SET NULL)", None).unwrap();
+        engine.execute_sql("INSERT INTO p VALUES (1)", None).unwrap();
+        engine.execute_sql("INSERT INTO c VALUES (10, 1)", None).unwrap();
+        engine.execute_sql("DELETE FROM p WHERE id = 1", None).unwrap();
+        let r = engine.execute_sql("SELECT pid FROM c WHERE id = 10", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Null);
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_database() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE DATABASE analytics", None).unwrap();
+        engine.execute_sql("CREATE DATABASE IF NOT EXISTS analytics", None).unwrap();
+        let r = engine.execute_sql("SHOW DATABASES", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(rows.iter().any(|r| matches!(&r[0], Value::Text(s) if s == "analytics")));
+                assert!(rows.iter().any(|r| matches!(&r[0], Value::Text(s) if s == "test")));
+            }
+            _ => panic!("Expected Rows"),
+        }
+        engine.execute_sql("USE analytics", None).unwrap();
+        let drop_current = engine.execute_sql("DROP DATABASE analytics", None);
+        assert!(drop_current.is_err(), "cannot drop current db");
+        engine.execute_sql("USE test", None).unwrap();
+        engine.execute_sql("DROP DATABASE analytics", None).unwrap();
     }
 
     #[test]

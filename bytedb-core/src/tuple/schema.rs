@@ -54,11 +54,23 @@ impl Column {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FkAction {
+    #[default]
+    Restrict,
+    Cascade,
+    SetNull,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub ref_table: String,
     pub ref_columns: Vec<String>,
+    #[serde(default)]
+    pub on_delete: FkAction,
+    #[serde(default)]
+    pub on_update: FkAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
