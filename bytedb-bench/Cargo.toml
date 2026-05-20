@@ -1,0 +1,12 @@
+[package]
+name = "bytedb-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytedb-core = { path = "../bytedb-core" }
+bytedb-query = { path = "../bytedb-query" }
+
+[[bin]]
+name = "bytedb-bench"
+path = "src/main.rs"

@@ -1,0 +1,13 @@
+[package]
+name = "bytedb-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytedb-core = { path = "../bytedb-core" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+rustyline = "14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,3394 @@
+use std::collections::HashMap;
+use std::collections::BinaryHeap;
+use std::sync::Arc;
+use std::cmp::Ordering;
+
+use bytedb_core::catalog::database::Database;
+use bytedb_core::catalog::table::TableMeta;
+use bytedb_core::index::btree::BPlusTree;
+use bytedb_core::mvcc::transaction::{IsolationLevel, TransactionManager, TxnId};
+use bytedb_core::mvcc::version_store::VersionStore;
+use bytedb_core::tuple::schema::{Column, Schema};
+use bytedb_core::tuple::tuple::{Tuple, raw_filter_matches, read_int64_at, read_value_at};
+use bytedb_core::tuple::value::{DataType, Value};
+use bytedb_core::wal::log_manager::LogManager;
+use bytedb_core::wal::log_record::LogRecord;
+
+use crate::error::{QueryError, Result};
+use crate::executor::batch::{SelectionVector, deserialize_batch};
+use crate::parser::ast::*;
+use crate::planner::logical_plan::build_logical_plan;
+use crate::planner::optimizer::optimize;
+use crate::planner::physical_plan::PhysicalPlan;
+
+const STMT_CACHE_SIZE: usize = 256;
+
+struct StmtCache {
+    entries: Vec<(u64, Statement)>,
+}
+
+impl StmtCache {
+    fn new() -> Self {
+        StmtCache {
+            entries: Vec::with_capacity(STMT_CACHE_SIZE),
+        }
+    }
+
+    fn get(&self, hash: u64) -> Option<&Statement> {
+        self.entries.iter().find(|(h, _)| *h == hash).map(|(_, s)| s)
+    }
+
+    fn insert(&mut self, hash: u64, stmt: Statement) {
+        if self.entries.len() >= STMT_CACHE_SIZE {
+            self.entries.remove(0);
+        }
+        self.entries.push((hash, stmt));
+    }
+}
+
+fn hash_sql(sql: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in sql.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[derive(Debug, Clone)]
+pub enum ExecutionResult {
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    Modified {
+        count: u64,
+    },
+    Ok(String),
+}
+
+pub struct QueryEngine {
+    database: Arc<Database>,
+    txn_manager: Arc<TransactionManager>,
+    tables: Arc<parking_lot::RwLock<HashMap<String, TableData>>>,
+    wal: Option<Arc<LogManager>>,
+    stmt_cache: parking_lot::Mutex<StmtCache>,
+}
+
+pub struct TableData {
+    pub schema: Schema,
+    pub index: Arc<BPlusTree>,
+    pub version_store: Arc<VersionStore>,
+    pub check_exprs: Vec<Expr>,
+    pub sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>>,
+}
+
+impl QueryEngine {
+    pub fn new(database: Arc<Database>, txn_manager: Arc<TransactionManager>) -> Self {
+        QueryEngine {
+            database,
+            txn_manager,
+            tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            wal: None,
+            stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
+        }
+    }
+
+    pub fn with_wal(database: Arc<Database>, txn_manager: Arc<TransactionManager>, wal: Arc<LogManager>) -> Self {
+        QueryEngine {
+            database,
+            txn_manager,
+            tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            wal: Some(wal),
+            stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
+        }
+    }
+
+    pub fn execute_sql(&self, sql: &str, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let hash = hash_sql(sql);
+        let cached = {
+            let cache = self.stmt_cache.lock();
+            cache.get(hash).cloned()
+        };
+        let stmt = if let Some(s) = cached {
+            s
+        } else {
+            let mut parser = crate::parser::parser::Parser::new(sql)
+                .map_err(|e| QueryError::Parse(e.to_string()))?;
+            let s = parser.parse()?;
+            let mut cache = self.stmt_cache.lock();
+            cache.insert(hash, s.clone());
+            s
+        };
+        self.execute(stmt, txn_id)
+    }
+
+    fn wal_append(&self, record: LogRecord) {
+        if let Some(ref wal) = self.wal {
+            let _ = wal.append(record);
+        }
+    }
+
+    fn wal_flush(&self) {
+        if let Some(ref wal) = self.wal {
+            let _ = wal.flush();
+        }
+    }
+
+    pub fn execute(&self, stmt: Statement, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        match stmt {
+            Statement::Begin(isolation) => {
+                let iso = isolation.unwrap_or(IsolationLevel::ReadCommitted);
+                let id = self.txn_manager.begin(iso);
+                self.wal_append(LogRecord::Begin { txn_id: id });
+                Ok(ExecutionResult::Ok(format!("Transaction {} started", id)))
+            }
+            Statement::Commit => {
+                if let Some(txn_id) = txn_id {
+                    self.wal_append(LogRecord::Commit { txn_id });
+                    self.wal_flush();
+                    self.txn_manager.commit(txn_id)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                    Ok(ExecutionResult::Ok("COMMIT".into()))
+                } else {
+                    Err(QueryError::Execution("No active transaction".into()))
+                }
+            }
+            Statement::Rollback => {
+                if let Some(txn_id) = txn_id {
+                    self.wal_append(LogRecord::Abort { txn_id });
+                    self.wal_flush();
+                    self.txn_manager.abort(txn_id)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                    Ok(ExecutionResult::Ok("ROLLBACK".into()))
+                } else {
+                    Err(QueryError::Execution("No active transaction".into()))
+                }
+            }
+            Statement::ShowTables => {
+                let tables = self.database.list_tables();
+                let rows: Vec<Vec<Value>> = tables.into_iter()
+                    .map(|t| vec![Value::Text(t)])
+                    .collect();
+                Ok(ExecutionResult::Rows {
+                    columns: vec!["table_name".into()],
+                    rows,
+                })
+            }
+            Statement::Describe(name) | Statement::ShowColumns(name) => {
+                let tables = self.tables.read();
+                let table_data = tables.get(&name)
+                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                let rows: Vec<Vec<Value>> = table_data.schema.columns.iter().map(|c| {
+                    vec![
+                        Value::Text(c.name.clone()),
+                        Value::Text(format!("{:?}", c.data_type)),
+                        Value::Bool(c.nullable),
+                        Value::Bool(c.primary_key),
+                    ]
+                }).collect();
+                Ok(ExecutionResult::Rows {
+                    columns: vec!["name".into(), "type".into(), "nullable".into(), "primary_key".into()],
+                    rows,
+                })
+            }
+            Statement::ShowCreateTable(name) => {
+                let tables = self.tables.read();
+                let table_data = tables.get(&name)
+                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                let mut ddl = format!("CREATE TABLE {} (\n", name);
+                for (i, col) in table_data.schema.columns.iter().enumerate() {
+                    if i > 0 { ddl.push_str(",\n"); }
+                    ddl.push_str(&format!("  {} {:?}", col.name, col.data_type));
+                    if col.primary_key { ddl.push_str(" PRIMARY KEY"); }
+                    if !col.nullable { ddl.push_str(" NOT NULL"); }
+                }
+                ddl.push_str("\n)");
+                Ok(ExecutionResult::Rows {
+                    columns: vec!["Create Table".into()],
+                    rows: vec![vec![Value::Text(ddl)]],
+                })
+            }
+            Statement::Truncate(name) => {
+                let tables = self.tables.read();
+                let table_data = tables.get(&name)
+                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                let keys: Vec<Vec<u8>> = table_data.index.scan_all()
+                    .map_err(|e| QueryError::Execution(e.to_string()))?
+                    .into_iter().map(|(k, _)| k).collect();
+                for key in keys {
+                    table_data.index.delete(&key)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                }
+                Ok(ExecutionResult::Ok(format!("TRUNCATE TABLE")))
+            }
+            Statement::KvGet(_) | Statement::KvSet(_, _) | Statement::KvDelete(_) | Statement::KvScan(_, _) => {
+                Err(QueryError::Execution("Use KV engine for KV operations".into()))
+            }
+            Statement::DocInsert(_) | Statement::DocFind(_) | Statement::DocUpdate(_) | Statement::DocDelete(_) => {
+                Err(QueryError::Execution("Use Document engine for DOC operations".into()))
+            }
+            Statement::AlterTable(alter) => self.exec_alter_table(alter),
+            Statement::Union(left, right, all) => self.exec_union(*left, *right, all, txn_id),
+            Statement::Intersect(left, right, all) => self.exec_intersect(*left, *right, all, txn_id),
+            Statement::Except(left, right, all) => self.exec_except(*left, *right, all, txn_id),
+            Statement::Explain(inner, _analyze) => {
+                let logical = build_logical_plan(&inner)?;
+                let plan_text = format!("{:#?}", logical);
+                Ok(ExecutionResult::Rows {
+                    columns: vec!["QUERY PLAN".into()],
+                    rows: plan_text.lines().map(|l| vec![Value::Text(l.to_string())]).collect(),
+                })
+            }
+            Statement::Insert(ins) => {
+                self.exec_insert(&ins.table, ins.columns, ins.source, ins.on_conflict, ins.returning, txn_id)
+            }
+            Statement::Update(upd) => {
+                self.exec_update(&upd.table, upd.assignments, upd.where_clause, upd.returning, txn_id)
+            }
+            Statement::Delete(del) => {
+                self.exec_delete(&del.table, del.where_clause, del.returning, txn_id)
+            }
+            Statement::Select(ref select) if !select.ctes.is_empty() || matches!(select.from, FromClause::Subquery(_)) => {
+                let ctes = select.ctes.clone();
+                let mut cte_names = Vec::new();
+                for cte in &ctes {
+                    let cte_result = self.execute(Statement::Select(cte.query.clone()), txn_id)?;
+                    if let ExecutionResult::Rows { columns, rows } = cte_result {
+                        self.materialize_cte(&cte.name, &columns, rows)?;
+                        cte_names.push(cte.name.clone());
+                    }
+                }
+                if let FromClause::Subquery(ref subquery) = select.from {
+                    let sub_result = self.execute(Statement::Select(*subquery.clone()), txn_id)?;
+                    if let ExecutionResult::Rows { columns, rows } = sub_result {
+                        let alias = select.from_alias.clone().unwrap_or_else(|| "__subquery__".to_string());
+                        self.materialize_cte(&alias, &columns, rows)?;
+                        cte_names.push(alias);
+                    }
+                }
+                let mut main_select = select.clone();
+                main_select.ctes = Vec::new();
+                if matches!(main_select.from, FromClause::Subquery(_)) {
+                    let alias = main_select.from_alias.clone().unwrap_or_else(|| "__subquery__".to_string());
+                    main_select.from = FromClause::Table(alias);
+                }
+                let result = self.execute(Statement::Select(main_select), txn_id);
+                for name in &cte_names {
+                    self.tables.write().remove(name);
+                }
+                result
+            }
+            _ => {
+                let stmt = Self::rewrite_aliases(stmt);
+                let logical = build_logical_plan(&stmt)?;
+                let physical = optimize(logical)?;
+                self.execute_physical(physical, txn_id)
+            }
+        }
+    }
+
+    fn execute_physical(&self, plan: PhysicalPlan, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        match plan {
+            PhysicalPlan::CreateTable(ct) => self.exec_create_table(ct),
+            PhysicalPlan::DropTable(dt) => self.exec_drop_table(dt),
+            PhysicalPlan::CreateIndex(ci) => self.exec_create_index(ci),
+            PhysicalPlan::DropIndex(name) => {
+                self.tables.write().remove(&name);
+                Ok(ExecutionResult::Ok(format!("Index {} dropped", name)))
+            }
+            PhysicalPlan::Insert { table, columns, source } => {
+                self.exec_insert(&table, columns, source, None, None, txn_id)
+            }
+            PhysicalPlan::Update { table, assignments, filter } => {
+                self.exec_update(&table, assignments, filter, None, txn_id)
+            }
+            PhysicalPlan::Delete { table, filter } => {
+                self.exec_delete(&table, filter, None, txn_id)
+            }
+            PhysicalPlan::Project { input, columns } => {
+                let result = self.execute_physical(*input, txn_id)?;
+                self.apply_projection(result, &columns)
+            }
+            PhysicalPlan::SeqScan { table, filter, limit, needed_columns } => {
+                self.exec_seq_scan(&table, filter.as_ref(), txn_id, limit, needed_columns.as_deref())
+            }
+            PhysicalPlan::Filter { input, predicate } => {
+                let result = self.execute_physical(*input, txn_id)?;
+                self.apply_filter(result, &predicate)
+            }
+            PhysicalPlan::Sort { input, order_by } => {
+                let result = self.execute_physical(*input, txn_id)?;
+                self.apply_sort(result, &order_by)
+            }
+            PhysicalPlan::Limit { input, count, offset } => {
+                match *input {
+                    PhysicalPlan::Sort { input: sort_input, order_by } if offset == 0 => {
+                        match *sort_input {
+                            PhysicalPlan::SeqScan { ref table, ref filter, .. } if order_by.len() == 1 => {
+                                let table_name = table.clone();
+                                let filter_clone = filter.clone();
+                                match self.exec_scan_top_n(&table_name, filter_clone.as_ref(), txn_id, &order_by, count) {
+                                    Ok(r) => Ok(r),
+                                    Err(_) => {
+                                        let result = self.execute_physical(*sort_input, txn_id)?;
+                                        self.apply_top_n(result, &order_by, count)
+                                    }
+                                }
+                            }
+                            other => {
+                                let result = self.execute_physical(other, txn_id)?;
+                                self.apply_top_n(result, &order_by, count)
+                            }
+                        }
+                    }
+                    other => {
+                        let result = self.execute_physical(other, txn_id)?;
+                        self.apply_limit(result, count, offset)
+                    }
+                }
+            }
+            PhysicalPlan::HashJoin { left, right, condition, join_type } => {
+                self.exec_hash_join(*left, *right, condition, join_type, txn_id)
+            }
+            PhysicalPlan::NestedLoopJoin { left, right, condition, join_type } => {
+                self.exec_hash_join(*left, *right, condition, join_type, txn_id)
+            }
+            PhysicalPlan::HashAggregate { input, group_by, aggregates, having } => {
+                if !group_by.is_empty() {
+                    if let PhysicalPlan::SeqScan { ref table, ref filter, .. } = *input {
+                        if filter.is_none() && txn_id.is_none() && having.is_none() {
+                            let tables = self.tables.read();
+                            if let Some(td) = tables.get(table) {
+                                let col_names: Vec<String> = td.schema.columns.iter().map(|c| c.name.clone()).collect();
+                                let result = self.try_fast_aggregate(td, &col_names, &group_by, &aggregates);
+                                if let Some(r) = result {
+                                    return Ok(r);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.exec_hash_aggregate(*input, group_by, aggregates, having, txn_id)
+            }
+            PhysicalPlan::IndexScan { table, index_name: _, key_expr } => {
+                self.exec_seq_scan(&table, Some(&key_expr), txn_id, None, None)
+            }
+            PhysicalPlan::Distinct { input } => {
+                let result = self.execute_physical(*input, txn_id)?;
+                self.apply_distinct(result)
+            }
+        }
+    }
+
+    fn exec_create_table(&self, ct: CreateTableStmt) -> Result<ExecutionResult> {
+        let columns: Vec<Column> = ct.columns.iter().map(|c| {
+            let mut col = Column::new(c.name.clone(), c.data_type);
+            if !c.nullable {
+                col = col.not_null();
+            }
+            if c.primary_key {
+                col = col.primary_key();
+            }
+            if c.unique {
+                col = col.unique();
+            }
+            if c.auto_increment {
+                col = col.auto_increment();
+            }
+            if let Some(ref default_expr) = c.default {
+                let default_val = self.eval_expr_simple(default_expr);
+                col = col.with_default(default_val);
+            }
+            col
+        }).collect();
+
+        let mut schema = Schema::new(ct.name.clone(), columns);
+        schema.check_constraints = ct.check_constraints.iter().map(|e| format!("{:?}", e)).collect();
+        schema.foreign_keys = ct.foreign_keys.iter().map(|(cols, t, rc)| {
+            bytedb_core::tuple::schema::ForeignKey {
+                columns: cols.clone(),
+                ref_table: t.clone(),
+                ref_columns: rc.clone(),
+            }
+        }).collect();
+        // Per-column REFERENCES → foreign_keys
+        for c in &ct.columns {
+            if let Some((rt, rc)) = &c.references {
+                schema.foreign_keys.push(bytedb_core::tuple::schema::ForeignKey {
+                    columns: vec![c.name.clone()],
+                    ref_table: rt.clone(),
+                    ref_columns: vec![rc.clone()],
+                });
+            }
+        }
+
+        let mut sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>> = HashMap::new();
+        for c in &schema.columns {
+            if c.auto_increment {
+                sequences.insert(c.name.clone(), Arc::new(bytedb_core::tuple::schema::SequenceGenerator::new(1)));
+            }
+        }
+
+        let table_id = self.tables.read().len() as u32 + 1;
+        let meta = TableMeta::new(ct.name.clone(), schema.clone(), table_id);
+
+        self.database.create_table(meta)
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+        let table_data = TableData {
+            schema,
+            index: Arc::new(BPlusTree::new(format!("{}_pk", ct.name), 128)),
+            version_store: Arc::new(VersionStore::new()),
+            check_exprs: ct.check_constraints.clone(),
+            sequences,
+        };
+        self.tables.write().insert(ct.name.clone(), table_data);
+
+        Ok(ExecutionResult::Ok(format!("Table {} created", ct.name)))
+    }
+
+    fn exec_drop_table(&self, dt: DropTableStmt) -> Result<ExecutionResult> {
+        match self.database.drop_table(&dt.name) {
+            Ok(_) => {
+                self.tables.write().remove(&dt.name);
+                Ok(ExecutionResult::Ok(format!("Table {} dropped", dt.name)))
+            }
+            Err(e) => {
+                if dt.if_exists {
+                    Ok(ExecutionResult::Ok("OK".into()))
+                } else {
+                    Err(QueryError::Execution(e.to_string()))
+                }
+            }
+        }
+    }
+
+    fn exec_create_index(&self, ci: CreateIndexStmt) -> Result<ExecutionResult> {
+        Ok(ExecutionResult::Ok(format!("Index {} created on {}", ci.name, ci.table)))
+    }
+
+    fn exec_alter_table(&self, alter: AlterTableStmt) -> Result<ExecutionResult> {
+        let mut tables = self.tables.write();
+        let table_data = tables.get_mut(&alter.table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", alter.table)))?;
+
+        match alter.action {
+            AlterTableAction::AddColumn(col_def) => {
+                let mut col = Column::new(col_def.name.clone(), col_def.data_type);
+                if !col_def.nullable {
+                    col = col.not_null();
+                }
+                if col_def.primary_key {
+                    col = col.primary_key();
+                }
+
+                let mut columns = table_data.schema.columns.clone();
+                columns.push(col);
+                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+
+                Ok(ExecutionResult::Ok(format!("Column '{}' added", col_def.name)))
+            }
+            AlterTableAction::DropColumn(col_name) => {
+                let idx = table_data.schema.column_index(&col_name)
+                    .ok_or_else(|| QueryError::Execution(format!("Column '{}' not found", col_name)))?;
+
+                let pk_cols = table_data.schema.primary_key_columns();
+                if pk_cols.contains(&idx) {
+                    return Err(QueryError::Execution("Cannot drop primary key column".into()));
+                }
+
+                let mut columns = table_data.schema.columns.clone();
+                columns.remove(idx);
+                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+
+                Ok(ExecutionResult::Ok(format!("Column '{}' dropped", col_name)))
+            }
+            AlterTableAction::RenameColumn { old_name, new_name } => {
+                let idx = table_data.schema.column_index(&old_name)
+                    .ok_or_else(|| QueryError::Execution(format!("Column '{}' not found", old_name)))?;
+
+                let mut columns = table_data.schema.columns.clone();
+                columns[idx].name = new_name.clone();
+                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+
+                Ok(ExecutionResult::Ok(format!("Column '{}' renamed to '{}'", old_name, new_name)))
+            }
+        }
+    }
+
+    fn exec_union(&self, left: Statement, right: Statement, all: bool, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let left_result = self.execute(left, txn_id)?;
+        let right_result = self.execute(right, txn_id)?;
+
+        match (left_result, right_result) {
+            (ExecutionResult::Rows { columns, rows: left_rows }, ExecutionResult::Rows { rows: right_rows, .. }) => {
+                let mut rows = left_rows;
+                rows.extend(right_rows);
+                if all {
+                    Ok(ExecutionResult::Rows { columns, rows })
+                } else {
+                    let distinct_result = self.apply_distinct(ExecutionResult::Rows { columns, rows })?;
+                    Ok(distinct_result)
+                }
+            }
+            _ => Err(QueryError::Execution("UNION requires two SELECT statements".into())),
+        }
+    }
+
+    fn exec_intersect(&self, left: Statement, right: Statement, all: bool, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let left_result = self.execute(left, txn_id)?;
+        let right_result = self.execute(right, txn_id)?;
+
+        match (left_result, right_result) {
+            (ExecutionResult::Rows { columns, rows: left_rows }, ExecutionResult::Rows { rows: right_rows, .. }) => {
+                let mut right_set: HashMap<Vec<u8>, usize> = HashMap::new();
+                for row in &right_rows {
+                    let key = self.serialize_row(row);
+                    *right_set.entry(key).or_insert(0) += 1;
+                }
+                let mut rows = Vec::new();
+                for row in &left_rows {
+                    let key = self.serialize_row(row);
+                    if let Some(count) = right_set.get_mut(&key) {
+                        if *count > 0 {
+                            rows.push(row.clone());
+                            if !all { right_set.remove(&key); }
+                            else { *count -= 1; }
+                        }
+                    }
+                }
+                Ok(ExecutionResult::Rows { columns, rows })
+            }
+            _ => Err(QueryError::Execution("INTERSECT requires two SELECT statements".into())),
+        }
+    }
+
+    fn exec_except(&self, left: Statement, right: Statement, all: bool, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let left_result = self.execute(left, txn_id)?;
+        let right_result = self.execute(right, txn_id)?;
+
+        match (left_result, right_result) {
+            (ExecutionResult::Rows { columns, rows: left_rows }, ExecutionResult::Rows { rows: right_rows, .. }) => {
+                let mut right_set: HashMap<Vec<u8>, usize> = HashMap::new();
+                for row in &right_rows {
+                    let key = self.serialize_row(row);
+                    *right_set.entry(key).or_insert(0) += 1;
+                }
+                let mut rows = Vec::new();
+                for row in &left_rows {
+                    let key = self.serialize_row(row);
+                    if let Some(count) = right_set.get_mut(&key) {
+                        if *count > 0 {
+                            if all { *count -= 1; }
+                            else { right_set.remove(&key); }
+                            continue;
+                        }
+                    }
+                    rows.push(row.clone());
+                }
+                Ok(ExecutionResult::Rows { columns, rows })
+            }
+            _ => Err(QueryError::Execution("EXCEPT requires two SELECT statements".into())),
+        }
+    }
+
+    fn serialize_row(&self, row: &[Value]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for v in row {
+            match v {
+                Value::Int64(n) => { buf.push(1); buf.extend_from_slice(&n.to_be_bytes()); }
+                Value::Float64(f) => { buf.push(2); buf.extend_from_slice(&f.to_bits().to_be_bytes()); }
+                Value::Text(s) => { buf.push(3); buf.extend_from_slice(s.as_bytes()); buf.push(0); }
+                Value::Bool(b) => { buf.push(4); buf.push(*b as u8); }
+                Value::Null => { buf.push(0); }
+                _ => { buf.push(5); }
+            }
+        }
+        buf
+    }
+
+    fn exec_insert(&self, table: &str, columns: Option<Vec<String>>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let rows_to_insert: Vec<Vec<Value>> = match source {
+            InsertSource::Values(values) => {
+                let tables = self.tables.read();
+                let table_data = tables.get(table)
+                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+                let num_cols = table_data.schema.columns.len();
+
+                let col_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
+                    cols.iter().map(|c| {
+                        table_data.schema.column_index(c)
+                            .ok_or_else(|| QueryError::Execution(format!("Column '{}' not found", c)))
+                    }).collect::<Result<Vec<_>>>()
+                }).transpose()?;
+
+                let mut rows = Vec::new();
+                for row_exprs in &values {
+                    let mut row_values = vec![Value::Null; num_cols];
+                    if let Some(ref indices) = col_indices {
+                        for (i, e) in row_exprs.iter().enumerate() {
+                            if i < indices.len() {
+                                row_values[indices[i]] = self.eval_expr_simple(e);
+                            }
+                        }
+                    } else {
+                        for (i, e) in row_exprs.iter().enumerate() {
+                            if i < num_cols {
+                                row_values[i] = self.eval_expr_simple(e);
+                            }
+                        }
+                    }
+                    rows.push(row_values);
+                }
+                rows
+            }
+            InsertSource::Select(select_stmt) => {
+                let select_result = self.execute(Statement::Select(select_stmt), txn_id)?;
+                match select_result {
+                    ExecutionResult::Rows { rows, .. } => rows,
+                    _ => return Err(QueryError::Execution("INSERT ... SELECT did not return rows".into())),
+                }
+            }
+        };
+
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let table_id = table_data.schema.columns.len() as u32;
+        let pk_cols = table_data.schema.primary_key_columns();
+        let num_cols = table_data.schema.columns.len();
+        let mut count = 0u64;
+        let mut returned_rows: Vec<Vec<Value>> = Vec::new();
+
+        for mut row_values in rows_to_insert {
+            row_values.resize(num_cols, Value::Null);
+
+            for (i, col) in table_data.schema.columns.iter().enumerate() {
+                if row_values[i].is_null() {
+                    if col.auto_increment {
+                        if let Some(seq) = table_data.sequences.get(&col.name) {
+                            row_values[i] = Value::Int64(seq.next());
+                        }
+                    } else if let Some(ref default) = col.default {
+                        row_values[i] = default.clone();
+                    }
+                } else if col.auto_increment {
+                    if let Value::Int64(n) = &row_values[i] {
+                        if let Some(seq) = table_data.sequences.get(&col.name) {
+                            seq.observe(*n);
+                        }
+                    }
+                }
+                if row_values[i].is_null() && !col.nullable {
+                    return Err(QueryError::Execution(
+                        format!("NOT NULL constraint violated for column '{}'", col.name)
+                    ));
+                }
+            }
+
+            // UNIQUE enforcement (skip if also PK — PK handled by key collision below)
+            for (i, col) in table_data.schema.columns.iter().enumerate() {
+                if col.unique && !col.primary_key && !row_values[i].is_null() {
+                    let val = &row_values[i];
+                    let all = table_data.index.scan_all()
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                    for (_, other_data) in &all {
+                        if let Some(other) = Tuple::deserialize(other_data) {
+                            if other.get(i) == Some(val) {
+                                return Err(QueryError::Execution(
+                                    format!("UNIQUE constraint violated for column '{}'", col.name)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // CHECK constraints
+            {
+                let tup = Tuple::new(row_values.clone());
+                for chk in &table_data.check_exprs {
+                    if !self.eval_predicate(chk, &tup, &table_data.schema) {
+                        return Err(QueryError::Execution(
+                            format!("CHECK constraint failed on table '{}'", table)
+                        ));
+                    }
+                }
+            }
+
+            // FOREIGN KEY enforcement
+            for fk in &table_data.schema.foreign_keys {
+                let mut child_vals: Vec<Value> = Vec::new();
+                let mut any_null = false;
+                for cname in &fk.columns {
+                    if let Some(idx) = table_data.schema.column_index(cname) {
+                        if row_values[idx].is_null() { any_null = true; break; }
+                        child_vals.push(row_values[idx].clone());
+                    }
+                }
+                if any_null { continue; }
+                let parent = tables.get(&fk.ref_table)
+                    .ok_or_else(|| QueryError::Execution(format!("Foreign key references unknown table '{}'", fk.ref_table)))?;
+                let parent_idxs: Vec<usize> = fk.ref_columns.iter()
+                    .filter_map(|c| parent.schema.column_index(c)).collect();
+                let parent_all = parent.index.scan_all()
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                let mut found = false;
+                for (_, pdata) in &parent_all {
+                    if let Some(pt) = Tuple::deserialize(pdata) {
+                        let mut all_eq = true;
+                        for (j, pi) in parent_idxs.iter().enumerate() {
+                            if pt.get(*pi) != Some(&child_vals[j]) { all_eq = false; break; }
+                        }
+                        if all_eq { found = true; break; }
+                    }
+                }
+                if !found {
+                    return Err(QueryError::Execution(
+                        format!("FOREIGN KEY violation: no matching row in '{}'", fk.ref_table)
+                    ));
+                }
+            }
+
+            let tuple = Tuple::new(row_values.clone());
+            let key = tuple.key_bytes(&pk_cols);
+            let data = tuple.serialize();
+
+            let existing = table_data.index.search(&key)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+            if existing.is_some() {
+                if let Some(ref oc) = on_conflict {
+                    match &oc.action {
+                        ConflictAction::DoNothing => continue,
+                        ConflictAction::DoUpdate(assignments) => {
+                            let mut existing_tuple = Tuple::deserialize(existing.as_ref().unwrap()).unwrap();
+                            for (col_name, expr) in assignments {
+                                if let Some(idx) = table_data.schema.column_index(col_name) {
+                                    let new_val = self.eval_value(expr, &existing_tuple, &table_data.schema);
+                                    existing_tuple.set(idx, new_val);
+                                }
+                            }
+                            let new_data = existing_tuple.serialize();
+                            table_data.index.insert(key, new_data)
+                                .map_err(|e| QueryError::Execution(e.to_string()))?;
+                            if returning.is_some() {
+                                returned_rows.push(existing_tuple.values.to_vec());
+                            }
+                            count += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(tid) = txn_id {
+                self.wal_append(LogRecord::Insert {
+                    txn_id: tid,
+                    table_id,
+                    page_id: 0,
+                    slot: count as u16,
+                    data: data.clone(),
+                });
+                table_data.version_store.insert(key.clone(), tuple.clone(), tid, tid);
+            }
+
+            table_data.index.insert(key, data)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+            if returning.is_some() {
+                returned_rows.push(row_values);
+            }
+            count += 1;
+        }
+
+        if let Some(ref ret_cols) = returning {
+            let col_names: Vec<String> = table_data.schema.columns.iter().map(|c| c.name.clone()).collect();
+            return self.build_returning_result(ret_cols, &returned_rows, &col_names, &table_data.schema);
+        }
+
+        Ok(ExecutionResult::Modified { count })
+    }
+
+    fn exec_update(&self, table: &str, assignments: Vec<(String, Expr)>, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let table_id = table_data.schema.columns.len() as u32;
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
+            match table_data.index.search(&key) {
+                Ok(Some(data)) => vec![(key, data)],
+                _ => vec![],
+            }
+        } else {
+            table_data.index.scan_all()
+                .map_err(|e| QueryError::Execution(e.to_string()))?
+        };
+
+        let mut count = 0u64;
+        let mut returned_rows: Vec<Vec<Value>> = Vec::new();
+
+        for (key, data) in entries {
+            if let Some(mut tuple) = Tuple::deserialize(&data) {
+                let matches = if let Some(ref f) = filter {
+                    self.eval_predicate(f, &tuple, &table_data.schema)
+                } else {
+                    true
+                };
+
+                if matches {
+                    let old_data = data.clone();
+                    for (col_name, expr) in &assignments {
+                        if let Some(idx) = table_data.schema.column_index(col_name) {
+                            let new_val = self.eval_value(expr, &tuple, &table_data.schema);
+                            tuple.set(idx, new_val);
+                        }
+                    }
+
+                    for (i, col) in table_data.schema.columns.iter().enumerate() {
+                        if !col.nullable {
+                            if let Some(val) = tuple.get(i) {
+                                if val.is_null() {
+                                    return Err(QueryError::Execution(
+                                        format!("NOT NULL constraint violated for column '{}'", col.name)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    let new_data = tuple.serialize();
+
+                    if let Some(tid) = txn_id {
+                        self.wal_append(LogRecord::Update {
+                            txn_id: tid,
+                            table_id,
+                            page_id: 0,
+                            slot: count as u16,
+                            old_data,
+                            new_data: new_data.clone(),
+                        });
+                    }
+
+                    table_data.index.insert(key, new_data)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+                    if returning.is_some() {
+                        returned_rows.push(tuple.values.to_vec());
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        if let Some(ref ret_cols) = returning {
+            let col_names: Vec<String> = table_data.schema.columns.iter().map(|c| c.name.clone()).collect();
+            return self.build_returning_result(ret_cols, &returned_rows, &col_names, &table_data.schema);
+        }
+
+        Ok(ExecutionResult::Modified { count })
+    }
+
+    fn exec_delete(&self, table: &str, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let table_id = table_data.schema.columns.len() as u32;
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
+            match table_data.index.search(&key) {
+                Ok(Some(data)) => vec![(key, data)],
+                _ => vec![],
+            }
+        } else {
+            table_data.index.scan_all()
+                .map_err(|e| QueryError::Execution(e.to_string()))?
+        };
+
+        let mut count = 0u64;
+        let mut keys_to_delete = Vec::new();
+        let mut returned_rows: Vec<Vec<Value>> = Vec::new();
+
+        for (key, data) in entries {
+            if let Some(tuple) = Tuple::deserialize(&data) {
+                let matches = if let Some(ref f) = filter {
+                    self.eval_predicate(f, &tuple, &table_data.schema)
+                } else {
+                    true
+                };
+                if matches {
+                    if let Some(tid) = txn_id {
+                        self.wal_append(LogRecord::Delete {
+                            txn_id: tid,
+                            table_id,
+                            page_id: 0,
+                            slot: count as u16,
+                            old_data: data,
+                        });
+                        table_data.version_store.delete(&key, tid, tid);
+                    }
+                    if returning.is_some() {
+                        returned_rows.push(tuple.values.to_vec());
+                    }
+                    keys_to_delete.push(key);
+                    count += 1;
+                }
+            }
+        }
+
+        for key in keys_to_delete {
+            table_data.index.delete(&key)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+        }
+
+        if let Some(ref ret_cols) = returning {
+            let col_names: Vec<String> = table_data.schema.columns.iter().map(|c| c.name.clone()).collect();
+            return self.build_returning_result(ret_cols, &returned_rows, &col_names, &table_data.schema);
+        }
+
+        Ok(ExecutionResult::Modified { count })
+    }
+
+    fn exec_information_schema_tables(&self, filter: Option<&Expr>) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let columns = vec!["table_catalog".into(), "table_schema".into(), "table_name".into(), "table_type".into()];
+        let schema = Schema::new("", columns.iter().map(|c: &String| Column::new(c.clone(), DataType::Text)).collect());
+        let mut rows: Vec<Vec<Value>> = tables.keys().map(|name| {
+            vec![
+                Value::Text("bytedb".into()),
+                Value::Text("public".into()),
+                Value::Text(name.clone()),
+                Value::Text("BASE TABLE".into()),
+            ]
+        }).collect();
+
+        if let Some(f) = filter {
+            rows.retain(|row| {
+                let tuple = Tuple::new(row.clone());
+                self.eval_predicate(f, &tuple, &schema)
+            });
+        }
+
+        Ok(ExecutionResult::Rows { columns, rows })
+    }
+
+    fn exec_information_schema_columns(&self, filter: Option<&Expr>) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let columns = vec![
+            "table_catalog".into(), "table_schema".into(), "table_name".into(),
+            "column_name".into(), "ordinal_position".into(), "is_nullable".into(),
+            "data_type".into(),
+        ];
+        let schema = Schema::new("", columns.iter().map(|c: &String| Column::new(c.clone(), DataType::Text)).collect());
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+
+        for (table_name, td) in tables.iter() {
+            for (i, col) in td.schema.columns.iter().enumerate() {
+                rows.push(vec![
+                    Value::Text("bytedb".into()),
+                    Value::Text("public".into()),
+                    Value::Text(table_name.clone()),
+                    Value::Text(col.name.clone()),
+                    Value::Int64((i + 1) as i64),
+                    Value::Text(if col.nullable { "YES" } else { "NO" }.into()),
+                    Value::Text(format!("{:?}", col.data_type)),
+                ]);
+            }
+        }
+
+        if let Some(f) = filter {
+            rows.retain(|row| {
+                let tuple = Tuple::new(row.clone());
+                self.eval_predicate(f, &tuple, &schema)
+            });
+        }
+
+        Ok(ExecutionResult::Rows { columns, rows })
+    }
+
+    fn materialize_cte(&self, name: &str, columns: &[String], rows: Vec<Vec<Value>>) -> Result<()> {
+        let col_schemas: Vec<Column> = columns.iter().enumerate().map(|(i, c)| {
+            Column {
+                name: c.clone(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: i == 0,
+                unique: false,
+                auto_increment: false,
+                default: None,
+            }
+        }).collect();
+
+        let schema = Schema::new(name, col_schemas);
+        let index = Arc::new(BPlusTree::new(name, 64));
+        let version_store = Arc::new(VersionStore::new());
+        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new() };
+
+        for (i, row) in rows.into_iter().enumerate() {
+            let tuple = Tuple::new(row);
+            let key = (i as i64).to_be_bytes().to_vec();
+            let data = tuple.serialize();
+            table_data.index.insert(key, data)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+        }
+
+        self.tables.write().insert(name.to_string(), table_data);
+        Ok(())
+    }
+
+    fn build_returning_result(&self, ret_cols: &[SelectColumn], rows: &[Vec<Value>], col_names: &[String], schema: &Schema) -> Result<ExecutionResult> {
+        let is_star = matches!(ret_cols.first(), Some(SelectColumn::Star));
+        if is_star {
+            return Ok(ExecutionResult::Rows {
+                columns: col_names.to_vec(),
+                rows: rows.to_vec(),
+            });
+        }
+
+        let mut out_col_names = Vec::new();
+        let mut out_rows: Vec<Vec<Value>> = Vec::new();
+
+        for col in ret_cols {
+            match col {
+                SelectColumn::Star => unreachable!(),
+                SelectColumn::Expr(expr, alias) => {
+                    let name = alias.clone().unwrap_or_else(|| match expr {
+                        Expr::Column(c) => c.clone(),
+                        _ => "?column?".to_string(),
+                    });
+                    out_col_names.push(name);
+                }
+            }
+        }
+
+        for row in rows {
+            let tuple = Tuple::new(row.clone());
+            let mut out_row = Vec::new();
+            for col in ret_cols {
+                match col {
+                    SelectColumn::Star => unreachable!(),
+                    SelectColumn::Expr(expr, _) => {
+                        out_row.push(self.eval_value(expr, &tuple, schema));
+                    }
+                }
+            }
+            out_rows.push(out_row);
+        }
+
+        Ok(ExecutionResult::Rows { columns: out_col_names, rows: out_rows })
+    }
+
+    fn exec_seq_scan(&self, table: &str, filter: Option<&Expr>, txn_id: Option<TxnId>, limit: Option<usize>, needed_columns: Option<&[usize]>) -> Result<ExecutionResult> {
+        if table == "information_schema.tables" {
+            return self.exec_information_schema_tables(filter);
+        }
+        if table == "information_schema.columns" {
+            return self.exec_information_schema_columns(filter);
+        }
+
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let col_names: Vec<String> = table_data.schema.columns.iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let mut rows = Vec::new();
+
+        if let Some(tid) = txn_id {
+            let snapshot = self.txn_manager.get_snapshot(tid)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let visible = table_data.version_store.get_all_visible(
+                tid,
+                snapshot.start_ts,
+                &snapshot.active_txns,
+            );
+            for (_key, tuple) in visible {
+                let matches = if let Some(f) = filter {
+                    self.eval_predicate(f, &tuple, &table_data.schema)
+                } else {
+                    true
+                };
+                if matches {
+                    rows.push(tuple.values);
+                    if let Some(lim) = limit {
+                        if rows.len() >= lim { break; }
+                    }
+                }
+            }
+        } else if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
+            if let Ok(Some(data)) = table_data.index.search(&key) {
+                if let Some(tuple) = Tuple::deserialize(&data) {
+                    rows.push(tuple.values);
+                }
+            }
+        } else {
+            let schema = &table_data.schema;
+            let scan_limit = limit;
+            let fast_filter = filter.and_then(|f| self.try_fast_filter(f, schema));
+            if let Some((col_idx, op, ref lit_val)) = fast_filter {
+                let op_code: u8 = match op {
+                    BinOp::Eq => 0,
+                    BinOp::Neq => 1,
+                    BinOp::Lt => 2,
+                    BinOp::Gt => 3,
+                    BinOp::Lte => 4,
+                    BinOp::Gte => 5,
+                    _ => 255,
+                };
+                table_data.index.for_each(|_key, data| {
+                    match raw_filter_matches(data, col_idx, op_code, lit_val) {
+                        Some(true) => {
+                            if let Some(tuple) = Tuple::deserialize(data) {
+                                rows.push(tuple.values);
+                                if let Some(lim) = scan_limit {
+                                    if rows.len() >= lim { return false; }
+                                }
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            // Fallback: null or unsupported type, skip row
+                        }
+                    }
+                    true
+                }).map_err(|e| QueryError::Execution(e.to_string()))?;
+            } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
+                // Full scan — sequential, no filter
+                table_data.index.for_each(|_key, data| {
+                    if let Some(tuple) = Tuple::deserialize(data) {
+                        rows.push(tuple.values);
+                    }
+                    true
+                }).map_err(|e| QueryError::Execution(e.to_string()))?;
+            } else {
+                table_data.index.for_each(|_key, data| {
+                    let tuple = if let Some(nc) = needed_columns {
+                        Tuple::deserialize_columns(data, nc)
+                    } else {
+                        Tuple::deserialize(data)
+                    };
+                    if let Some(tuple) = tuple {
+                        let matches = if let Some(f) = filter {
+                            self.eval_predicate(f, &tuple, schema)
+                        } else {
+                            true
+                        };
+                        if matches {
+                            rows.push(tuple.values);
+                            if let Some(lim) = scan_limit {
+                                if rows.len() >= lim { return false; }
+                            }
+                        }
+                    }
+                    true
+                }).map_err(|e| QueryError::Execution(e.to_string()))?;
+            }
+        }
+
+        Ok(ExecutionResult::Rows { columns: col_names, rows })
+    }
+
+    fn exec_scan_top_n(&self, table: &str, filter: Option<&Expr>, _txn_id: Option<TxnId>, order_by: &[OrderByExpr], n: usize) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let col_names: Vec<String> = table_data.schema.columns.iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let sort_col_name = match &order_by[0].expr {
+            Expr::Column(name) => name,
+            _ => return Err(QueryError::Execution("Non-column ORDER BY".into())),
+        };
+        let sort_col_idx = table_data.schema.column_index(sort_col_name)
+            .ok_or_else(|| QueryError::Execution(format!("Column '{}' not found", sort_col_name)))?;
+        let asc = order_by[0].ascending;
+
+        let schema = &table_data.schema;
+        let fast_filter = filter.and_then(|f| self.try_fast_filter(f, schema));
+        let op_code: u8 = fast_filter.as_ref().map(|(_, op, _)| match op {
+            BinOp::Eq => 0, BinOp::Neq => 1, BinOp::Lt => 2,
+            BinOp::Gt => 3, BinOp::Lte => 4, BinOp::Gte => 5, _ => 255,
+        }).unwrap_or(255);
+
+        // Phase 1: collect (heap_key, raw_data_index) using zero-copy
+        // Store raw data for top-N rows only
+        let mut heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(n + 1);
+        let mut kept_data: Vec<Vec<u8>> = Vec::with_capacity(n + 1);
+        let mut all_int = true;
+
+        table_data.index.for_each(|_key, data| {
+            // Zero-copy filter
+            let matches = if let Some((col_idx, _, ref lit_val)) = fast_filter {
+                raw_filter_matches(data, col_idx, op_code, lit_val).unwrap_or(false)
+            } else {
+                true
+            };
+
+            if matches {
+                // Zero-copy sort key extraction
+                match read_int64_at(data, sort_col_idx) {
+                    Some(k) => {
+                        let heap_key = if asc { k } else { -k };
+                        if heap.len() < n {
+                            let idx = kept_data.len();
+                            kept_data.push(data.to_vec());
+                            heap.push((heap_key, idx));
+                        } else if let Some(&(top_key, _)) = heap.peek() {
+                            if heap_key < top_key {
+                                let (_, old_idx) = heap.pop().unwrap();
+                                kept_data[old_idx].clear();
+                                let idx = kept_data.len();
+                                kept_data.push(data.to_vec());
+                                heap.push((heap_key, idx));
+                            }
+                        }
+                    }
+                    None => { all_int = false; return false; }
+                }
+            }
+            true
+        }).map_err(|e| QueryError::Execution(e.to_string()))?;
+
+        if !all_int {
+            return Err(QueryError::Execution("Non-int sort column".into()));
+        }
+
+        // Phase 2: deserialize only the N winners
+        let mut entries: Vec<(i64, Vec<Value>)> = heap.into_vec().into_iter()
+            .filter_map(|(_, idx)| {
+                let data = &kept_data[idx];
+                if data.is_empty() { return None; }
+                let tuple = Tuple::deserialize(data)?;
+                let k = match tuple.values.get(sort_col_idx) {
+                    Some(Value::Int64(v)) => *v,
+                    _ => i64::MIN,
+                };
+                Some((k, tuple.values))
+            })
+            .collect();
+
+        entries.sort_unstable_by(|(a, _), (b, _)| if asc { a.cmp(b) } else { b.cmp(a) });
+        let result: Vec<Vec<Value>> = entries.into_iter().map(|(_, row)| row).collect();
+
+        Ok(ExecutionResult::Rows { columns: col_names, rows: result })
+    }
+
+    fn try_fast_filter(&self, expr: &Expr, schema: &Schema) -> Option<(usize, BinOp, Value)> {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {}
+                    _ => return None,
+                }
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(name), Expr::Literal(lit)) => {
+                        let idx = schema.column_index(name)?;
+                        let val = self.eval_expr_simple(&Expr::Literal(lit.clone()));
+                        Some((idx, *op, val))
+                    }
+                    (Expr::Literal(lit), Expr::Column(name)) => {
+                        let idx = schema.column_index(name)?;
+                        let val = self.eval_expr_simple(&Expr::Literal(lit.clone()));
+                        let flipped_op = match op {
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Lte => BinOp::Gte,
+                            BinOp::Gte => BinOp::Lte,
+                            other => *other,
+                        };
+                        Some((idx, flipped_op, val))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn try_pk_lookup(&self, filter: Option<&Expr>, schema: &Schema) -> Option<Vec<u8>> {
+        let filter = filter?;
+        let pk_indices = schema.primary_key_columns();
+        if pk_indices.len() != 1 {
+            return None;
+        }
+        let pk_name = &schema.columns[pk_indices[0]].name;
+
+        match filter {
+            Expr::BinaryOp { left, op: BinOp::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(name), Expr::Literal(lit)) if name == pk_name => {
+                        Some(self.literal_to_key_bytes(lit))
+                    }
+                    (Expr::Literal(lit), Expr::Column(name)) if name == pk_name => {
+                        Some(self.literal_to_key_bytes(lit))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn literal_to_key_bytes(&self, lit: &LiteralValue) -> Vec<u8> {
+        let value = match lit {
+            LiteralValue::Integer(n) => Value::Int64(*n),
+            LiteralValue::Float(f) => Value::Float64(*f),
+            LiteralValue::String(s) => Value::Text(s.clone()),
+            LiteralValue::Bool(b) => Value::Bool(*b),
+            LiteralValue::Null => Value::Null,
+        };
+        let tuple = Tuple::new(vec![value]);
+        tuple.key_bytes(&[0])
+    }
+
+    fn apply_projection(&self, result: ExecutionResult, columns: &[SelectColumn]) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns: col_names, rows } => {
+                if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
+                    return Ok(ExecutionResult::Rows { columns: col_names, rows });
+                }
+
+                let has_window = columns.iter().any(|c| matches!(c, SelectColumn::Expr(Expr::WindowFunction { .. }, _)));
+                if has_window {
+                    return self.apply_projection_with_windows(col_names, rows, columns);
+                }
+
+                let schema = Schema::new("", col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+
+                let mut new_col_names = Vec::new();
+                for col in columns {
+                    match col {
+                        SelectColumn::Star => {
+                            for name in &col_names {
+                                new_col_names.push(name.clone());
+                            }
+                        }
+                        SelectColumn::Expr(Expr::Column(name), alias) => {
+                            new_col_names.push(alias.clone().unwrap_or_else(|| name.clone()));
+                        }
+                        SelectColumn::Expr(Expr::QualifiedColumn(_table, col_name), alias) => {
+                            new_col_names.push(alias.clone().unwrap_or_else(|| col_name.clone()));
+                        }
+                        SelectColumn::Expr(Expr::Function { name, args }, alias) => {
+                            let arg_name = if args.is_empty() { "*".to_string() } else {
+                                match &args[0] {
+                                    Expr::Column(c) => c.clone(),
+                                    _ => "*".to_string(),
+                                }
+                            };
+                            let func_col = format!("{}({})", name.to_lowercase(), arg_name);
+                            new_col_names.push(alias.clone().unwrap_or(func_col));
+                        }
+                        SelectColumn::Expr(_, alias) => {
+                            new_col_names.push(alias.clone().unwrap_or_else(|| "?".into()));
+                        }
+                    }
+                }
+
+                let new_rows: Vec<Vec<Value>> = rows.into_iter().map(|row| {
+                    let tuple = Tuple::new(row.clone());
+                    columns.iter().flat_map(|col| {
+                        match col {
+                            SelectColumn::Star => row.clone(),
+                            SelectColumn::Expr(Expr::Column(name), _) => {
+                                let idx = col_names.iter().position(|c| c == name || c.ends_with(&format!(".{}", name))).unwrap_or(0);
+                                vec![row.get(idx).cloned().unwrap_or(Value::Null)]
+                            }
+                            SelectColumn::Expr(Expr::QualifiedColumn(table, col_name), _) => {
+                                let qualified = format!("{}.{}", table, col_name);
+                                let idx = col_names.iter().position(|c| c == &qualified)
+                                    .or_else(|| col_names.iter().position(|c| c == col_name || c.ends_with(&format!(".{}", col_name))))
+                                    .unwrap_or(0);
+                                vec![row.get(idx).cloned().unwrap_or(Value::Null)]
+                            }
+                            SelectColumn::Expr(Expr::Function { name: fname, args }, _) => {
+                                let arg_name = if args.is_empty() { "*".to_string() } else {
+                                    match &args[0] {
+                                        Expr::Column(c) => c.clone(),
+                                        _ => "*".to_string(),
+                                    }
+                                };
+                                let func_col = format!("{}({})", fname.to_lowercase(), arg_name);
+                                if let Some(idx) = col_names.iter().position(|c| c == &func_col) {
+                                    vec![row.get(idx).cloned().unwrap_or(Value::Null)]
+                                } else {
+                                    let expr = Expr::Function { name: fname.clone(), args: args.clone() };
+                                    vec![self.eval_value(&expr, &tuple, &schema)]
+                                }
+                            }
+                            SelectColumn::Expr(expr, _) => {
+                                vec![self.eval_value(expr, &tuple, &schema)]
+                            }
+                        }
+                    }).collect()
+                }).collect();
+
+                Ok(ExecutionResult::Rows { columns: new_col_names, rows: new_rows })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn apply_projection_with_windows(&self, col_names: Vec<String>, rows: Vec<Vec<Value>>, columns: &[SelectColumn]) -> Result<ExecutionResult> {
+        let schema = Schema::new("", col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+        let num_rows = rows.len();
+
+        let mut new_col_names = Vec::new();
+        for col in columns {
+            match col {
+                SelectColumn::Star => new_col_names.extend(col_names.clone()),
+                SelectColumn::Expr(Expr::Column(name), alias) => {
+                    new_col_names.push(alias.clone().unwrap_or_else(|| name.clone()));
+                }
+                SelectColumn::Expr(Expr::WindowFunction { name, .. }, alias) => {
+                    new_col_names.push(alias.clone().unwrap_or_else(|| name.to_lowercase()));
+                }
+                SelectColumn::Expr(Expr::Function { name, args }, alias) => {
+                    let arg_name = if args.is_empty() { "*".to_string() } else {
+                        match &args[0] { Expr::Column(c) => c.clone(), _ => "*".to_string() }
+                    };
+                    new_col_names.push(alias.clone().unwrap_or_else(|| format!("{}({})", name.to_lowercase(), arg_name)));
+                }
+                SelectColumn::Expr(_, alias) => {
+                    new_col_names.push(alias.clone().unwrap_or_else(|| "?".into()));
+                }
+            }
+        }
+
+        let mut window_results: Vec<Vec<Value>> = Vec::new();
+        for col in columns {
+            if let SelectColumn::Expr(Expr::WindowFunction { name, args, partition_by, order_by }, _) = col {
+                let values = self.compute_window_function(name, args, partition_by, order_by, &rows, &col_names, &schema);
+                window_results.push(values);
+            }
+        }
+
+        let mut new_rows: Vec<Vec<Value>> = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
+            let tuple = Tuple::new(rows[row_idx].clone());
+            let mut new_row = Vec::new();
+            let mut win_idx = 0;
+            for col in columns {
+                match col {
+                    SelectColumn::Star => new_row.extend(rows[row_idx].clone()),
+                    SelectColumn::Expr(Expr::WindowFunction { .. }, _) => {
+                        new_row.push(window_results[win_idx][row_idx].clone());
+                        win_idx += 1;
+                    }
+                    SelectColumn::Expr(Expr::Column(name), _) => {
+                        let idx = col_names.iter().position(|c| c == name).unwrap_or(0);
+                        new_row.push(rows[row_idx].get(idx).cloned().unwrap_or(Value::Null));
+                    }
+                    SelectColumn::Expr(expr, _) => {
+                        new_row.push(self.eval_value(expr, &tuple, &schema));
+                    }
+                }
+            }
+            new_rows.push(new_row);
+        }
+
+        Ok(ExecutionResult::Rows { columns: new_col_names, rows: new_rows })
+    }
+
+    fn compute_window_function(&self, name: &str, args: &[Expr], partition_by: &[Expr], order_by: &[OrderByExpr], rows: &[Vec<Value>], col_names: &[String], schema: &Schema) -> Vec<Value> {
+        let num_rows = rows.len();
+        let mut result = vec![Value::Null; num_rows];
+
+        let partition_keys: Vec<Vec<Value>> = rows.iter().map(|row| {
+            let tuple = Tuple::new(row.clone());
+            partition_by.iter().map(|e| self.eval_value(e, &tuple, schema)).collect()
+        }).collect();
+
+        let sort_keys: Vec<Vec<Value>> = rows.iter().map(|row| {
+            let tuple = Tuple::new(row.clone());
+            order_by.iter().map(|o| self.eval_value(&o.expr, &tuple, schema)).collect()
+        }).collect();
+
+        let mut partitions: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for i in 0..num_rows {
+            let key = self.serialize_partition_key(&partition_keys[i]);
+            partitions.entry(key).or_default().push(i);
+        }
+
+        let func_upper = name.to_uppercase();
+        for (_key, mut indices) in partitions {
+            if !order_by.is_empty() {
+                indices.sort_by(|&a, &b| {
+                    for (i, ob) in order_by.iter().enumerate() {
+                        let va = &sort_keys[a][i];
+                        let vb = &sort_keys[b][i];
+                        let cmp = va.compare(vb).unwrap_or(Ordering::Equal);
+                        let cmp = if ob.ascending { cmp } else { cmp.reverse() };
+                        if cmp != Ordering::Equal { return cmp; }
+                    }
+                    Ordering::Equal
+                });
+            }
+
+            match func_upper.as_str() {
+                "ROW_NUMBER" => {
+                    for (rank, &idx) in indices.iter().enumerate() {
+                        result[idx] = Value::Int64((rank + 1) as i64);
+                    }
+                }
+                "RANK" => {
+                    let mut rank = 1;
+                    for i in 0..indices.len() {
+                        if i > 0 && sort_keys[indices[i]] != sort_keys[indices[i - 1]] {
+                            rank = i + 1;
+                        }
+                        result[indices[i]] = Value::Int64(rank as i64);
+                    }
+                }
+                "DENSE_RANK" => {
+                    let mut rank = 1;
+                    for i in 0..indices.len() {
+                        if i > 0 && sort_keys[indices[i]] != sort_keys[indices[i - 1]] {
+                            rank += 1;
+                        }
+                        result[indices[i]] = Value::Int64(rank as i64);
+                    }
+                }
+                "SUM" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let mut running_sum: f64 = 0.0;
+                    for &idx in &indices {
+                        if let Some(ci) = col_idx {
+                            match &rows[idx][ci] {
+                                Value::Int64(v) => running_sum += *v as f64,
+                                Value::Float64(v) => running_sum += *v,
+                                _ => {}
+                            }
+                        }
+                        result[idx] = Value::Float64(running_sum);
+                    }
+                }
+                "AVG" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let mut running_sum: f64 = 0.0;
+                    let mut count = 0i64;
+                    for &idx in &indices {
+                        if let Some(ci) = col_idx {
+                            match &rows[idx][ci] {
+                                Value::Int64(v) => { running_sum += *v as f64; count += 1; }
+                                Value::Float64(v) => { running_sum += *v; count += 1; }
+                                _ => {}
+                            }
+                        }
+                        result[idx] = if count > 0 { Value::Float64(running_sum / count as f64) } else { Value::Null };
+                    }
+                }
+                "COUNT" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let mut count = 0i64;
+                    for &idx in &indices {
+                        if let Some(ci) = col_idx {
+                            if !rows[idx][ci].is_null() { count += 1; }
+                        } else {
+                            count += 1;
+                        }
+                        result[idx] = Value::Int64(count);
+                    }
+                }
+                "MIN" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let mut min_val = Value::Null;
+                    for &idx in &indices {
+                        if let Some(ci) = col_idx {
+                            let v = &rows[idx][ci];
+                            if !v.is_null() {
+                                min_val = match &min_val {
+                                    Value::Null => v.clone(),
+                                    cur => if v.compare(cur) == Some(Ordering::Less) { v.clone() } else { cur.clone() },
+                                };
+                            }
+                        }
+                        result[idx] = min_val.clone();
+                    }
+                }
+                "MAX" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let mut max_val = Value::Null;
+                    for &idx in &indices {
+                        if let Some(ci) = col_idx {
+                            let v = &rows[idx][ci];
+                            if !v.is_null() {
+                                max_val = match &max_val {
+                                    Value::Null => v.clone(),
+                                    cur => if v.compare(cur) == Some(Ordering::Greater) { v.clone() } else { cur.clone() },
+                                };
+                            }
+                        }
+                        result[idx] = max_val.clone();
+                    }
+                }
+                "LAG" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let offset = if args.len() >= 2 {
+                        match &args[1] { Expr::Literal(LiteralValue::Integer(n)) => *n as usize, _ => 1 }
+                    } else { 1 };
+                    for (i, &idx) in indices.iter().enumerate() {
+                        if i >= offset {
+                            let prev_idx = indices[i - offset];
+                            result[idx] = col_idx.map(|ci| rows[prev_idx][ci].clone()).unwrap_or(Value::Null);
+                        } else {
+                            result[idx] = Value::Null;
+                        }
+                    }
+                }
+                "LEAD" => {
+                    let col_idx = self.resolve_window_arg(args, col_names, schema);
+                    let offset = if args.len() >= 2 {
+                        match &args[1] { Expr::Literal(LiteralValue::Integer(n)) => *n as usize, _ => 1 }
+                    } else { 1 };
+                    for (i, &idx) in indices.iter().enumerate() {
+                        if i + offset < indices.len() {
+                            let next_idx = indices[i + offset];
+                            result[idx] = col_idx.map(|ci| rows[next_idx][ci].clone()).unwrap_or(Value::Null);
+                        } else {
+                            result[idx] = Value::Null;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    fn resolve_window_arg(&self, args: &[Expr], col_names: &[String], _schema: &Schema) -> Option<usize> {
+        if args.is_empty() { return None; }
+        match &args[0] {
+            Expr::Column(name) => col_names.iter().position(|c| c == name),
+            _ => None,
+        }
+    }
+
+    fn serialize_partition_key(&self, values: &[Value]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for v in values {
+            match v {
+                Value::Int64(n) => { buf.push(1); buf.extend_from_slice(&n.to_be_bytes()); }
+                Value::Float64(f) => { buf.push(2); buf.extend_from_slice(&f.to_bits().to_be_bytes()); }
+                Value::Text(s) => { buf.push(3); buf.extend_from_slice(s.as_bytes()); buf.push(0); }
+                Value::Bool(b) => { buf.push(4); buf.push(*b as u8); }
+                Value::Null => { buf.push(0); }
+                _ => { buf.push(5); }
+            }
+        }
+        buf
+    }
+
+    fn apply_filter(&self, result: ExecutionResult, predicate: &Expr) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns, rows } => {
+                let schema = Schema::new("", columns.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+                let filtered: Vec<Vec<Value>> = rows.into_iter().filter(|row| {
+                    let tuple = Tuple::new(row.clone());
+                    self.eval_predicate(predicate, &tuple, &schema)
+                }).collect();
+                Ok(ExecutionResult::Rows { columns, rows: filtered })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn apply_distinct(&self, result: ExecutionResult) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns, rows } => {
+                let mut seen = std::collections::HashSet::new();
+                let mut unique_rows = Vec::new();
+                for row in rows {
+                    let key: Vec<u8> = row.iter().flat_map(|v| {
+                        let mut buf = Vec::new();
+                        match v {
+                            Value::Null => buf.push(0),
+                            Value::Bool(b) => { buf.push(1); buf.push(*b as u8); }
+                            Value::Int64(n) => { buf.push(2); buf.extend_from_slice(&n.to_le_bytes()); }
+                            Value::Float64(f) => { buf.push(3); buf.extend_from_slice(&f.to_le_bytes()); }
+                            Value::Text(s) => { buf.push(4); buf.extend_from_slice(s.as_bytes()); buf.push(0); }
+                            _ => { buf.push(5); buf.extend_from_slice(&format!("{:?}", v).as_bytes()); buf.push(0); }
+                        }
+                        buf
+                    }).collect();
+                    if seen.insert(key) {
+                        unique_rows.push(row);
+                    }
+                }
+                Ok(ExecutionResult::Rows { columns, rows: unique_rows })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn apply_sort(&self, result: ExecutionResult, order_by: &[OrderByExpr]) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns, mut rows } => {
+                let col_indices: Vec<(usize, bool, Option<bool>)> = order_by.iter().filter_map(|o| {
+                    if let Expr::Column(name) = &o.expr {
+                        columns.iter().position(|c| c == name).map(|i| (i, o.ascending, o.nulls_first))
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                if col_indices.len() == order_by.len() {
+                    if col_indices.len() == 1 && col_indices[0].2.is_none() {
+                        let (idx, asc, _) = col_indices[0];
+                        let all_int = rows.iter().all(|r| matches!(r.get(idx), Some(Value::Int64(_)) | Some(Value::Null)));
+                        if all_int {
+                            let mut keyed: Vec<(i64, usize)> = rows.iter().enumerate().map(|(i, r)| {
+                                let k = match r.get(idx) {
+                                    Some(Value::Int64(n)) => *n,
+                                    _ => i64::MIN,
+                                };
+                                (k, i)
+                            }).collect();
+                            if asc {
+                                keyed.sort_unstable_by_key(|&(k, _)| k);
+                            } else {
+                                keyed.sort_unstable_by_key(|&(k, _)| std::cmp::Reverse(k));
+                            }
+                            let sorted: Vec<Vec<Value>> = keyed.into_iter().map(|(_, i)| {
+                                std::mem::take(&mut rows[i])
+                            }).collect();
+                            return Ok(ExecutionResult::Rows { columns, rows: sorted });
+                        }
+                    }
+
+                    rows.sort_unstable_by(|a, b| {
+                        for &(idx, asc, nulls_first) in &col_indices {
+                            let va = a.get(idx).unwrap_or(&Value::Null);
+                            let vb = b.get(idx).unwrap_or(&Value::Null);
+                            let a_null = va.is_null();
+                            let b_null = vb.is_null();
+                            if a_null || b_null {
+                                if a_null && b_null { continue; }
+                                let nf = nulls_first.unwrap_or(!asc);
+                                return if a_null {
+                                    if nf { Ordering::Less } else { Ordering::Greater }
+                                } else {
+                                    if nf { Ordering::Greater } else { Ordering::Less }
+                                };
+                            }
+                            let ord = va.cmp_fast(vb);
+                            if ord != Ordering::Equal {
+                                return if asc { ord } else { ord.reverse() };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                } else {
+                    let schema = Schema::new("", columns.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+                    rows.sort_by(|a, b| {
+                        for ob in order_by {
+                            let tuple_a = Tuple::new(a.clone());
+                            let tuple_b = Tuple::new(b.clone());
+                            let va = self.eval_value(&ob.expr, &tuple_a, &schema);
+                            let vb = self.eval_value(&ob.expr, &tuple_b, &schema);
+                            let a_null = va.is_null();
+                            let b_null = vb.is_null();
+                            if a_null || b_null {
+                                if a_null && b_null { continue; }
+                                let nf = ob.nulls_first.unwrap_or(!ob.ascending);
+                                return if a_null {
+                                    if nf { Ordering::Less } else { Ordering::Greater }
+                                } else {
+                                    if nf { Ordering::Greater } else { Ordering::Less }
+                                };
+                            }
+                            let ord = va.compare(&vb).unwrap_or(Ordering::Equal);
+                            if ord != Ordering::Equal {
+                                return if ob.ascending { ord } else { ord.reverse() };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                }
+
+                Ok(ExecutionResult::Rows { columns, rows })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn apply_limit(&self, result: ExecutionResult, count: usize, offset: usize) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns, rows } => {
+                let rows: Vec<Vec<Value>> = rows.into_iter().skip(offset).take(count).collect();
+                Ok(ExecutionResult::Rows { columns, rows })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn apply_top_n(&self, result: ExecutionResult, order_by: &[OrderByExpr], n: usize) -> Result<ExecutionResult> {
+        match result {
+            ExecutionResult::Rows { columns, rows } => {
+                let col_indices: Vec<(usize, bool)> = order_by.iter().filter_map(|o| {
+                    if let Expr::Column(name) = &o.expr {
+                        columns.iter().position(|c| c == name).map(|i| (i, o.ascending))
+                    } else {
+                        None
+                    }
+                }).collect();
+
+                if col_indices.is_empty() {
+                    let rows: Vec<Vec<Value>> = rows.into_iter().take(n).collect();
+                    return Ok(ExecutionResult::Rows { columns, rows });
+                }
+
+                if rows.len() <= n {
+                    let mut rows = rows;
+                    rows.sort_unstable_by(|a, b| {
+                        for &(idx, asc) in &col_indices {
+                            let va = a.get(idx).unwrap_or(&Value::Null);
+                            let vb = b.get(idx).unwrap_or(&Value::Null);
+                            let ord = va.cmp_fast(vb);
+                            if ord != Ordering::Equal {
+                                return if asc { ord } else { ord.reverse() };
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    return Ok(ExecutionResult::Rows { columns, rows });
+                }
+
+                if col_indices.len() == 1 {
+                    let (idx, asc) = col_indices[0];
+                    let all_int = rows.iter().all(|r| matches!(r.get(idx), Some(Value::Int64(_)) | Some(Value::Null)));
+                    if all_int {
+                        let mut heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(n + 1);
+                        for (i, row) in rows.iter().enumerate() {
+                            let k = match row.get(idx) {
+                                Some(Value::Int64(v)) => *v,
+                                _ => i64::MIN,
+                            };
+                            let heap_key = if asc { k } else { -k };
+                            heap.push((heap_key, i));
+                            if heap.len() > n {
+                                heap.pop();
+                            }
+                        }
+                        let mut indices: Vec<usize> = heap.into_vec().into_iter().map(|(_, i)| i).collect();
+                        indices.sort_unstable_by(|&a, &b| {
+                            let ka = match rows[a].get(idx) { Some(Value::Int64(v)) => *v, _ => i64::MIN };
+                            let kb = match rows[b].get(idx) { Some(Value::Int64(v)) => *v, _ => i64::MIN };
+                            if asc { ka.cmp(&kb) } else { kb.cmp(&ka) }
+                        });
+                        let mut rows = rows;
+                        let result: Vec<Vec<Value>> = indices.into_iter().map(|i| {
+                            std::mem::take(&mut rows[i])
+                        }).collect();
+                        return Ok(ExecutionResult::Rows { columns, rows: result });
+                    }
+                }
+
+                struct HeapRow {
+                    row: Vec<Value>,
+                    col_indices: *const Vec<(usize, bool)>,
+                }
+
+                impl PartialEq for HeapRow {
+                    fn eq(&self, other: &Self) -> bool {
+                        self.cmp(other) == Ordering::Equal
+                    }
+                }
+                impl Eq for HeapRow {}
+
+                impl PartialOrd for HeapRow {
+                    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                        Some(self.cmp(other))
+                    }
+                }
+
+                impl Ord for HeapRow {
+                    fn cmp(&self, other: &Self) -> Ordering {
+                        let indices = unsafe { &*self.col_indices };
+                        for &(idx, asc) in indices {
+                            let va = self.row.get(idx).unwrap_or(&Value::Null);
+                            let vb = other.row.get(idx).unwrap_or(&Value::Null);
+                            let ord = va.cmp_fast(vb);
+                            if ord != Ordering::Equal {
+                                return if asc { ord } else { ord.reverse() };
+                            }
+                        }
+                        Ordering::Equal
+                    }
+                }
+
+                let indices_ptr: *const Vec<(usize, bool)> = &col_indices;
+                let mut heap: BinaryHeap<HeapRow> = BinaryHeap::with_capacity(n + 1);
+
+                for row in rows {
+                    heap.push(HeapRow { row, col_indices: indices_ptr });
+                    if heap.len() > n {
+                        heap.pop();
+                    }
+                }
+
+                let mut result: Vec<Vec<Value>> = heap.into_iter().map(|hr| hr.row).collect();
+                result.sort_unstable_by(|a, b| {
+                    for &(idx, asc) in &col_indices {
+                        let va = a.get(idx).unwrap_or(&Value::Null);
+                        let vb = b.get(idx).unwrap_or(&Value::Null);
+                        let ord = va.cmp_fast(vb);
+                        if ord != Ordering::Equal {
+                            return if asc { ord } else { ord.reverse() };
+                        }
+                    }
+                    Ordering::Equal
+                });
+
+                Ok(ExecutionResult::Rows { columns, rows: result })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn exec_hash_join(&self, left: PhysicalPlan, right: PhysicalPlan, condition: Expr, join_type: JoinType, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let left_table = Self::plan_table_name(&left);
+        let right_table = Self::plan_table_name(&right);
+        let left_result = self.execute_physical(left, txn_id)?;
+        let right_result = self.execute_physical(right, txn_id)?;
+
+        let (left_cols, left_rows) = match left_result {
+            ExecutionResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err(QueryError::Execution("JOIN requires row input".into())),
+        };
+        let (right_cols, right_rows) = match right_result {
+            ExecutionResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err(QueryError::Execution("JOIN requires row input".into())),
+        };
+
+        let (left_key_idx, right_key_idx) = self.extract_join_keys(&condition, &left_cols, &right_cols)?;
+
+        let right_all_int = right_rows.iter().all(|r| matches!(r.get(right_key_idx), Some(Value::Int64(_))));
+        let left_all_int = right_all_int && left_rows.iter().all(|r| matches!(r.get(left_key_idx), Some(Value::Int64(_))));
+
+        let mut out_cols = Vec::with_capacity(left_cols.len() + right_cols.len());
+        for col in &left_cols {
+            if let Some(ref tbl) = left_table {
+                out_cols.push(format!("{}.{}", tbl, col));
+            } else {
+                out_cols.push(col.clone());
+            }
+        }
+        for col in &right_cols {
+            if let Some(ref tbl) = right_table {
+                out_cols.push(format!("{}.{}", tbl, col));
+            } else {
+                out_cols.push(col.clone());
+            }
+        }
+        let right_width = right_cols.len();
+        let left_width = left_cols.len();
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
+
+        if left_all_int {
+            let mut hash_table: HashMap<i64, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+            for (i, row) in right_rows.iter().enumerate() {
+                if let Some(Value::Int64(k)) = row.get(right_key_idx) {
+                    hash_table.entry(*k).or_default().push(i);
+                }
+            }
+
+            match join_type {
+                JoinType::Inner => {
+                    for left_row in &left_rows {
+                        if let Some(Value::Int64(k)) = left_row.get(left_key_idx) {
+                            if let Some(indices) = hash_table.get(k) {
+                                for &ri in indices {
+                                    let mut combined = Vec::with_capacity(left_width + right_width);
+                                    combined.extend(left_row.iter().cloned());
+                                    combined.extend(right_rows[ri].iter().cloned());
+                                    out_rows.push(combined);
+                                }
+                            }
+                        }
+                    }
+                }
+                JoinType::Left => {
+                    for left_row in &left_rows {
+                        if let Some(Value::Int64(k)) = left_row.get(left_key_idx) {
+                            if let Some(indices) = hash_table.get(k) {
+                                for &ri in indices {
+                                    let mut combined = Vec::with_capacity(left_width + right_width);
+                                    combined.extend(left_row.iter().cloned());
+                                    combined.extend(right_rows[ri].iter().cloned());
+                                    out_rows.push(combined);
+                                }
+                            } else {
+                                let mut combined = Vec::with_capacity(left_width + right_width);
+                                combined.extend(left_row.iter().cloned());
+                                combined.resize(left_width + right_width, Value::Null);
+                                out_rows.push(combined);
+                            }
+                        }
+                    }
+                }
+                JoinType::Right => {
+                    let mut left_hash: HashMap<i64, Vec<usize>> = HashMap::with_capacity(left_rows.len());
+                    for (i, row) in left_rows.iter().enumerate() {
+                        if let Some(Value::Int64(k)) = row.get(left_key_idx) {
+                            left_hash.entry(*k).or_default().push(i);
+                        }
+                    }
+                    for right_row in &right_rows {
+                        if let Some(Value::Int64(k)) = right_row.get(right_key_idx) {
+                            if let Some(indices) = left_hash.get(k) {
+                                for &li in indices {
+                                    let mut combined = Vec::with_capacity(left_width + right_width);
+                                    combined.extend(left_rows[li].iter().cloned());
+                                    combined.extend(right_row.iter().cloned());
+                                    out_rows.push(combined);
+                                }
+                            } else {
+                                let mut combined = vec![Value::Null; left_width];
+                                combined.extend(right_row.iter().cloned());
+                                out_rows.push(combined);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut hash_table: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+            for (i, row) in right_rows.iter().enumerate() {
+                let key = self.hash_key(&row[right_key_idx]);
+                hash_table.entry(key).or_default().push(i);
+            }
+
+            match join_type {
+                JoinType::Inner => {
+                    for left_row in &left_rows {
+                        let key = self.hash_key(&left_row[left_key_idx]);
+                        if let Some(indices) = hash_table.get(&key) {
+                            for &ri in indices {
+                                let mut combined = Vec::with_capacity(left_width + right_width);
+                                combined.extend(left_row.iter().cloned());
+                                combined.extend(right_rows[ri].iter().cloned());
+                                out_rows.push(combined);
+                            }
+                        }
+                    }
+                }
+                JoinType::Left => {
+                    for left_row in &left_rows {
+                        let key = self.hash_key(&left_row[left_key_idx]);
+                        if let Some(indices) = hash_table.get(&key) {
+                            for &ri in indices {
+                                let mut combined = Vec::with_capacity(left_width + right_width);
+                                combined.extend(left_row.iter().cloned());
+                                combined.extend(right_rows[ri].iter().cloned());
+                                out_rows.push(combined);
+                            }
+                        } else {
+                            let mut combined = Vec::with_capacity(left_width + right_width);
+                            combined.extend(left_row.iter().cloned());
+                            combined.resize(left_width + right_width, Value::Null);
+                            out_rows.push(combined);
+                        }
+                    }
+                }
+                JoinType::Right => {
+                    let mut left_hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(left_rows.len());
+                    for (i, row) in left_rows.iter().enumerate() {
+                        let key = self.hash_key(&row[left_key_idx]);
+                        left_hash.entry(key).or_default().push(i);
+                    }
+                    for right_row in &right_rows {
+                        let key = self.hash_key(&right_row[right_key_idx]);
+                        if let Some(indices) = left_hash.get(&key) {
+                            for &li in indices {
+                                let mut combined = Vec::with_capacity(left_width + right_width);
+                                combined.extend(left_rows[li].iter().cloned());
+                                combined.extend(right_row.iter().cloned());
+                                out_rows.push(combined);
+                            }
+                        } else {
+                            let mut combined = vec![Value::Null; left_width];
+                            combined.extend(right_row.iter().cloned());
+                            out_rows.push(combined);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ExecutionResult::Rows { columns: out_cols, rows: out_rows })
+    }
+
+    fn rewrite_aliases(stmt: Statement) -> Statement {
+        match stmt {
+            Statement::Select(mut select) => {
+                let mut alias_map: HashMap<String, String> = HashMap::new();
+                if let FromClause::Table(ref table) = select.from {
+                    if let Some(ref alias) = select.from_alias {
+                        alias_map.insert(alias.clone(), table.clone());
+                    }
+                }
+                for join in &select.joins {
+                    if let Some(ref alias) = join.alias {
+                        alias_map.insert(alias.clone(), join.table.clone());
+                    }
+                }
+                if alias_map.is_empty() {
+                    return Statement::Select(select);
+                }
+                select.columns = select.columns.into_iter().map(|c| match c {
+                    SelectColumn::Expr(expr, alias) => SelectColumn::Expr(Self::rewrite_expr_aliases(&expr, &alias_map), alias),
+                    other => other,
+                }).collect();
+                select.where_clause = select.where_clause.map(|e| Self::rewrite_expr_aliases(&e, &alias_map));
+                select.order_by = select.order_by.into_iter().map(|mut o| {
+                    o.expr = Self::rewrite_expr_aliases(&o.expr, &alias_map);
+                    o
+                }).collect();
+                select.group_by = select.group_by.into_iter().map(|e| Self::rewrite_expr_aliases(&e, &alias_map)).collect();
+                select.having = select.having.map(|e| Self::rewrite_expr_aliases(&e, &alias_map));
+                select.joins = select.joins.into_iter().map(|mut j| {
+                    j.condition = Self::rewrite_expr_aliases(&j.condition, &alias_map);
+                    j
+                }).collect();
+                Statement::Select(select)
+            }
+            other => other,
+        }
+    }
+
+    fn rewrite_expr_aliases(expr: &Expr, alias_map: &HashMap<String, String>) -> Expr {
+        match expr {
+            Expr::QualifiedColumn(table, col) => {
+                if let Some(real_table) = alias_map.get(table) {
+                    Expr::QualifiedColumn(real_table.clone(), col.clone())
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::rewrite_expr_aliases(left, alias_map)),
+                op: *op,
+                right: Box::new(Self::rewrite_expr_aliases(right, alias_map)),
+            },
+            Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
+            },
+            Expr::Function { name, args } => Expr::Function {
+                name: name.clone(),
+                args: args.iter().map(|a| Self::rewrite_expr_aliases(a, alias_map)).collect(),
+            },
+            Expr::IsNull(inner) => Expr::IsNull(Box::new(Self::rewrite_expr_aliases(inner, alias_map))),
+            Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(Self::rewrite_expr_aliases(inner, alias_map))),
+            Expr::InList { expr: inner, list } => Expr::InList {
+                expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
+                list: list.iter().map(|e| Self::rewrite_expr_aliases(e, alias_map)).collect(),
+            },
+            Expr::Between { expr: inner, low, high } => Expr::Between {
+                expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
+                low: Box::new(Self::rewrite_expr_aliases(low, alias_map)),
+                high: Box::new(Self::rewrite_expr_aliases(high, alias_map)),
+            },
+            Expr::Case { operand, when_clauses, else_result } => Expr::Case {
+                operand: operand.as_ref().map(|o| Box::new(Self::rewrite_expr_aliases(o, alias_map))),
+                when_clauses: when_clauses.iter().map(|(w, t)| (Self::rewrite_expr_aliases(w, alias_map), Self::rewrite_expr_aliases(t, alias_map))).collect(),
+                else_result: else_result.as_ref().map(|e| Box::new(Self::rewrite_expr_aliases(e, alias_map))),
+            },
+            Expr::Cast { expr: inner, data_type } => Expr::Cast {
+                expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
+                data_type: *data_type,
+            },
+            _ => expr.clone(),
+        }
+    }
+
+    fn plan_table_name(plan: &PhysicalPlan) -> Option<String> {
+        match plan {
+            PhysicalPlan::SeqScan { table, .. } => Some(table.clone()),
+            PhysicalPlan::IndexScan { table, .. } => Some(table.clone()),
+            PhysicalPlan::Filter { input, .. } => Self::plan_table_name(input),
+            PhysicalPlan::Sort { input, .. } => Self::plan_table_name(input),
+            PhysicalPlan::Limit { input, .. } => Self::plan_table_name(input),
+            PhysicalPlan::Distinct { input, .. } => Self::plan_table_name(input),
+            _ => None,
+        }
+    }
+
+    fn extract_join_keys(&self, condition: &Expr, left_cols: &[String], right_cols: &[String]) -> Result<(usize, usize)> {
+        match condition {
+            Expr::BinaryOp { left, op: BinOp::Eq, right } => {
+                let left_name = self.expr_column_name(left);
+                let right_name = self.expr_column_name(right);
+
+                if let (Some(ln), Some(rn)) = (left_name, right_name) {
+                    if let Some(li) = left_cols.iter().position(|c| c == &ln || ln.ends_with(&format!(".{}", c))) {
+                        if let Some(ri) = right_cols.iter().position(|c| c == &rn || rn.ends_with(&format!(".{}", c))) {
+                            return Ok((li, ri));
+                        }
+                    }
+                    if let Some(li) = left_cols.iter().position(|c| c == &rn || rn.ends_with(&format!(".{}", c))) {
+                        if let Some(ri) = right_cols.iter().position(|c| c == &ln || ln.ends_with(&format!(".{}", c))) {
+                            return Ok((li, ri));
+                        }
+                    }
+                }
+                Err(QueryError::Execution("Cannot determine join keys from condition".into()))
+            }
+            _ => Err(QueryError::Execution("JOIN condition must be an equality".into())),
+        }
+    }
+
+    fn expr_column_name(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Column(name) => Some(name.clone()),
+            Expr::QualifiedColumn(_, name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn hash_key(&self, value: &Value) -> Vec<u8> {
+        match value {
+            Value::Int64(n) => n.to_le_bytes().to_vec(),
+            Value::Float64(f) => f.to_le_bytes().to_vec(),
+            Value::Text(s) => s.as_bytes().to_vec(),
+            Value::Bool(b) => vec![*b as u8],
+            Value::Null => vec![],
+            _ => format!("{:?}", value).into_bytes(),
+        }
+    }
+
+    fn exec_hash_aggregate(&self, input: PhysicalPlan, group_by: Vec<Expr>, aggregates: Vec<Expr>, having: Option<Expr>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let input_result = self.execute_physical(input, txn_id)?;
+        let (col_names, rows) = match input_result {
+            ExecutionResult::Rows { columns, rows } => (columns, rows),
+            _ => return Err(QueryError::Execution("Aggregate requires row input".into())),
+        };
+
+        let group_indices: Vec<usize> = group_by.iter().filter_map(|expr| {
+            if let Expr::Column(name) = expr {
+                col_names.iter().position(|c| c == name)
+            } else {
+                None
+            }
+        }).collect();
+
+        let agg_functions: Vec<&Expr> = aggregates.iter().filter(|e| matches!(e, Expr::Function { .. })).collect();
+
+        let agg_col_indices: Vec<Option<usize>> = agg_functions.iter().map(|expr| {
+            if let Expr::Function { args, .. } = expr {
+                if args.is_empty() { None }
+                else if let Expr::Column(name) = &args[0] {
+                    col_names.iter().position(|c| c == name)
+                } else { None }
+            } else { None }
+        }).collect();
+
+        let mut groups: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::with_capacity(rows.len().min(1024));
+        for (row_idx, row) in rows.iter().enumerate() {
+            let key: Vec<Vec<u8>> = group_indices.iter().map(|&i| {
+                self.hash_key(row.get(i).unwrap_or(&Value::Null))
+            }).collect();
+            groups.entry(key).or_default().push(row_idx);
+        }
+
+        let mut out_col_names = Vec::with_capacity(group_indices.len() + agg_functions.len());
+        for expr in &group_by {
+            if let Expr::Column(name) = expr {
+                out_col_names.push(name.clone());
+            }
+        }
+        for expr in &agg_functions {
+            if let Expr::Function { name, args } = expr {
+                let arg_name = if args.is_empty() { "*".to_string() } else {
+                    match &args[0] {
+                        Expr::Column(c) => c.clone(),
+                        _ => "*".to_string(),
+                    }
+                };
+                out_col_names.push(format!("{}({})", name.to_lowercase(), arg_name));
+            }
+        }
+
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        for (_key, row_indices) in &groups {
+            let mut row_out = Vec::with_capacity(group_indices.len() + agg_functions.len());
+
+            for &gi in &group_indices {
+                row_out.push(rows[row_indices[0]].get(gi).cloned().unwrap_or(Value::Null));
+            }
+
+            for (fi, expr) in agg_functions.iter().enumerate() {
+                if let Expr::Function { name, .. } = expr {
+                    let agg_val = self.compute_aggregate_fast(name, agg_col_indices[fi], row_indices, &rows);
+                    row_out.push(agg_val);
+                }
+            }
+
+            out_rows.push(row_out);
+        }
+
+        if let Some(ref having_expr) = having {
+            let having_schema = Schema::new("", out_col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+            out_rows.retain(|row| {
+                let tuple = Tuple::new(row.clone());
+                self.eval_predicate(having_expr, &tuple, &having_schema)
+            });
+        }
+
+        Ok(ExecutionResult::Rows { columns: out_col_names, rows: out_rows })
+    }
+
+    fn try_fast_aggregate(&self, table_data: &TableData, col_names: &[String], group_by: &[Expr], aggregates: &[Expr]) -> Option<ExecutionResult> {
+        let group_indices: Vec<usize> = group_by.iter().filter_map(|expr| {
+            if let Expr::Column(name) = expr {
+                col_names.iter().position(|c| c == name)
+            } else {
+                None
+            }
+        }).collect();
+
+        if group_indices.len() != group_by.len() { return None; }
+
+        let agg_functions: Vec<(&str, Option<usize>)> = aggregates.iter().filter_map(|e| {
+            if let Expr::Function { name, args } = e {
+                let col_idx = if args.is_empty() { None }
+                else if let Expr::Column(cname) = &args[0] {
+                    col_names.iter().position(|c| c == cname)
+                } else { None };
+                Some((name.as_str(), col_idx))
+            } else { None }
+        }).collect();
+
+        // Check all agg columns are INT64 (for fast path)
+        let all_int_aggs = agg_functions.iter().all(|(name, col_idx)| {
+            let n = name.to_uppercase();
+            n == "COUNT" || col_idx.is_some()
+        });
+        if !all_int_aggs { return None; }
+
+        // COUNT_DISTINCT not supported in fast path
+        if agg_functions.iter().any(|(name, _)| name.to_uppercase() == "COUNT_DISTINCT") {
+            return None;
+        }
+
+        // Single group key, TEXT type — common case (GROUP BY category)
+        // Aggregate directly from raw bytes
+        struct GroupAcc {
+            count: i64,
+            sum: i64,
+            min: i64,
+            max: i64,
+            group_val: Value,
+        }
+
+        let mut groups: HashMap<Vec<u8>, GroupAcc> = HashMap::new();
+
+        let _ = table_data.index.for_each(|_key, data| {
+            // Extract group key as raw bytes (avoid String alloc for grouping)
+            let group_key_bytes: Vec<u8> = group_indices.iter().filter_map(|&gi| {
+                let pos = bytedb_core::tuple::tuple::column_offset(data, gi)?;
+                let next_pos = bytedb_core::tuple::tuple::column_offset(data, gi + 1)
+                    .unwrap_or(data.len());
+                Some(data[pos..next_pos].to_vec())
+            }).flatten().collect();
+
+            // Extract aggregate value (assume first non-COUNT agg column)
+            let agg_val = agg_functions.iter().find_map(|(name, col_idx)| {
+                let n = name.to_uppercase();
+                if n != "COUNT" {
+                    col_idx.and_then(|ci| read_int64_at(data, ci))
+                } else { None }
+            });
+
+            let entry = groups.entry(group_key_bytes).or_insert_with(|| {
+                let gv = if group_indices.len() == 1 {
+                    read_value_at(data, group_indices[0]).unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                GroupAcc { count: 0, sum: 0, min: i64::MAX, max: i64::MIN, group_val: gv }
+            });
+            entry.count += 1;
+            if let Some(v) = agg_val {
+                entry.sum += v;
+                if v < entry.min { entry.min = v; }
+                if v > entry.max { entry.max = v; }
+            }
+            true
+        });
+
+        // Build output
+        let mut out_col_names = Vec::with_capacity(group_indices.len() + agg_functions.len());
+        for expr in group_by {
+            if let Expr::Column(name) = expr { out_col_names.push(name.clone()); }
+        }
+        for (name, args_col) in &agg_functions {
+            let arg_name = args_col.map(|i| col_names[i].clone()).unwrap_or_else(|| "*".to_string());
+            out_col_names.push(format!("{}({})", name.to_lowercase(), arg_name));
+        }
+
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        for (_, acc) in groups {
+            let mut row = Vec::with_capacity(out_col_names.len());
+            row.push(acc.group_val);
+
+            for (name, _) in &agg_functions {
+                let n = name.to_uppercase();
+                let val = match n.as_str() {
+                    "COUNT" => Value::Int64(acc.count),
+                    "SUM" => Value::Int64(acc.sum),
+                    "AVG" => if acc.count > 0 { Value::Float64(acc.sum as f64 / acc.count as f64) } else { Value::Null },
+                    "MIN" => if acc.min == i64::MAX { Value::Null } else { Value::Int64(acc.min) },
+                    "MAX" => if acc.max == i64::MIN { Value::Null } else { Value::Int64(acc.max) },
+                    _ => Value::Null,
+                };
+                row.push(val);
+            }
+            out_rows.push(row);
+        }
+
+        Some(ExecutionResult::Rows { columns: out_col_names, rows: out_rows })
+    }
+
+    fn compute_aggregate_fast(&self, func_name: &str, col_idx: Option<usize>, row_indices: &[usize], rows: &[Vec<Value>]) -> Value {
+        match func_name.to_uppercase().as_str() {
+            "COUNT" => {
+                if let Some(idx) = col_idx {
+                    let count = row_indices.iter().filter(|&&ri| {
+                        rows[ri].get(idx).map(|v| !v.is_null()).unwrap_or(false)
+                    }).count();
+                    Value::Int64(count as i64)
+                } else {
+                    Value::Int64(row_indices.len() as i64)
+                }
+            }
+            "COUNT_DISTINCT" => {
+                let idx = match col_idx {
+                    Some(i) => i,
+                    None => return Value::Int64(row_indices.len() as i64),
+                };
+                let mut seen = std::collections::HashSet::new();
+                for &ri in row_indices {
+                    if let Some(val) = rows[ri].get(idx) {
+                        if val.is_null() { continue; }
+                        seen.insert(self.hash_key(val));
+                    }
+                }
+                Value::Int64(seen.len() as i64)
+            }
+            "SUM" => {
+                let idx = match col_idx {
+                    Some(i) => i,
+                    None => return Value::Null,
+                };
+                let mut sum = 0i64;
+                let mut is_float = false;
+                let mut fsum = 0.0f64;
+                for &ri in row_indices {
+                    match rows[ri].get(idx) {
+                        Some(Value::Int64(n)) => sum += n,
+                        Some(Value::Float64(f)) => { is_float = true; fsum += f; }
+                        _ => {}
+                    }
+                }
+                if is_float { Value::Float64(fsum + sum as f64) } else { Value::Int64(sum) }
+            }
+            "AVG" => {
+                let idx = match col_idx {
+                    Some(i) => i,
+                    None => return Value::Null,
+                };
+                let mut sum = 0.0f64;
+                let mut count = 0i64;
+                for &ri in row_indices {
+                    match rows[ri].get(idx) {
+                        Some(Value::Int64(n)) => { sum += *n as f64; count += 1; }
+                        Some(Value::Float64(f)) => { sum += f; count += 1; }
+                        _ => {}
+                    }
+                }
+                if count > 0 { Value::Float64(sum / count as f64) } else { Value::Null }
+            }
+            "MIN" => {
+                let idx = match col_idx {
+                    Some(i) => i,
+                    None => return Value::Null,
+                };
+                let mut min: Option<&Value> = None;
+                for &ri in row_indices {
+                    if let Some(val) = rows[ri].get(idx) {
+                        if val.is_null() { continue; }
+                        min = Some(match min {
+                            None => val,
+                            Some(current) => {
+                                if val.cmp_fast(current) == Ordering::Less { val } else { current }
+                            }
+                        });
+                    }
+                }
+                min.cloned().unwrap_or(Value::Null)
+            }
+            "MAX" => {
+                let idx = match col_idx {
+                    Some(i) => i,
+                    None => return Value::Null,
+                };
+                let mut max: Option<&Value> = None;
+                for &ri in row_indices {
+                    if let Some(val) = rows[ri].get(idx) {
+                        if val.is_null() { continue; }
+                        max = Some(match max {
+                            None => val,
+                            Some(current) => {
+                                if val.cmp_fast(current) == Ordering::Greater { val } else { current }
+                            }
+                        });
+                    }
+                }
+                max.cloned().unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        }
+    }
+
+    fn eval_expr_simple(&self, expr: &Expr) -> Value {
+        match expr {
+            Expr::Literal(LiteralValue::Integer(n)) => Value::Int64(*n),
+            Expr::Literal(LiteralValue::Float(f)) => Value::Float64(*f),
+            Expr::Literal(LiteralValue::String(s)) => Value::Text(s.clone()),
+            Expr::Literal(LiteralValue::Bool(b)) => Value::Bool(*b),
+            Expr::Literal(LiteralValue::Null) => Value::Null,
+            _ => Value::Null,
+        }
+    }
+
+    fn eval_predicate(&self, expr: &Expr, tuple: &Tuple, schema: &Schema) -> bool {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    BinOp::And => {
+                        self.eval_predicate(left, tuple, schema) && self.eval_predicate(right, tuple, schema)
+                    }
+                    BinOp::Or => {
+                        self.eval_predicate(left, tuple, schema) || self.eval_predicate(right, tuple, schema)
+                    }
+                    _ => {
+                        let lval = self.eval_value(left, tuple, schema);
+                        let rval = self.eval_value(right, tuple, schema);
+                        match op {
+                            BinOp::Eq => lval.compare(&rval) == Some(std::cmp::Ordering::Equal),
+                            BinOp::Neq => lval.compare(&rval) != Some(std::cmp::Ordering::Equal),
+                            BinOp::Lt => lval.compare(&rval) == Some(std::cmp::Ordering::Less),
+                            BinOp::Gt => lval.compare(&rval) == Some(std::cmp::Ordering::Greater),
+                            BinOp::Lte => matches!(lval.compare(&rval), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+                            BinOp::Gte => matches!(lval.compare(&rval), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+                            BinOp::Like => match (&lval, &rval) {
+                                (Value::Text(s), Value::Text(pattern)) => like_match(s, pattern),
+                                _ => false,
+                            },
+                            BinOp::Ilike => match (&lval, &rval) {
+                                (Value::Text(s), Value::Text(pattern)) => like_match(&s.to_lowercase(), &pattern.to_lowercase()),
+                                _ => false,
+                            },
+                            _ => false,
+                        }
+                    }
+                }
+            }
+            Expr::IsNull(inner) => {
+                let val = self.eval_value(inner, tuple, schema);
+                val.is_null()
+            }
+            Expr::IsNotNull(inner) => {
+                let val = self.eval_value(inner, tuple, schema);
+                !val.is_null()
+            }
+            _ => {
+                match self.eval_value(expr, tuple, schema) {
+                    Value::Bool(b) => b,
+                    Value::Null => false,
+                    _ => true,
+                }
+            }
+        }
+    }
+
+    fn eval_value(&self, expr: &Expr, tuple: &Tuple, schema: &Schema) -> Value {
+        match expr {
+            Expr::Column(name) => {
+                if let Some(idx) = schema.column_index(name) {
+                    tuple.get(idx).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            Expr::QualifiedColumn(table, col) => {
+                let qualified = format!("{}.{}", table, col);
+                if let Some(idx) = schema.column_index(&qualified) {
+                    tuple.get(idx).cloned().unwrap_or(Value::Null)
+                } else if let Some(idx) = schema.column_index(col) {
+                    tuple.get(idx).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            Expr::Literal(lit) => match lit {
+                LiteralValue::Integer(n) => Value::Int64(*n),
+                LiteralValue::Float(f) => Value::Float64(*f),
+                LiteralValue::String(s) => Value::Text(s.clone()),
+                LiteralValue::Bool(b) => Value::Bool(*b),
+                LiteralValue::Null => Value::Null,
+            },
+            Expr::BinaryOp { left, op, right } => {
+                let lval = self.eval_value(left, tuple, schema);
+                let rval = self.eval_value(right, tuple, schema);
+                match op {
+                    BinOp::Plus => match (&lval, &rval) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
+                        (Value::Text(a), Value::Text(b)) => Value::Text(format!("{}{}", a, b)),
+                        _ => Value::Null,
+                    },
+                    BinOp::Minus => match (&lval, &rval) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOp::Mul => match (&lval, &rval) {
+                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
+                        (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
+                        (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
+                        (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOp::Div => match (&lval, &rval) {
+                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a / b),
+                        (Value::Float64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(a / b),
+                        (Value::Int64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(*a as f64 / b),
+                        (Value::Float64(a), Value::Int64(b)) if *b != 0 => Value::Float64(a / *b as f64),
+                        _ => Value::Null,
+                    },
+                    BinOp::Mod => match (&lval, &rval) {
+                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a % b),
+                        (Value::Float64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(a % b),
+                        _ => Value::Null,
+                    },
+                    BinOp::Eq => Value::Bool(lval.compare(&rval) == Some(std::cmp::Ordering::Equal)),
+                    BinOp::Neq => Value::Bool(lval.compare(&rval) != Some(std::cmp::Ordering::Equal)),
+                    BinOp::Lt => Value::Bool(lval.compare(&rval) == Some(std::cmp::Ordering::Less)),
+                    BinOp::Gt => Value::Bool(lval.compare(&rval) == Some(std::cmp::Ordering::Greater)),
+                    BinOp::Lte => Value::Bool(matches!(lval.compare(&rval), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))),
+                    BinOp::Gte => Value::Bool(matches!(lval.compare(&rval), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))),
+                    BinOp::And => match (&lval, &rval) {
+                        (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a && *b),
+                        _ => Value::Null,
+                    },
+                    BinOp::Or => match (&lval, &rval) {
+                        (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
+                        _ => Value::Null,
+                    },
+                    BinOp::Like => match (&lval, &rval) {
+                        (Value::Text(s), Value::Text(pattern)) => {
+                            Value::Bool(like_match(s, pattern))
+                        }
+                        _ => Value::Null,
+                    },
+                    BinOp::Ilike => match (&lval, &rval) {
+                        (Value::Text(s), Value::Text(pattern)) => {
+                            Value::Bool(like_match(&s.to_lowercase(), &pattern.to_lowercase()))
+                        }
+                        _ => Value::Null,
+                    },
+                }
+            }
+            Expr::UnaryOp { op, expr } => {
+                let val = self.eval_value(expr, tuple, schema);
+                match op {
+                    UnaryOp::Neg => match val {
+                        Value::Int64(n) => Value::Int64(-n),
+                        Value::Float64(f) => Value::Float64(-f),
+                        _ => Value::Null,
+                    },
+                    UnaryOp::Not => match val {
+                        Value::Bool(b) => Value::Bool(!b),
+                        _ => Value::Null,
+                    },
+                }
+            }
+            Expr::Function { name, args } => {
+                let upper_name = name.to_uppercase();
+                match upper_name.as_str() {
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                        let arg_name = if args.is_empty() { "*".to_string() } else {
+                            match &args[0] {
+                                Expr::Column(c) => c.clone(),
+                                _ => "*".to_string(),
+                            }
+                        };
+                        let func_col = format!("{}({})", name.to_lowercase(), arg_name);
+                        if let Some(idx) = schema.column_index(&func_col) {
+                            return tuple.get(idx).cloned().unwrap_or(Value::Null);
+                        }
+                    }
+                    _ => {}
+                }
+                match upper_name.as_str() {
+                    "COALESCE" => {
+                        for arg in args {
+                            let val = self.eval_value(arg, tuple, schema);
+                            if !val.is_null() {
+                                return val;
+                            }
+                        }
+                        Value::Null
+                    }
+                    "NULLIF" => {
+                        if args.len() == 2 {
+                            let a = self.eval_value(&args[0], tuple, schema);
+                            let b = self.eval_value(&args[1], tuple, schema);
+                            if a.compare(&b) == Some(std::cmp::Ordering::Equal) {
+                                Value::Null
+                            } else {
+                                a
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    "GREATEST" => {
+                        let mut best: Option<Value> = None;
+                        for arg in args {
+                            let val = self.eval_value(arg, tuple, schema);
+                            if val.is_null() { continue; }
+                            best = Some(match best {
+                                None => val,
+                                Some(b) => if val.compare(&b) == Some(std::cmp::Ordering::Greater) { val } else { b },
+                            });
+                        }
+                        best.unwrap_or(Value::Null)
+                    }
+                    "LEAST" => {
+                        let mut best: Option<Value> = None;
+                        for arg in args {
+                            let val = self.eval_value(arg, tuple, schema);
+                            if val.is_null() { continue; }
+                            best = Some(match best {
+                                None => val,
+                                Some(b) => if val.compare(&b) == Some(std::cmp::Ordering::Less) { val } else { b },
+                            });
+                        }
+                        best.unwrap_or(Value::Null)
+                    }
+                    "UPPER" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Text(s.to_uppercase()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "LOWER" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Text(s.to_lowercase()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "LENGTH" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Int64(s.len() as i64),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "TRIM" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Text(s.trim().to_string()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "CONCAT" => {
+                        let mut result = String::new();
+                        for arg in args {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => result.push_str(&s),
+                                Value::Int64(n) => result.push_str(&n.to_string()),
+                                Value::Float64(f) => result.push_str(&f.to_string()),
+                                Value::Bool(b) => result.push_str(&b.to_string()),
+                                _ => {}
+                            }
+                        }
+                        Value::Text(result)
+                    }
+                    "CONCAT_WS" => {
+                        if args.is_empty() { return Value::Null; }
+                        let sep = match self.eval_value(&args[0], tuple, schema) {
+                            Value::Text(s) => s,
+                            _ => return Value::Null,
+                        };
+                        let parts: Vec<String> = args[1..].iter().filter_map(|a| {
+                            match self.eval_value(a, tuple, schema) {
+                                Value::Null => None,
+                                Value::Text(s) => Some(s),
+                                Value::Int64(n) => Some(n.to_string()),
+                                Value::Float64(f) => Some(f.to_string()),
+                                Value::Bool(b) => Some(b.to_string()),
+                                _ => None,
+                            }
+                        }).collect();
+                        Value::Text(parts.join(&sep))
+                    }
+                    "SPLIT_PART" => {
+                        if args.len() == 3 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let sep = self.eval_value(&args[1], tuple, schema);
+                            let n = self.eval_value(&args[2], tuple, schema);
+                            match (s, sep, n) {
+                                (Value::Text(s), Value::Text(sep), Value::Int64(n)) => {
+                                    let parts: Vec<&str> = s.split(&sep as &str).collect();
+                                    let idx = (n - 1) as usize;
+                                    Value::Text(parts.get(idx).map(|p| p.to_string()).unwrap_or_default())
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "STARTS_WITH" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let prefix = self.eval_value(&args[1], tuple, schema);
+                            match (s, prefix) {
+                                (Value::Text(s), Value::Text(p)) => Value::Bool(s.starts_with(&p)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "ENDS_WITH" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let suffix = self.eval_value(&args[1], tuple, schema);
+                            match (s, suffix) {
+                                (Value::Text(s), Value::Text(p)) => Value::Bool(s.ends_with(&p)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "CONTAINS" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let needle = self.eval_value(&args[1], tuple, schema);
+                            match (s, needle) {
+                                (Value::Text(s), Value::Text(n)) => Value::Bool(s.contains(&n)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "REPLACE" => {
+                        if args.len() == 3 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let from = self.eval_value(&args[1], tuple, schema);
+                            let to = self.eval_value(&args[2], tuple, schema);
+                            match (s, from, to) {
+                                (Value::Text(s), Value::Text(f), Value::Text(t)) => Value::Text(s.replace(&f, &t)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "SUBSTRING" | "SUBSTR" => {
+                        if args.len() >= 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let start = self.eval_value(&args[1], tuple, schema);
+                            let len = if args.len() >= 3 { Some(self.eval_value(&args[2], tuple, schema)) } else { None };
+                            match (s, start) {
+                                (Value::Text(s), Value::Int64(start)) => {
+                                    let start = (start.max(1) - 1) as usize;
+                                    let result: String = match len {
+                                        Some(Value::Int64(l)) => s.chars().skip(start).take(l.max(0) as usize).collect(),
+                                        _ => s.chars().skip(start).collect(),
+                                    };
+                                    Value::Text(result)
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "ABS" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Int64(n) => Value::Int64(n.abs()),
+                                Value::Float64(f) => Value::Float64(f.abs()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "CEIL" | "CEILING" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Float64(f) => Value::Float64(f.ceil()),
+                                Value::Int64(n) => Value::Int64(n),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "FLOOR" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Float64(f) => Value::Float64(f.floor()),
+                                Value::Int64(n) => Value::Int64(n),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "ROUND" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Float64(f) => Value::Float64(f.round()),
+                                Value::Int64(n) => Value::Int64(n),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "POWER" | "POW" => {
+                        if args.len() == 2 {
+                            let base = self.eval_value(&args[0], tuple, schema);
+                            let exp = self.eval_value(&args[1], tuple, schema);
+                            match (base, exp) {
+                                (Value::Float64(b), Value::Float64(e)) => Value::Float64(b.powf(e)),
+                                (Value::Int64(b), Value::Int64(e)) => Value::Float64((b as f64).powf(e as f64)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "SQRT" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Float64(f) if f >= 0.0 => Value::Float64(f.sqrt()),
+                                Value::Int64(n) if n >= 0 => Value::Float64((n as f64).sqrt()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "MOD" => {
+                        if args.len() == 2 {
+                            let a = self.eval_value(&args[0], tuple, schema);
+                            let b = self.eval_value(&args[1], tuple, schema);
+                            match (a, b) {
+                                (Value::Int64(x), Value::Int64(y)) if y != 0 => Value::Int64(x % y),
+                                (Value::Float64(x), Value::Float64(y)) if y != 0.0 => Value::Float64(x % y),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "NOW" | "CURRENT_TIMESTAMP" => {
+                        Value::Text(chrono_now())
+                    }
+                    "CURRENT_DATE" => {
+                        Value::Text(chrono_date())
+                    }
+                    "EXTRACT" => {
+                        if args.len() == 2 {
+                            let field = match &args[0] {
+                                Expr::Column(name) => name.to_uppercase(),
+                                _ => return Value::Null,
+                            };
+                            let val = self.eval_value(&args[1], tuple, schema);
+                            extract_from_timestamp(&field, &val)
+                        } else { Value::Null }
+                    }
+                    "POSITION" | "STRPOS" => {
+                        if args.len() == 2 {
+                            let sub = self.eval_value(&args[0], tuple, schema);
+                            let s = self.eval_value(&args[1], tuple, schema);
+                            match (sub, s) {
+                                (Value::Text(needle), Value::Text(haystack)) => {
+                                    Value::Int64(haystack.find(&needle).map(|i| i as i64 + 1).unwrap_or(0))
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "LEFT" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let n = self.eval_value(&args[1], tuple, schema);
+                            match (s, n) {
+                                (Value::Text(s), Value::Int64(n)) => {
+                                    Value::Text(s.chars().take(n.max(0) as usize).collect())
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "RIGHT" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let n = self.eval_value(&args[1], tuple, schema);
+                            match (s, n) {
+                                (Value::Text(s), Value::Int64(n)) => {
+                                    let n = n.max(0) as usize;
+                                    let len = s.chars().count();
+                                    Value::Text(s.chars().skip(len.saturating_sub(n)).collect())
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "LPAD" => {
+                        if args.len() >= 2 {
+                            let s = match self.eval_value(&args[0], tuple, schema) { Value::Text(s) => s, _ => return Value::Null };
+                            let n = match self.eval_value(&args[1], tuple, schema) { Value::Int64(n) => n.max(0) as usize, _ => return Value::Null };
+                            let pad = if args.len() >= 3 {
+                                match self.eval_value(&args[2], tuple, schema) { Value::Text(p) => p, _ => " ".to_string() }
+                            } else { " ".to_string() };
+                            let len = s.chars().count();
+                            if len >= n { Value::Text(s.chars().take(n).collect()) }
+                            else {
+                                let needed = n - len;
+                                let padding: String = pad.chars().cycle().take(needed).collect();
+                                Value::Text(format!("{}{}", padding, s))
+                            }
+                        } else { Value::Null }
+                    }
+                    "RPAD" => {
+                        if args.len() >= 2 {
+                            let s = match self.eval_value(&args[0], tuple, schema) { Value::Text(s) => s, _ => return Value::Null };
+                            let n = match self.eval_value(&args[1], tuple, schema) { Value::Int64(n) => n.max(0) as usize, _ => return Value::Null };
+                            let pad = if args.len() >= 3 {
+                                match self.eval_value(&args[2], tuple, schema) { Value::Text(p) => p, _ => " ".to_string() }
+                            } else { " ".to_string() };
+                            let len = s.chars().count();
+                            if len >= n { Value::Text(s.chars().take(n).collect()) }
+                            else {
+                                let needed = n - len;
+                                let padding: String = pad.chars().cycle().take(needed).collect();
+                                Value::Text(format!("{}{}", s, padding))
+                            }
+                        } else { Value::Null }
+                    }
+                    "REPEAT" => {
+                        if args.len() == 2 {
+                            let s = self.eval_value(&args[0], tuple, schema);
+                            let n = self.eval_value(&args[1], tuple, schema);
+                            match (s, n) {
+                                (Value::Text(s), Value::Int64(n)) => Value::Text(s.repeat(n.max(0) as usize)),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "REVERSE" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Text(s.chars().rev().collect()),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "INITCAP" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => {
+                                    let mut cap_next = true;
+                                    let result: String = s.chars().map(|c| {
+                                        if cap_next { cap_next = false; c.to_uppercase().next().unwrap_or(c) }
+                                        else if c.is_whitespace() { cap_next = true; c }
+                                        else { c.to_lowercase().next().unwrap_or(c) }
+                                    }).collect();
+                                    Value::Text(result)
+                                }
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Int64(s.chars().count() as i64),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "OCTET_LENGTH" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Int64(s.len() as i64),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "SIGN" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Int64(n) => Value::Int64(if n > 0 { 1 } else if n < 0 { -1 } else { 0 }),
+                                Value::Float64(f) => Value::Int64(if f > 0.0 { 1 } else if f < 0.0 { -1 } else { 0 }),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    _ => Value::Null,
+                }
+            }
+            Expr::Case { operand, when_clauses, else_result } => {
+                if let Some(operand) = operand {
+                    let op_val = self.eval_value(operand, tuple, schema);
+                    for (when_expr, then_expr) in when_clauses {
+                        let when_val = self.eval_value(when_expr, tuple, schema);
+                        if op_val.compare(&when_val) == Some(std::cmp::Ordering::Equal) {
+                            return self.eval_value(then_expr, tuple, schema);
+                        }
+                    }
+                } else {
+                    for (when_expr, then_expr) in when_clauses {
+                        let when_val = self.eval_value(when_expr, tuple, schema);
+                        match when_val {
+                            Value::Bool(true) => return self.eval_value(then_expr, tuple, schema),
+                            _ => {}
+                        }
+                    }
+                }
+                match else_result {
+                    Some(e) => self.eval_value(e, tuple, schema),
+                    None => Value::Null,
+                }
+            }
+            Expr::Cast { expr, data_type } => {
+                let val = self.eval_value(expr, tuple, schema);
+                cast_value(val, *data_type)
+            }
+            Expr::IsNull(inner) => {
+                let val = self.eval_value(inner, tuple, schema);
+                Value::Bool(val.is_null())
+            }
+            Expr::IsNotNull(inner) => {
+                let val = self.eval_value(inner, tuple, schema);
+                Value::Bool(!val.is_null())
+            }
+            Expr::InList { expr, list } => {
+                let val = self.eval_value(expr, tuple, schema);
+                let found = list.iter().any(|item| {
+                    let item_val = self.eval_value(item, tuple, schema);
+                    val.compare(&item_val) == Some(std::cmp::Ordering::Equal)
+                });
+                Value::Bool(found)
+            }
+            Expr::Between { expr, low, high } => {
+                let val = self.eval_value(expr, tuple, schema);
+                let low_val = self.eval_value(low, tuple, schema);
+                let high_val = self.eval_value(high, tuple, schema);
+                let ge_low = matches!(val.compare(&low_val), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal));
+                let le_high = matches!(val.compare(&high_val), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
+                Value::Bool(ge_low && le_high)
+            }
+            Expr::JsonPath { .. } | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::WindowFunction { .. } => Value::Null,
+        }
+    }
+
+    pub fn txn_manager(&self) -> &TransactionManager {
+        &self.txn_manager
+    }
+
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    pub fn tables(&self) -> &parking_lot::RwLock<HashMap<String, TableData>> {
+        &self.tables
+    }
+
+    pub fn bulk_insert(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let pk_cols = table_data.schema.primary_key_columns();
+        let mut count = 0u64;
+
+        for row_values in rows {
+            let tuple = Tuple::new(row_values);
+            let key = tuple.key_bytes(&pk_cols);
+            let data = tuple.serialize();
+            table_data.index.insert(key, data)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    pub fn exec_seq_scan_vectorized(
+        &self,
+        table: &str,
+        filter: Option<&Expr>,
+        _txn_id: Option<TxnId>,
+        limit: Option<usize>,
+    ) -> Result<ExecutionResult> {
+        let tables = self.tables.read();
+        let table_data = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+
+        let col_names: Vec<String> = table_data.schema.columns.iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let num_columns = col_names.len();
+
+        let fast_filter = filter.and_then(|f| self.try_fast_filter(f, &table_data.schema));
+
+        let mut all_rows: Vec<Vec<Value>> = Vec::new();
+        let scan_limit = limit;
+
+        table_data.index.for_each_leaf_batch(|values| {
+            let refs: Vec<&[u8]> = values.iter().map(|v| v.as_slice()).collect();
+            if let Some(batch) = deserialize_batch(&refs, num_columns) {
+                if let Some((col_idx, ref op, ref lit_val)) = fast_filter {
+                    let sel = match lit_val {
+                        Value::Int64(v) => batch.filter_int64_column(col_idx, *op, *v),
+                        Value::Float64(v) => batch.filter_float64_column(col_idx, *op, *v),
+                        Value::Text(v) => batch.filter_text_column(col_idx, *op, v),
+                        _ => SelectionVector { indices: (0..batch.num_rows as u16).collect() },
+                    };
+                    let rows = batch.materialize_rows(&sel);
+                    all_rows.extend(rows);
+                } else {
+                    let rows = batch.materialize_all_rows();
+                    all_rows.extend(rows);
+                }
+
+                if let Some(lim) = scan_limit {
+                    if all_rows.len() >= lim {
+                        all_rows.truncate(lim);
+                        return false;
+                    }
+                }
+            }
+            true
+        }).map_err(|e| QueryError::Execution(e.to_string()))?;
+
+        Ok(ExecutionResult::Rows { columns: col_names, rows: all_rows })
+    }
+}
+
+fn cast_value(val: Value, target: DataType) -> Value {
+    match target {
+        DataType::Int64 => match val {
+            Value::Int64(_) => val,
+            Value::Float64(f) => Value::Int64(f as i64),
+            Value::Text(s) => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null),
+            Value::Bool(b) => Value::Int64(if b { 1 } else { 0 }),
+            _ => Value::Null,
+        },
+        DataType::Float64 => match val {
+            Value::Float64(_) => val,
+            Value::Int64(n) => Value::Float64(n as f64),
+            Value::Text(s) => s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        DataType::Text => match val {
+            Value::Text(_) => val,
+            Value::Int64(n) => Value::Text(n.to_string()),
+            Value::Float64(f) => Value::Text(f.to_string()),
+            Value::Bool(b) => Value::Text(b.to_string()),
+            Value::Null => Value::Null,
+            _ => Value::Text(format!("{:?}", val)),
+        },
+        DataType::Bool => match val {
+            Value::Bool(_) => val,
+            Value::Int64(n) => Value::Bool(n != 0),
+            Value::Text(s) => match s.to_lowercase().as_str() {
+                "true" | "t" | "1" | "yes" => Value::Bool(true),
+                "false" | "f" | "0" | "no" => Value::Bool(false),
+                _ => Value::Null,
+            },
+            _ => Value::Null,
+        },
+        _ => val,
+    }
+}
+
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let (y, m, d) = days_to_ymd(days as i64);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, time_secs / 3600, (time_secs % 3600) / 60, time_secs % 60)
+}
+
+fn chrono_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = secs / 86400;
+    let (y, m, d) = days_to_ymd(days as i64);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn extract_from_timestamp(field: &str, val: &Value) -> Value {
+    let s = match val {
+        Value::Text(s) => s.as_str(),
+        _ => return Value::Null,
+    };
+    let parts: Vec<&str> = s.split(|c| c == '-' || c == ' ' || c == ':' || c == 'T').collect();
+    match field {
+        "YEAR" => parts.first().and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        "MONTH" => parts.get(1).and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        "DAY" => parts.get(2).and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        "HOUR" => parts.get(3).and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        "MINUTE" => parts.get(4).and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        "SECOND" => parts.get(5).and_then(|p| p.parse::<i64>().ok()).map(Value::Int64).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+fn like_match(s: &str, pattern: &str) -> bool {
+    let s_chars: Vec<char> = s.chars().collect();
+    let p_chars: Vec<char> = pattern.chars().collect();
+    like_match_inner(&s_chars, &p_chars)
+}
+
+fn like_match_inner(s: &[char], p: &[char]) -> bool {
+    if p.is_empty() {
+        return s.is_empty();
+    }
+    match p[0] {
+        '%' => {
+            like_match_inner(s, &p[1..]) || (!s.is_empty() && like_match_inner(&s[1..], p))
+        }
+        '_' => {
+            !s.is_empty() && like_match_inner(&s[1..], &p[1..])
+        }
+        c => {
+            !s.is_empty() && s[0] == c && like_match_inner(&s[1..], &p[1..])
+        }
+    }
+}

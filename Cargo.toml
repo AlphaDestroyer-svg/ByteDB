@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "bytedb-core",
+    "bytedb-query",
+    "bytedb-server",
+    "bytedb-client",
+    "bytedb-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ByteDB Contributors"]
+license = "AGPL-3.0-or-later"

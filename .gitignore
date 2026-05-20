@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target
+**/target
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ByteDB runtime data
+/bytedb_data/
+/data/
+*.wal
+*.snapshot
+snapshots/
+
+# Editor backups
+*.swp
+*.swo
+*~
+
+# Claude / AI tooling artifacts
+.claude/
+.memory/
+
+# Logs
+*.log

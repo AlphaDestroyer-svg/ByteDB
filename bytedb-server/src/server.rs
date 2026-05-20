@@ -1,0 +1,218 @@
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tracing::{info, error, warn};
+
+use crate::config::Config;
+use crate::connection::handle_connection;
+use crate::error::Result;
+use crate::auth::credentials::{Credentials, SessionManager};
+use bytedb_core::catalog::database::Database;
+use bytedb_core::catalog::table::TableMeta;
+use bytedb_core::index::btree::BPlusTree;
+use bytedb_core::mvcc::transaction::TransactionManager;
+use bytedb_core::mvcc::version_store::VersionStore;
+use bytedb_core::snapshot::format::{FullSnapshot, SnapshotFormat, TableSnapshot};
+use bytedb_core::snapshot::manager::SnapshotManager;
+use bytedb_core::wal::log_manager::LogManager;
+use bytedb_core::wal::recovery::RecoveryManager;
+use bytedb_query::executor::engine::{QueryEngine, TableData};
+use bytedb_query::kv::kv_engine::KvEngine;
+use bytedb_query::document::doc_engine::DocEngine;
+
+pub struct Server {
+    config: Config,
+    query_engine: Arc<QueryEngine>,
+    kv_engine: Arc<KvEngine>,
+    doc_engine: Arc<DocEngine>,
+    credentials: Arc<Credentials>,
+    session_manager: Arc<SessionManager>,
+    semaphore: Arc<Semaphore>,
+    snapshot_manager: Arc<SnapshotManager>,
+}
+
+impl Server {
+    pub fn new(config: Config) -> Self {
+        std::fs::create_dir_all(&config.data_dir).ok();
+
+        let snapshot_format = match config.snapshot_format.as_str() {
+            "json" => SnapshotFormat::Json,
+            _ => SnapshotFormat::Binary,
+        };
+        let snapshot_manager = Arc::new(SnapshotManager::new(
+            config.snapshot_dir(),
+            config.snapshot_write_threshold,
+            config.snapshot_interval_secs,
+            snapshot_format,
+        ));
+
+        let wal_path = config.wal_path();
+        let log_manager = Arc::new(
+            LogManager::new(&wal_path).expect("Failed to open WAL")
+        );
+
+        match RecoveryManager::recover(&log_manager) {
+            Ok(result) => {
+                let redo_count = result.redo_records.len();
+                let undo_count = result.undo_records.len();
+                if redo_count > 0 || undo_count > 0 {
+                    info!("WAL recovery: {} redo, {} undo records processed", redo_count, undo_count);
+                }
+            }
+            Err(e) => {
+                warn!("WAL recovery failed: {}", e);
+            }
+        }
+
+        let database = Arc::new(Database::new("bytedb"));
+        let txn_manager = Arc::new(TransactionManager::new());
+        let query_engine = Arc::new(QueryEngine::with_wal(database, txn_manager, log_manager));
+
+        if let Ok(Some(snapshot)) = snapshot_manager.load_latest() {
+            info!("Restoring from snapshot (LSN: {}, {} tables)", snapshot.header.lsn, snapshot.tables.len());
+            Self::restore_from_snapshot(&query_engine, &snapshot);
+            info!("Snapshot restored successfully");
+        }
+
+        let kv_engine = Arc::new(KvEngine::new());
+        let doc_engine = Arc::new(DocEngine::new());
+        let credentials = Arc::new(Credentials::new());
+        let session_manager = Arc::new(SessionManager::new());
+        let semaphore = Arc::new(Semaphore::new(config.max_connections));
+
+        Server {
+            config,
+            query_engine,
+            kv_engine,
+            doc_engine,
+            credentials,
+            session_manager,
+            semaphore,
+            snapshot_manager,
+        }
+    }
+
+    fn restore_from_snapshot(engine: &QueryEngine, snapshot: &FullSnapshot) {
+        use std::collections::HashMap;
+        use bytedb_core::tuple::schema::SequenceGenerator;
+        let mut tables = engine.tables().write();
+        for table_snap in &snapshot.tables {
+            let schema = table_snap.schema.clone();
+            let index = Arc::new(BPlusTree::new(format!("{}_pk", table_snap.name), 128));
+            for (key, value) in &table_snap.entries {
+                let _ = index.insert(key.clone(), value.clone());
+            }
+            let mut sequences: HashMap<String, Arc<SequenceGenerator>> = HashMap::new();
+            for c in &schema.columns {
+                if c.auto_increment {
+                    sequences.insert(c.name.clone(), Arc::new(SequenceGenerator::new(1)));
+                }
+            }
+            let meta = TableMeta::new(table_snap.name.clone(), schema.clone(), table_snap.table_id);
+            let _ = engine.database().create_table(meta);
+            tables.insert(table_snap.name.clone(), TableData {
+                schema,
+                index,
+                version_store: Arc::new(VersionStore::new()),
+                check_exprs: Vec::new(),
+                sequences,
+            });
+        }
+    }
+
+    fn create_snapshot(engine: &QueryEngine, snapshot_manager: &SnapshotManager) {
+        let tables = engine.tables().read();
+        let mut table_snapshots = Vec::with_capacity(tables.len());
+
+        for (name, table_data) in tables.iter() {
+            let entries = table_data.index.scan_all().unwrap_or_default();
+            table_snapshots.push(TableSnapshot {
+                name: name.clone(),
+                table_id: table_data.schema.columns.len() as u32,
+                schema: table_data.schema.clone(),
+                entries,
+            });
+        }
+        drop(tables);
+
+        let header = snapshot_manager.create_snapshot_header(0, table_snapshots.len() as u32);
+        let snapshot = FullSnapshot { header, tables: table_snapshots };
+
+        match snapshot_manager.save(&snapshot) {
+            Ok(path) => info!("Snapshot saved: {:?}", path),
+            Err(e) => error!("Failed to save snapshot: {}", e),
+        }
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let addr = self.config.addr();
+        let listener = TcpListener::bind(&addr).await?;
+        info!("ByteDB server listening on {}", addr);
+
+        let timeout_secs = self.config.connection_timeout_secs;
+
+        let snap_engine = Arc::clone(&self.query_engine);
+        let snap_manager = Arc::clone(&self.snapshot_manager);
+        let snap_interval = self.snapshot_manager.interval();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(snap_interval);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                Self::create_snapshot(&snap_engine, &snap_manager);
+            }
+        });
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, peer_addr) = accept_result?;
+                    info!("New connection from {}", peer_addr);
+
+                    let permit = match self.semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!("Max connections reached, rejecting {}", peer_addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
+                    let query_engine = Arc::clone(&self.query_engine);
+                    let kv_engine = Arc::clone(&self.kv_engine);
+                    let doc_engine = Arc::clone(&self.doc_engine);
+                    let credentials = Arc::clone(&self.credentials);
+                    let session_manager = Arc::clone(&self.session_manager);
+
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+                        let result = tokio::time::timeout(timeout, handle_connection(
+                            stream,
+                            query_engine,
+                            kv_engine,
+                            doc_engine,
+                            credentials,
+                            session_manager,
+                        )).await;
+
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => error!("Connection error from {}: {}", peer_addr, e),
+                            Err(_) => warn!("Connection timeout for {}", peer_addr),
+                        }
+                        info!("Connection closed: {}", peer_addr);
+                    });
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Shutting down gracefully...");
+                    Self::create_snapshot(&self.query_engine, &self.snapshot_manager);
+                    info!("Final snapshot saved. Goodbye.");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}

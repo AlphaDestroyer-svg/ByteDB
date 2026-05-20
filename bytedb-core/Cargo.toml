@@ -1,0 +1,13 @@
+[package]
+name = "bytedb-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+crc32fast = "1"
+bytes = "1"
