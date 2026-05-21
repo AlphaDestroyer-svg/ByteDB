@@ -32,6 +32,7 @@ pub struct Transaction {
     pub status: TxnStatus,
     pub started_at: Instant,
     pub deadline: Option<Instant>,
+    pub snapshot_active: Vec<TxnId>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,9 +78,11 @@ impl TransactionManager {
         isolation: IsolationLevel,
         timeout: Option<Duration>,
     ) -> TxnId {
+        let now = Instant::now();
+        let mut active = self.active_txns.write();
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let start_ts = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
-        let now = Instant::now();
+        let snapshot_active: Vec<TxnId> = active.keys().copied().collect();
 
         let txn = Transaction {
             id: txn_id,
@@ -89,9 +92,10 @@ impl TransactionManager {
             status: TxnStatus::Active,
             started_at: now,
             deadline: timeout.map(|d| now + d),
+            snapshot_active,
         };
 
-        self.active_txns.write().insert(txn_id, txn);
+        active.insert(txn_id, txn);
         txn_id
     }
 
@@ -155,12 +159,10 @@ impl TransactionManager {
         let txn = active.get(&txn_id)
             .ok_or(CoreError::TransactionNotFound(txn_id))?;
 
-        let active_txns: Vec<TxnId> = active.keys().copied().collect();
-
         Ok(Snapshot {
             txn_id,
             start_ts: txn.start_ts,
-            active_txns,
+            active_txns: txn.snapshot_active.clone(),
         })
     }
 

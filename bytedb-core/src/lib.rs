@@ -130,8 +130,8 @@ mod tests {
         let vs = VersionStore::new();
         let key = b"row1".to_vec();
         vs.insert(key.clone(), Tuple::new(vec![Value::Int64(1)]), 1, 1);
-        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, &[2, 3]).unwrap();
-        let r = vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, &[2, 3]);
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, 100, &[2, 3]).unwrap();
+        let r = vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, 100, &[2, 3]);
         assert!(matches!(r, Err(crate::error::CoreError::WriteConflict)));
     }
 
@@ -143,8 +143,8 @@ mod tests {
         let vs = VersionStore::new();
         let key = b"row1".to_vec();
         vs.insert(key.clone(), Tuple::new(vec![Value::Int64(1)]), 1, 1);
-        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, &[2]).unwrap();
-        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, &[3]).unwrap();
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, 100, &[2]).unwrap();
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, 100, &[3]).unwrap();
     }
 
     #[test]

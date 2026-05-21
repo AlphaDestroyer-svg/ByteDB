@@ -116,12 +116,30 @@ impl TableData {
         if let Some(tid) = txn_id {
             let snapshot = txn_manager.get_snapshot(tid)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
-            let visible = self.version_store.get_all_visible(
-                tid,
-                snapshot.start_ts,
-                &snapshot.active_txns,
-            );
-            Ok(visible.into_iter().map(|(k, t)| (k, t.serialize())).collect())
+            let base = self.index.scan_all()
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(base.len());
+            let mut keys_in_vs = std::collections::HashSet::new();
+            for (k, v) in base {
+                match self.version_store.lookup_for_read(&k, tid, snapshot.start_ts, &snapshot.active_txns) {
+                    bytedb_core::mvcc::version_store::ReadResult::Visible(t) => {
+                        keys_in_vs.insert(k.clone());
+                        out.push((k, t.serialize()));
+                    }
+                    bytedb_core::mvcc::version_store::ReadResult::Tombstone => {
+                        keys_in_vs.insert(k);
+                    }
+                    bytedb_core::mvcc::version_store::ReadResult::NoVersions => {
+                        out.push((k, v));
+                    }
+                }
+            }
+            for (k, t) in self.version_store.get_all_visible(tid, snapshot.start_ts, &snapshot.active_txns) {
+                if !keys_in_vs.contains(&k) {
+                    out.push((k, t.serialize()));
+                }
+            }
+            Ok(out)
         } else {
             self.index.scan_all()
                 .map_err(|e| QueryError::Execution(e.to_string()))
@@ -132,8 +150,13 @@ impl TableData {
         if let Some(tid) = txn_id {
             let snapshot = txn_manager.get_snapshot(tid)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
-            Ok(self.version_store.get_visible(key, tid, snapshot.start_ts, &snapshot.active_txns)
-                .map(|t| t.serialize()))
+            match self.version_store.lookup_for_read(key, tid, snapshot.start_ts, &snapshot.active_txns) {
+                bytedb_core::mvcc::version_store::ReadResult::Visible(t) => Ok(Some(t.serialize())),
+                bytedb_core::mvcc::version_store::ReadResult::Tombstone => Ok(None),
+                bytedb_core::mvcc::version_store::ReadResult::NoVersions => {
+                    self.index.search(key).map_err(|e| QueryError::Execution(e.to_string()))
+                }
+            }
         } else {
             self.index.search(key)
                 .map_err(|e| QueryError::Execution(e.to_string()))
@@ -1235,7 +1258,9 @@ impl QueryEngine {
                     slot: count as u16,
                     data: data.clone(),
                 });
-                table_data.version_store.insert(key.clone(), tuple.clone(), tid, tid);
+                let snapshot = self.txn_manager.get_snapshot(tid)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                table_data.version_store.insert(key.clone(), tuple.clone(), tid, snapshot.start_ts);
             }
 
             table_data.index.insert(key, data)
@@ -1367,13 +1392,15 @@ impl QueryEngine {
                     let new_data = tuple.serialize();
 
                     if let Some(tid) = txn_id {
-                        let active = self.txn_manager.active_txn_ids();
+                        let snapshot = self.txn_manager.get_snapshot(tid)
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
                         table_data.version_store.try_update(
                             key.clone(),
                             tuple.clone(),
                             tid,
-                            tid,
-                            &active,
+                            snapshot.start_ts,
+                            snapshot.start_ts,
+                            &snapshot.active_txns,
                         )?;
                         self.wal_append(LogRecord::Update {
                             txn_id: tid,
@@ -1494,8 +1521,9 @@ impl QueryEngine {
                         }
                     }
                     if let Some(tid) = txn_id {
-                        let active = self.txn_manager.active_txn_ids();
-                        table_data.version_store.try_delete(&key, tid, tid, &active)?;
+                        let snapshot = self.txn_manager.get_snapshot(tid)
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        table_data.version_store.try_delete(&key, tid, snapshot.start_ts, snapshot.start_ts, &snapshot.active_txns)?;
                         self.wal_append(LogRecord::Delete {
                             txn_id: tid,
                             table_id,
@@ -1842,13 +1870,33 @@ impl QueryEngine {
         if let Some(tid) = txn_id {
             let snapshot = self.txn_manager.get_snapshot(tid)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
-            let mut continue_loop = true;
-            table_data.version_store.for_each_visible(tid, snapshot.start_ts, &snapshot.active_txns, |_k, t| {
-                if !continue_loop { return false; }
-                let data = t.serialize();
-                if !process(&data) { continue_loop = false; }
-                continue_loop
-            });
+            let mut keep = true;
+            table_data.index.for_each(|key, data| {
+                if !keep { return false; }
+                match table_data.version_store.lookup_for_read(key, tid, snapshot.start_ts, &snapshot.active_txns) {
+                    bytedb_core::mvcc::version_store::ReadResult::Visible(t) => {
+                        let serialized = t.serialize();
+                        if !process(&serialized) { keep = false; }
+                    }
+                    bytedb_core::mvcc::version_store::ReadResult::Tombstone => {}
+                    bytedb_core::mvcc::version_store::ReadResult::NoVersions => {
+                        if !process(data) { keep = false; }
+                    }
+                }
+                keep
+            }).map_err(|e| QueryError::Execution(e.to_string()))?;
+            if keep {
+                let mut continue_loop = true;
+                table_data.version_store.for_each_visible(tid, snapshot.start_ts, &snapshot.active_txns, |k, t| {
+                    if !continue_loop { return false; }
+                    if table_data.index.search(k).ok().flatten().is_some() {
+                        return true;
+                    }
+                    let data = t.serialize();
+                    if !process(&data) { continue_loop = false; }
+                    continue_loop
+                });
+            }
         } else {
             table_data.index.for_each(|_key, data| {
                 process(data)

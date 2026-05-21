@@ -66,7 +66,7 @@ impl VersionStore {
         false
     }
 
-    pub fn try_delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<bool, crate::error::CoreError> {
+    pub fn try_delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Result<bool, crate::error::CoreError> {
         let mut shard = self.shard_for(key).write();
         if let Some(chain) = shard.get_mut(key) {
             if let Some(latest) = chain.last_mut() {
@@ -81,6 +81,14 @@ impl VersionStore {
                 if latest.created_by != txn_id && active_txns.contains(&latest.created_by) {
                     return Err(crate::error::CoreError::WriteConflict);
                 }
+                if latest.created_by != txn_id && latest.created_ts > snapshot_ts {
+                    return Err(crate::error::CoreError::WriteConflict);
+                }
+                if let Some(dts) = latest.deleted_ts {
+                    if latest.deleted_by != Some(txn_id) && dts > snapshot_ts {
+                        return Err(crate::error::CoreError::WriteConflict);
+                    }
+                }
                 latest.deleted_by = Some(txn_id);
                 latest.deleted_ts = Some(ts);
                 return Ok(true);
@@ -89,7 +97,7 @@ impl VersionStore {
         Ok(false)
     }
 
-    pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
+    pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
         let mut shard = self.shard_for(&key).write();
         let chain = shard.entry(key).or_insert_with(Vec::new);
         if let Some(latest) = chain.last() {
@@ -100,6 +108,14 @@ impl VersionStore {
             }
             if latest.created_by != txn_id && active_txns.contains(&latest.created_by) {
                 return Err(crate::error::CoreError::WriteConflict);
+            }
+            if latest.created_by != txn_id && latest.created_ts > snapshot_ts {
+                return Err(crate::error::CoreError::WriteConflict);
+            }
+            if let Some(dts) = latest.deleted_ts {
+                if latest.deleted_by != Some(txn_id) && dts > snapshot_ts {
+                    return Err(crate::error::CoreError::WriteConflict);
+                }
             }
         }
         chain.push(VersionedTuple {
@@ -122,6 +138,22 @@ impl VersionStore {
             }
         }
         None
+    }
+
+    pub fn lookup_for_read(&self, key: &[u8], txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> ReadResult {
+        let shard = self.shard_for(key).read();
+        match shard.get(key) {
+            None => ReadResult::NoVersions,
+            Some(chain) if chain.is_empty() => ReadResult::NoVersions,
+            Some(chain) => {
+                for version in chain.iter().rev() {
+                    if is_visible(version, txn_id, snapshot_ts, active_txns) {
+                        return ReadResult::Visible(version.data.clone());
+                    }
+                }
+                ReadResult::Tombstone
+            }
+        }
     }
 
     pub fn get_all_visible(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Vec<(Vec<u8>, Tuple)> {
@@ -233,6 +265,13 @@ impl VersionStore {
 pub struct GcStats {
     pub versions_removed: u64,
     pub keys_removed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReadResult {
+    Visible(Tuple),
+    Tombstone,
+    NoVersions,
 }
 
 fn is_visible(version: &VersionedTuple, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> bool {
