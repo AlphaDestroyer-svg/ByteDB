@@ -74,19 +74,15 @@ pub struct QueryEngine {
     database: Arc<Database>,
     txn_manager: Arc<TransactionManager>,
     tables: Arc<parking_lot::RwLock<HashMap<String, TableData>>>,
-    /// Per-database tables map. The active set lives in `tables`; switching
-    /// USE moves the current map back into this cache and pulls/loads the
-    /// target database's tables.
+
     db_tables: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, TableData>>>>,
     wal: Option<Arc<LogManager>>,
     stmt_cache: parking_lot::Mutex<StmtCache>,
-    /// Logical database catalog (names only). Default db is `database.name()`.
+
     databases: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
     current_db: Arc<parking_lot::RwLock<String>>,
     disk_store: Option<Arc<crate::executor::diskstore::DiskStore>>,
-    /// Per-table statistics, populated by `ANALYZE`. Cleared lazily when
-    /// the table is dropped or altered. Keyed by table name in the active
-    /// database.
+
     stats: Arc<parking_lot::RwLock<HashMap<String, TableStats>>>,
 }
 
@@ -135,11 +131,8 @@ impl QueryEngine {
         }
     }
 
-    /// Attach a disk store. After this call, every CREATE/DROP/INSERT/UPDATE/
-    /// DELETE flushes the affected table to disk, and the engine restores
-    /// content from disk on startup.
     pub fn attach_disk_store(&mut self, store: Arc<crate::executor::diskstore::DiskStore>) {
-        // Seed the in-memory database registry with on-disk databases.
+
         let mut dbs = self.databases.write();
         for n in store.registry().list() {
             dbs.insert(n);
@@ -153,7 +146,6 @@ impl QueryEngine {
         self.disk_store.as_ref().map(Arc::clone)
     }
 
-    /// Reload the active database's tables from disk into the in-memory map.
     fn restore_current_db_from_disk(&self) -> Result<()> {
         let Some(ds) = self.disk_store.as_ref() else { return Ok(()); };
         let mut tables = self.tables.write();
@@ -175,7 +167,7 @@ impl QueryEngine {
                     sequences.insert(c.name.clone(), Arc::new(bytedb_core::tuple::schema::SequenceGenerator::new(start)));
                 }
             }
-            // Best-effort register in catalog. Ignore duplicates.
+
             let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
             let _ = self.database.create_table(meta);
             tables.insert(tcat.name.clone(), TableData {
@@ -189,13 +181,10 @@ impl QueryEngine {
         Ok(())
     }
 
-    /// Stash the active database's tables and load `name`'s tables
-    /// (from in-memory cache or disk) into the active map.
     fn switch_to_database(&self, name: &str) -> Result<()> {
         let current = self.current_db.read().clone();
         if current == name { return Ok(()); }
 
-        // Move current tables into the cache.
         {
             let mut tables = self.tables.write();
             let mut cache = self.db_tables.write();
@@ -203,7 +192,6 @@ impl QueryEngine {
             cache.insert(current.clone(), snapshot);
         }
 
-        // Try in-memory cache first.
         let cached = self.db_tables.write().remove(name);
         if let Some(map) = cached {
             *self.tables.write() = map;
@@ -444,7 +432,7 @@ impl QueryEngine {
                 let tname = del.table.clone();
                 let r = self.exec_delete(&del.table, del.where_clause, del.returning, txn_id);
                 if r.is_ok() {
-                    // DELETE may have cascaded to other tables; flush all.
+
                     let names: Vec<String> = self.tables.read().keys().cloned().collect();
                     for n in names { self.flush_table_to_disk(&n); }
                     let _ = tname;
@@ -617,7 +605,7 @@ impl QueryEngine {
                 on_update: ast_fk_action_to_core(fk.on_update),
             }
         }).collect();
-        // Per-column REFERENCES → foreign_keys
+
         for c in &ct.columns {
             if let Some((rt, rc)) = &c.references {
                 schema.foreign_keys.push(bytedb_core::tuple::schema::ForeignKey {
@@ -652,7 +640,6 @@ impl QueryEngine {
         };
         self.tables.write().insert(ct.name.clone(), table_data);
 
-        // Persist catalog + empty data file.
         if let Some(ds) = &self.disk_store {
             let seqs: Vec<(String, i64)> = sequences.iter()
                 .map(|(c, s)| (c.clone(), s.counter.load(std::sync::atomic::Ordering::SeqCst)))
@@ -901,7 +888,7 @@ impl QueryEngine {
                         }
                     }
                 }
-                // Auto-coerce string literals to native typed values
+
                 if !row_values[i].is_null() {
                     if let Value::Text(s) = &row_values[i] {
                         match col.data_type {
@@ -939,7 +926,6 @@ impl QueryEngine {
                 }
             }
 
-            // UNIQUE enforcement (skip if also PK - PK handled by key collision below)
             for (i, col) in table_data.schema.columns.iter().enumerate() {
                 if col.unique && !col.primary_key && !row_values[i].is_null() {
                     let val = &row_values[i];
@@ -955,7 +941,6 @@ impl QueryEngine {
                 }
             }
 
-            // CHECK constraints
             {
                 let tup = Tuple::new(row_values.clone());
                 for chk in &table_data.check_exprs {
@@ -965,7 +950,6 @@ impl QueryEngine {
                 }
             }
 
-            // FOREIGN KEY enforcement
             for fk in &table_data.schema.foreign_keys {
                 let mut child_vals: Vec<Value> = Vec::new();
                 let mut any_null = false;
@@ -1104,7 +1088,6 @@ impl QueryEngine {
                         }
                     }
 
-                    // UNIQUE enforcement (skip current row by key)
                     for (i, col) in table_data.schema.columns.iter().enumerate() {
                         if col.unique && !col.primary_key {
                             if let Some(val) = tuple.get(i) {
@@ -1126,7 +1109,6 @@ impl QueryEngine {
                         }
                     }
 
-                    // CHECK
                     for chk in &table_data.check_exprs {
                         if !self.eval_predicate(chk, &tuple, &table_data.schema) {
                             return Err(QueryError::Execution(
@@ -1135,7 +1117,6 @@ impl QueryEngine {
                         }
                     }
 
-                    // FOREIGN KEY (child→parent) on UPDATE
                     for fk in &table_data.schema.foreign_keys {
                         let mut child_vals: Vec<Value> = Vec::new();
                         let mut any_null = false;
@@ -1231,8 +1212,7 @@ impl QueryEngine {
                     true
                 };
                 if matches {
-                    // Referential integrity: handle RESTRICT / CASCADE / SET NULL
-                    // Collect (child_table, action, child_keys) so we can mutate after dropping the read lock.
+
                     let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
                     for (other_name, other_td) in tables.iter() {
                         if other_name == table { continue; }
@@ -1272,7 +1252,7 @@ impl QueryEngine {
                             }
                         }
                     }
-                    // Apply cascade actions
+
                     for (cname, action, ck, child_idxs) in &cascade_targets {
                         let ctd = tables.get(cname).unwrap();
                         match action {
@@ -1525,13 +1505,13 @@ impl QueryEngine {
                         }
                         Some(false) => {}
                         None => {
-                            // Fallback: null or unsupported type, skip row
+
                         }
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
-                // Full scan - sequential, no filter
+
                 table_data.index.for_each(|_key, data| {
                     if let Some(tuple) = Tuple::deserialize(data) {
                         rows.push(tuple.values);
@@ -1590,14 +1570,12 @@ impl QueryEngine {
             BinOp::Gt => 3, BinOp::Lte => 4, BinOp::Gte => 5, _ => 255,
         }).unwrap_or(255);
 
-        // Phase 1: collect (heap_key, raw_data_index) using zero-copy
-        // Store raw data for top-N rows only
         let mut heap: BinaryHeap<(i64, usize)> = BinaryHeap::with_capacity(n + 1);
         let mut kept_data: Vec<Vec<u8>> = Vec::with_capacity(n + 1);
         let mut all_int = true;
 
         table_data.index.for_each(|_key, data| {
-            // Zero-copy filter
+
             let matches = if let Some((col_idx, _, ref lit_val)) = fast_filter {
                 raw_filter_matches(data, col_idx, op_code, lit_val).unwrap_or(false)
             } else {
@@ -1605,7 +1583,7 @@ impl QueryEngine {
             };
 
             if matches {
-                // Zero-copy sort key extraction
+
                 match read_int64_at(data, sort_col_idx) {
                     Some(k) => {
                         let heap_key = if asc { k } else { -k };
@@ -1633,7 +1611,6 @@ impl QueryEngine {
             return Err(QueryError::Execution("Non-int sort column".into()));
         }
 
-        // Phase 2: deserialize only the N winners
         let mut entries: Vec<(i64, Vec<Value>)> = heap.into_vec().into_iter()
             .filter_map(|(_, idx)| {
                 let data = &kept_data[idx];
@@ -2741,20 +2718,16 @@ impl QueryEngine {
             } else { None }
         }).collect();
 
-        // Check all agg columns are INT64 (for fast path)
         let all_int_aggs = agg_functions.iter().all(|(name, col_idx)| {
             let n = name.to_uppercase();
             n == "COUNT" || col_idx.is_some()
         });
         if !all_int_aggs { return None; }
 
-        // COUNT_DISTINCT not supported in fast path
         if agg_functions.iter().any(|(name, _)| name.to_uppercase() == "COUNT_DISTINCT") {
             return None;
         }
 
-        // Single group key, TEXT type - common case (GROUP BY category)
-        // Aggregate directly from raw bytes
         struct GroupAcc {
             count: i64,
             sum: i64,
@@ -2766,7 +2739,7 @@ impl QueryEngine {
         let mut groups: HashMap<Vec<u8>, GroupAcc> = HashMap::new();
 
         let _ = table_data.index.for_each(|_key, data| {
-            // Extract group key as raw bytes (avoid String alloc for grouping)
+
             let group_key_bytes: Vec<u8> = group_indices.iter().filter_map(|&gi| {
                 let pos = bytedb_core::tuple::tuple::column_offset(data, gi)?;
                 let next_pos = bytedb_core::tuple::tuple::column_offset(data, gi + 1)
@@ -2774,7 +2747,6 @@ impl QueryEngine {
                 Some(data[pos..next_pos].to_vec())
             }).flatten().collect();
 
-            // Extract aggregate value (assume first non-COUNT agg column)
             let agg_val = agg_functions.iter().find_map(|(name, col_idx)| {
                 let n = name.to_uppercase();
                 if n != "COUNT" {
@@ -2799,7 +2771,6 @@ impl QueryEngine {
             true
         });
 
-        // Build output
         let mut out_col_names = Vec::with_capacity(group_indices.len() + agg_functions.len());
         for expr in group_by {
             if let Expr::Column(name) = expr { out_col_names.push(name.clone()); }
@@ -3579,15 +3550,10 @@ impl QueryEngine {
         &self.txn_manager
     }
 
-    /// Per-table statistics map. Populated by `ANALYZE`; consulted by
-    /// the cost model in stage 7+.
     pub fn stats(&self) -> &parking_lot::RwLock<HashMap<String, TableStats>> {
         &self.stats
     }
 
-    /// Clone the current stats map for use by the optimiser. The
-    /// optimiser reads stats once per query, so this avoids holding the
-    /// lock across a long planning pass.
     fn stats_snapshot(&self) -> StatsCatalog {
         self.stats.read().clone()
     }
@@ -3688,8 +3654,6 @@ impl QueryEngine {
         Arc::clone(&self.txn_manager)
     }
 
-    /// Snapshot the per-table version stores. Used by the background
-    /// vacuum worker to GC dead MVCC versions across every table.
     pub fn snapshot_version_stores(&self) -> Vec<Arc<bytedb_core::mvcc::version_store::VersionStore>> {
         self.tables
             .read()

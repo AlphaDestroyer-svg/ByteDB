@@ -24,7 +24,7 @@ impl DiskManager {
 
         let file_len = file.metadata()?.len();
         let num_pages = if file_len == 0 {
-            1 // reserve page 0 as meta page
+            1
         } else {
             (file_len as u32) / (PAGE_SIZE as u32)
         };

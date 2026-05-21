@@ -1,9 +1,3 @@
-//! Periodically calls `LogManager::flush` so commits that left the
-//! BufWriter without explicitly fsync'ing become durable in bounded
-//! time. Most commit paths flush synchronously through the group-commit
-//! leader, but background-only writes (best-effort logs, async hints)
-//! benefit from a heartbeat flusher.
-
 use std::sync::Arc;
 use std::time::Duration;
 

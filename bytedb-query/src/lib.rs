@@ -345,7 +345,6 @@ mod tests {
         let mut p = Parser::new("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)").unwrap();
         engine.execute(p.parse().unwrap(), None).unwrap();
 
-        // Insert with txn1
         let mut p = Parser::new("BEGIN").unwrap();
         let result = engine.execute(p.parse().unwrap(), None).unwrap();
         let txn1_id = match result {
@@ -359,7 +358,6 @@ mod tests {
         let mut p = Parser::new("INSERT INTO accounts VALUES (1, 1000)").unwrap();
         engine.execute(p.parse().unwrap(), Some(txn1_id)).unwrap();
 
-        // Start txn2 - should NOT see txn1's uncommitted data
         let mut p = Parser::new("BEGIN").unwrap();
         let result = engine.execute(p.parse().unwrap(), None).unwrap();
         let txn2_id = match result {
@@ -379,7 +377,6 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
 
-        // Commit txn1
         let mut p = Parser::new("COMMIT").unwrap();
         engine.execute(p.parse().unwrap(), Some(txn1_id)).unwrap();
     }
@@ -953,7 +950,6 @@ mod tests {
         engine.execute_sql("INSERT INTO employees VALUES (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Carol', 10)", None).unwrap();
         engine.execute_sql("INSERT INTO departments VALUES (10, 'Engineering'), (20, 'Sales')", None).unwrap();
 
-        // Single table alias
         let result = engine.execute_sql("SELECT e.name FROM employees AS e WHERE e.id = 1", None).unwrap();
         match result {
             ExecutionResult::Rows { rows, .. } => {
@@ -963,7 +959,6 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
 
-        // JOIN with aliases
         let result = engine.execute_sql(
             "SELECT e.name, d.dept_name FROM employees e JOIN departments d ON e.dept_id = d.id WHERE d.dept_name = 'Engineering'",
             None
@@ -978,7 +973,6 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
 
-        // Qualified column without alias (using table name directly)
         let result = engine.execute_sql(
             "SELECT employees.name FROM employees WHERE employees.id = 2",
             None
@@ -999,7 +993,6 @@ mod tests {
         engine.execute_sql("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT NOT NULL, amount INT)", None).unwrap();
         engine.execute_sql("INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Alice', 200), (3, 'Bob', 150), (4, 'Carol', 50), (5, 'Carol', 75), (6, 'Carol', 25)", None).unwrap();
 
-        // HAVING with COUNT
         let result = engine.execute_sql(
             "SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1",
             None
@@ -1014,7 +1007,6 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
 
-        // HAVING with SUM
         let result = engine.execute_sql(
             "SELECT customer, SUM(amount) FROM orders GROUP BY customer HAVING SUM(amount) > 150",
             None
@@ -1037,10 +1029,8 @@ mod tests {
             None
         ).unwrap();
 
-        // Insert with all columns
         engine.execute_sql("INSERT INTO products VALUES (1, 'Widget', 'sold', 5)", None).unwrap();
 
-        // Insert with partial columns - defaults should fill in
         engine.execute_sql("INSERT INTO products (id, name) VALUES (2, 'Gadget')", None).unwrap();
 
         let result = engine.execute_sql("SELECT id, name, status, quantity FROM products WHERE id = 1", None).unwrap();
@@ -1248,7 +1238,7 @@ mod tests {
         engine.execute_sql("INSERT INTO u VALUES (2, 'b@x.com')", None).unwrap();
         let r = engine.execute_sql("UPDATE u SET email = 'a@x.com' WHERE id = 2", None);
         assert!(r.is_err(), "updating to a duplicate UNIQUE value should fail");
-        // Updating row to its own value should work
+
         engine.execute_sql("UPDATE u SET email = 'b@x.com' WHERE id = 2", None).unwrap();
     }
 
@@ -1282,7 +1272,7 @@ mod tests {
         engine.execute_sql("INSERT INTO c VALUES (10, 1)", None).unwrap();
         let r = engine.execute_sql("DELETE FROM p WHERE id = 1", None);
         assert!(r.is_err(), "DELETE of referenced parent should fail (RESTRICT)");
-        // Remove child first, then parent succeeds
+
         engine.execute_sql("DELETE FROM c WHERE id = 10", None).unwrap();
         engine.execute_sql("DELETE FROM p WHERE id = 1", None).unwrap();
     }
@@ -1332,7 +1322,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bytedb_disk_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // First boot — create a table, insert rows.
         {
             let mut engine = setup_engine();
             let store = DiskStore::open(dir.clone(), "test").unwrap();
@@ -1341,7 +1330,6 @@ mod tests {
             engine.execute_sql("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')", None).unwrap();
         }
 
-        // Second boot — same dir; rows must come back without snapshots.
         {
             let mut engine = setup_engine();
             let store = DiskStore::open(dir.clone(), "test").unwrap();
@@ -1383,7 +1371,6 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
 
-        // The directory must exist on disk
         assert!(dir.join("databases").join("shop").exists());
 
         engine.execute_sql("DROP DATABASE shop", None).unwrap();

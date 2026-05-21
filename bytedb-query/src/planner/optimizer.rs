@@ -1,15 +1,3 @@
-//! Stage 8 optimiser.
-//!
-//! `optimize_with_stats` is the new entry point: it consults
-//! [`crate::planner::cost`] to reorder a left-deep chain of joins so the
-//! cheapest sub-plan goes first. Without stats we fall back to the
-//! original source-order plan — the same behaviour as `optimize`.
-//!
-//! The reordering is greedy by smallest estimated cardinality. For the
-//! 2- to 5-table joins we expect, greedy gives the same answer as DP in
-//! virtually every benchmark we've measured here, at a fraction of the
-//! complexity. We can graduate to DP/Selinger if join chains grow.
-
 use super::cost::{cost_plan, StatsCatalog};
 use super::logical_plan::LogicalPlan;
 use super::physical_plan::PhysicalPlan;
@@ -58,10 +46,7 @@ fn convert_to_physical(plan: LogicalPlan, stats: &StatsCatalog) -> Result<Physic
             })
         }
         LogicalPlan::Join { .. } => {
-            // Flatten the left-deep join chain, reorder, then convert each
-            // leaf and re-emit as a left-deep PhysicalPlan tree directly
-            // (going back through convert_to_physical would re-enter this
-            // arm and loop forever).
+
             let (rels, joins) = flatten_join_chain(plan);
             let (ordered_rels, ordered_joins) = reorder_join_chain(rels, joins, stats);
             build_physical_join_chain(ordered_rels, ordered_joins, stats)
@@ -117,9 +102,6 @@ struct JoinEdge {
     join_type: JoinType,
 }
 
-/// Walk a left-deep `LogicalPlan::Join` chain and return the leaf
-/// relations in source order plus the join edges between them.
-/// Non-join roots flow through unchanged via the `Plan` variant.
 fn flatten_join_chain(plan: LogicalPlan) -> (Vec<LogicalPlan>, Vec<JoinEdge>) {
     let mut rels: Vec<LogicalPlan> = Vec::new();
     let mut joins: Vec<JoinEdge> = Vec::new();
@@ -132,9 +114,7 @@ fn walk(plan: LogicalPlan, rels: &mut Vec<LogicalPlan>, joins: &mut Vec<JoinEdge
         LogicalPlan::Join { left, right, condition, join_type } => {
             walk(*left, rels, joins);
             joins.push(JoinEdge { condition, join_type });
-            // The right side of a left-deep tree is always a single relation
-            // for parser-produced trees, but we recurse to handle any
-            // future bushy plans.
+
             rels.push(*right);
         }
         other => rels.push(other),
@@ -161,18 +141,12 @@ fn build_physical_join_chain(
     Ok(current)
 }
 
-/// Reorder the join chain greedily: pick the cheapest seed, then
-/// repeatedly attach the relation that produces the smallest result.
-/// Falls back to source order if there are no stats or fewer than two
-/// relations.
 fn reorder_join_chain(
     rels: Vec<LogicalPlan>,
     joins: Vec<JoinEdge>,
     stats: &StatsCatalog,
 ) -> (Vec<LogicalPlan>, Vec<JoinEdge>) {
-    // Bail to source order if we can't reason about it: too few rels,
-    // missing stats, or any non-INNER join (which would change nullability
-    // semantics if reordered).
+
     if rels.len() < 2 || joins.is_empty() {
         return (rels, joins);
     }
@@ -187,9 +161,6 @@ fn reorder_join_chain(
         .map(|r| cost_plan(&leaf_physical_for_cost(r), stats).rows)
         .collect();
 
-    // Greedy: smallest leaf first; then for each remaining relation,
-    // pick the one whose join with the running plan produces the
-    // smallest cardinality (using the same formula as cost::cost_plan).
     let mut remaining: Vec<usize> = (0..rels.len()).collect();
     let seed_pos = remaining.iter().enumerate()
         .min_by(|(_, a), (_, b)| {
@@ -220,22 +191,15 @@ fn reorder_join_chain(
         order.push(next);
     }
 
-    // If reordering didn't change anything, return the inputs as-is.
     if order.iter().enumerate().all(|(i, &idx)| i == idx) {
         return (rels, joins);
     }
 
-    // Pull each relation out by its original index.
     let mut by_index: Vec<Option<LogicalPlan>> = rels.into_iter().map(Some).collect();
     let new_rels: Vec<LogicalPlan> = order.iter()
         .map(|&i| by_index[i].take().expect("each rel taken at most once"))
         .collect();
 
-    // Conditions stay generic INNER joins on the original predicate from
-    // edge[i-1]; rebinding them to the new positions would require
-    // rewriting Expr::Column references, which we don't yet do. Inner
-    // joins are commutative for cardinality purposes so the *result set*
-    // is the same — only the chosen build/probe order changes.
     (new_rels, joins)
 }
 
@@ -254,8 +218,7 @@ fn leaf_physical_for_cost(plan: &LogicalPlan) -> PhysicalPlan {
             limit: None,
             needed_columns: None,
         },
-        // For non-scan leaves we conservatively report a placeholder — the
-        // optimiser will fall back to source order via chain_has_stats.
+
         _ => PhysicalPlan::SeqScan {
             table: String::new(),
             filter: None,
@@ -347,7 +310,7 @@ mod tests {
     fn no_stats_preserves_source_order() {
         let plan = join(join(scan("a"), scan("b")), scan("c"));
         let phys = optimize(plan).unwrap();
-        // First leaf must still be "a".
+
         assert_eq!(first_table(&phys), Some("a"));
     }
 
@@ -383,7 +346,7 @@ mod tests {
     fn missing_stats_for_one_relation_falls_back() {
         let mut catalog = StatsCatalog::new();
         catalog.insert("big".into(), stats_for("big", 10_000));
-        // "small" has no stats — chain_has_stats returns false.
+
         let plan = join(scan("big"), scan("small"));
         let phys = optimize_with_stats(plan, &catalog).unwrap();
         assert_eq!(first_table(&phys), Some("big"));

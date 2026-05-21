@@ -34,11 +34,9 @@ fn main() {
 
     let engine = setup_engine();
 
-    // Create table
     let mut p = Parser::new("CREATE TABLE benchmark (id INT PRIMARY KEY, name TEXT, value INT, category TEXT)").unwrap();
     engine.execute(p.parse().unwrap(), None).unwrap();
 
-    // === 100K INSERT ===
     let row_count = 100_000;
     let start = Instant::now();
     for i in 0..row_count {
@@ -56,7 +54,6 @@ fn main() {
     let insert_dur = start.elapsed();
     println!("  1. INSERT {} rows:        {:>9.2}ms  ({})", row_count, insert_dur.as_secs_f64() * 1000.0, format_rate(row_count, insert_dur));
 
-    // === Bulk INSERT (programmatic, no SQL parsing) ===
     let mut p = Parser::new("CREATE TABLE bulk_test (id INT PRIMARY KEY, name TEXT, value INT, category TEXT)").unwrap();
     engine.execute(p.parse().unwrap(), None).unwrap();
 
@@ -74,7 +71,6 @@ fn main() {
     let bulk_dur = start.elapsed();
     println!("  1b. BULK INSERT {} rows:   {:>9.2}ms  ({})", bulk_count, bulk_dur.as_secs_f64() * 1000.0, format_rate(bulk_count, bulk_dur));
 
-    // === Point SELECT (PK lookup) ===
     let select_count = 100_000;
     let start = Instant::now();
     for i in 0..select_count {
@@ -85,7 +81,6 @@ fn main() {
     let point_dur = start.elapsed();
     println!("  2. Point SELECT x{}:    {:>9.2}ms  ({})", select_count, point_dur.as_secs_f64() * 1000.0, format_rate(select_count, point_dur));
 
-    // === Full table scan ===
     let scan_iters = 10;
     let start = Instant::now();
     for _ in 0..scan_iters {
@@ -95,7 +90,6 @@ fn main() {
     let scan_dur = start.elapsed();
     println!("  3. Full scan x{} (100K rows): {:>6.2}ms  ({} scans/s)", scan_iters, scan_dur.as_secs_f64() * 1000.0, format_rate(scan_iters, scan_dur));
 
-    // === Filtered scan ===
     let filter_iters = 10;
     let start = Instant::now();
     for _ in 0..filter_iters {
@@ -105,7 +99,6 @@ fn main() {
     let filter_dur = start.elapsed();
     println!("  4. Filtered scan x{}:       {:>9.2}ms  ({} scans/s)", filter_iters, filter_dur.as_secs_f64() * 1000.0, format_rate(filter_iters, filter_dur));
 
-    // === UPDATE by PK ===
     let update_count = 10_000;
     let start = Instant::now();
     for i in 0..update_count {
@@ -116,7 +109,6 @@ fn main() {
     let update_dur = start.elapsed();
     println!("  5. UPDATE by PK x{}:     {:>9.2}ms  ({})", update_count, update_dur.as_secs_f64() * 1000.0, format_rate(update_count, update_dur));
 
-    // === ORDER BY + LIMIT ===
     let order_iters = 10;
     let start = Instant::now();
     for _ in 0..order_iters {
@@ -126,7 +118,6 @@ fn main() {
     let order_dur = start.elapsed();
     println!("  6. ORDER BY+LIMIT x{}:      {:>9.2}ms  ({} queries/s)", order_iters, order_dur.as_secs_f64() * 1000.0, format_rate(order_iters, order_dur));
 
-    // === SELECT LIMIT (no sort - pushdown) ===
     let limit_iters = 1000;
     let start = Instant::now();
     for _ in 0..limit_iters {
@@ -136,7 +127,6 @@ fn main() {
     let limit_dur = start.elapsed();
     println!("  6b. SELECT LIMIT 10 x{}:   {:>9.2}ms  ({})", limit_iters, limit_dur.as_secs_f64() * 1000.0, format_rate(limit_iters, limit_dur));
 
-    // === JOIN ===
     let mut p = Parser::new("CREATE TABLE categories (id INT PRIMARY KEY, cat_name TEXT, priority INT)").unwrap();
     engine.execute(p.parse().unwrap(), None).unwrap();
     for i in 0..1000 {
@@ -154,7 +144,6 @@ fn main() {
     let join_dur = start.elapsed();
     println!("  7. JOIN (100Kx1K) x{}:       {:>9.2}ms  ({} joins/s)", join_iters, join_dur.as_secs_f64() * 1000.0, format_rate(join_iters, join_dur));
 
-    // === GROUP BY + Aggregates ===
     let agg_iters = 5;
     let start = Instant::now();
     for _ in 0..agg_iters {
@@ -164,7 +153,6 @@ fn main() {
     let agg_dur = start.elapsed();
     println!("  8. GROUP BY+5 AGGs x{}:     {:>9.2}ms  ({} queries/s)", agg_iters, agg_dur.as_secs_f64() * 1000.0, format_rate(agg_iters, agg_dur));
 
-    // === DELETE by PK ===
     let delete_count = 10_000;
     let start = Instant::now();
     for i in 0..delete_count {
@@ -175,7 +163,6 @@ fn main() {
     let delete_dur = start.elapsed();
     println!("  9. DELETE by PK x{}:     {:>9.2}ms  ({})", delete_count, delete_dur.as_secs_f64() * 1000.0, format_rate(delete_count, delete_dur));
 
-    // === Concurrent Point SELECT (multi-threaded) ===
     let engine = Arc::new(engine);
     let num_threads = 4;
     let ops_per_thread = 25_000;

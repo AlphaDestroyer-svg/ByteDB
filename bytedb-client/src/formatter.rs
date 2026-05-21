@@ -20,7 +20,6 @@ pub fn format_response(response: &Response) -> String {
 
             let mut output = String::new();
 
-            // Top border
             let border: Vec<String> = col_widths.iter()
                 .map(|&w| "─".repeat(w + 2))
                 .collect();
@@ -29,7 +28,6 @@ pub fn format_response(response: &Response) -> String {
             output.push('┐');
             output.push('\n');
 
-            // Header
             let header: Vec<String> = columns.iter().enumerate()
                 .map(|(i, c)| format!(" {:width$} ", c, width = col_widths[i]))
                 .collect();
@@ -38,7 +36,6 @@ pub fn format_response(response: &Response) -> String {
             output.push('│');
             output.push('\n');
 
-            // Header separator
             let sep: Vec<String> = col_widths.iter()
                 .map(|&w| "─".repeat(w + 2))
                 .collect();
@@ -47,7 +44,6 @@ pub fn format_response(response: &Response) -> String {
             output.push('┤');
             output.push('\n');
 
-            // Rows
             for row in rows {
                 let row_str: Vec<String> = row.iter().enumerate()
                     .map(|(i, val)| {
@@ -62,7 +58,6 @@ pub fn format_response(response: &Response) -> String {
                 output.push('\n');
             }
 
-            // Bottom border
             let bottom: Vec<String> = col_widths.iter()
                 .map(|&w| "─".repeat(w + 2))
                 .collect();

@@ -1,10 +1,3 @@
-//! Disk-backed persistence used by [`QueryEngine`].
-//!
-//! The store keeps an in-memory mirror of the on-disk catalog and rewrites
-//! per-table data files on every committed mutation. This sidesteps the
-//! need for a global "flush every N writes" snapshot and gives each table
-//! its own durable file.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,7 +9,7 @@ use bytedb_core::error::Result as CoreResult;
 
 pub struct DiskStore {
     registry: Arc<DatabaseRegistry>,
-    /// Catalog of the currently-active database, mirrored in memory.
+
     catalog: RwLock<DbCatalog>,
     current_db: RwLock<String>,
 }

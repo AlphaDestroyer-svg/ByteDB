@@ -76,7 +76,7 @@ mod tests {
 
         match result {
             ExecutionResult::Rows { rows, .. } => {
-                assert_eq!(rows.len(), 2); // val=40, val=50
+                assert_eq!(rows.len(), 2);
             }
             _ => panic!("Expected Rows"),
         }

@@ -1,14 +1,3 @@
-//! Checkpoint thread.
-//!
-//! At each tick:
-//!   1. Flushes the buffer pool so all data pages catch up.
-//!   2. Calls `LogManager::flush` so the WAL is durable.
-//!   3. Writes a CHECKPOINT log record (when supported by callers).
-//!
-//! Truncating the WAL past the checkpoint is the caller's responsibility
-//! — it depends on still-active transactions, which live above
-//! `bytedb-core`. We just publish the durable point.
-
 use std::sync::Arc;
 use std::time::Duration;
 

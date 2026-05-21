@@ -1,28 +1,3 @@
-//! Slotted page format (v0.2).
-//!
-//! Each 8 KB page is laid out as:
-//!
-//! ```text
-//! +--------------------------------------------------+ 0
-//! | header (32 bytes)                                |
-//! +--------------------------------------------------+ 32
-//! | slot directory, growing forward ->               |
-//! |                                                  |
-//! |                  free space                      |
-//! |                                                  |
-//! |                <- tuple data, growing back       |
-//! +--------------------------------------------------+ PAGE_SIZE
-//! ```
-//!
-//! The slot directory is an array of fixed 5-byte `SlotEntry { offset: u16,
-//! length: u16, flags: u8 }` records, indexed by slot id. Live slots point
-//! at their tuple in the data region; dead slots have `flags & SLOT_DEAD
-//! != 0` and are reclaimed by `compact()`.
-//!
-//! Slot ids are stable for the life of the page: deleting a slot leaves a
-//! tombstone behind so existing pointers keep resolving (returning `None`),
-//! which matches what indexes and MVCC expect.
-
 use std::fmt;
 
 use crate::error::{CoreError, Result};
@@ -33,7 +8,6 @@ pub type SlotId = u16;
 
 pub const INVALID_PAGE_ID: PageId = 0;
 
-/// Magic stamped into the meta page so v0.1 files refuse to mount.
 pub const PAGE_MAGIC_V2: [u8; 4] = *b"BSDB";
 pub const PAGE_FORMAT_VERSION: u16 = 2;
 
@@ -64,18 +38,6 @@ impl From<u8> for PageType {
     }
 }
 
-// Header layout (32 bytes total):
-//   [0..4]   page_id           u32 LE
-//   [4]      page_type         u8
-//   [5]      format_version    u8
-//   [6..8]   flags             u16 LE  (reserved)
-//   [8..16]  lsn               u64 LE
-//   [16..20] checksum          u32 LE  (over body, set on flush)
-//   [20..22] slot_count        u16 LE  (incl. dead slots)
-//   [22..24] live_count        u16 LE
-//   [24..26] free_start        u16 LE  (low end of free space, grows up)
-//   [26..28] free_end          u16 LE  (high end of free space, grows down)
-//   [28..32] reserved
 pub const PAGE_HEADER_SIZE: usize = 32;
 pub const SLOT_ENTRY_SIZE: usize = 5;
 
@@ -117,7 +79,7 @@ pub struct Page {
 }
 
 impl Page {
-    /// New empty page with header initialised for slotted-page use.
+
     pub fn new(id: PageId) -> Self {
         let mut page = Page {
             id,
@@ -131,8 +93,6 @@ impl Page {
         page.set_free_end(PAGE_SIZE as u16);
         page
     }
-
-    // ---- header accessors ----
 
     pub fn page_type(&self) -> PageType {
         PageType::from(self.data[4])
@@ -172,7 +132,7 @@ impl Page {
     }
 
     pub fn compute_checksum(&self) -> u32 {
-        // Checksum covers everything past the checksum field itself.
+
         crc32fast::hash(&self.data[20..])
     }
 
@@ -208,23 +168,16 @@ impl Page {
         self.data[26..28].copy_from_slice(&v.to_le_bytes());
     }
 
-    /// Bytes available for a *new* slot+tuple (must fit both data and entry).
     pub fn free_space(&self) -> usize {
         self.free_end().saturating_sub(self.free_start()) as usize
     }
 
-    // ---- back-compat alias used by older callers ----
-
-    /// Number of *live* tuples on the page. Dead slots are excluded.
     pub fn item_count(&self) -> u16 {
         self.live_count()
     }
 
-    // ---- slot directory ----
-
     fn slot_entry_offset(&self, slot_id: SlotId) -> usize {
-        // Slot directory sits right after the header and grows forward.
-        // Slot 0 lives at PAGE_HEADER_SIZE.
+
         PAGE_HEADER_SIZE + slot_id as usize * SLOT_ENTRY_SIZE
     }
 
@@ -239,7 +192,6 @@ impl Page {
         self.data[off..off + SLOT_ENTRY_SIZE].copy_from_slice(&buf);
     }
 
-    /// Get the tuple bytes for a slot, or `None` if the slot is dead or OOB.
     pub fn get_slot(&self, slot_id: SlotId) -> Option<&[u8]> {
         if slot_id >= self.slot_count() {
             return None;
@@ -256,9 +208,6 @@ impl Page {
         Some(&self.data[start..end])
     }
 
-    /// Allocate a new slot containing `data`. Returns the slot id, or an
-    /// error if the page does not have enough free space (caller's job to
-    /// split / move to overflow page).
     pub fn alloc_slot(&mut self, data: &[u8]) -> Result<SlotId> {
         if data.len() > u16::MAX as usize {
             return Err(CoreError::Internal(
@@ -273,14 +222,11 @@ impl Page {
         }
 
         let slot_id = self.slot_count();
-        // Tuple sits just above the previous free_end (tuples grow from the
-        // high end of the page downward).
+
         let tuple_off = self.free_end() - data.len() as u16;
         let tuple_off_usize = tuple_off as usize;
         self.data[tuple_off_usize..tuple_off_usize + data.len()].copy_from_slice(data);
 
-        // Bump slot_count BEFORE writing the entry so slot_entry_offset
-        // resolves to the freshly-reserved slot.
         self.set_slot_count(slot_id + 1);
         self.write_slot(
             slot_id,
@@ -291,14 +237,12 @@ impl Page {
             },
         );
 
-        // Slot directory boundary moves up; tuple boundary moves down.
         self.set_free_start(self.free_start() + SLOT_ENTRY_SIZE as u16);
         self.set_free_end(tuple_off);
         self.set_live_count(self.live_count() + 1);
         Ok(slot_id)
     }
 
-    /// Mark a slot as dead. Idempotent. Space is reclaimed by `compact()`.
     pub fn delete_slot(&mut self, slot_id: SlotId) -> Result<()> {
         if slot_id >= self.slot_count() {
             return Err(CoreError::Internal(format!(
@@ -320,10 +264,6 @@ impl Page {
         Ok(())
     }
 
-    /// Replace the contents of a live slot. If the new data is larger than
-    /// the existing slot's length and there isn't enough trailing free
-    /// space, the slot is rewritten at the end of the data region (and the
-    /// old space becomes dead, reclaimable on the next `compact()`).
     pub fn update_slot(&mut self, slot_id: SlotId, data: &[u8]) -> Result<()> {
         if slot_id >= self.slot_count() {
             return Err(CoreError::Internal(format!(
@@ -337,7 +277,7 @@ impl Page {
         }
 
         if data.len() <= entry.length as usize {
-            // In-place overwrite.
+
             let start = entry.offset as usize;
             self.data[start..start + data.len()].copy_from_slice(data);
             self.write_slot(
@@ -351,9 +291,8 @@ impl Page {
             return Ok(());
         }
 
-        // Need a fresh region — allocate from free space, then redirect.
         if data.len() + 0 > self.free_space() {
-            // No room without compaction; try compacting first.
+
             self.compact();
             if data.len() > self.free_space() {
                 return Err(CoreError::Internal(
@@ -376,14 +315,10 @@ impl Page {
         Ok(())
     }
 
-    /// Iterate live slots, yielding `(SlotId, &[u8])`.
     pub fn iter_live<'a>(&'a self) -> impl Iterator<Item = (SlotId, &'a [u8])> + 'a {
         (0..self.slot_count()).filter_map(move |id| self.get_slot(id).map(|d| (id, d)))
     }
 
-    /// Defragment the data region. Live tuples are repacked against the
-    /// high end of the page; the slot directory is left in place so slot
-    /// ids stay stable.
     pub fn compact(&mut self) {
         let count = self.slot_count();
         let dir_end = PAGE_HEADER_SIZE + count as usize * SLOT_ENTRY_SIZE;
@@ -394,7 +329,6 @@ impl Page {
             return;
         }
 
-        // Snapshot live tuples (id, bytes).
         let mut live: Vec<(SlotId, Vec<u8>)> = Vec::new();
         for id in 0..count {
             let e = self.read_slot(id);
@@ -406,12 +340,10 @@ impl Page {
             live.push((id, self.data[s..s + l].to_vec()));
         }
 
-        // Wipe the tuple region (between dir_end and PAGE_SIZE).
         for byte in &mut self.data[dir_end..PAGE_SIZE] {
             *byte = 0;
         }
 
-        // Repack live tuples against the high end of the page.
         let mut cursor = PAGE_SIZE;
         for (id, bytes) in &live {
             let start = cursor - bytes.len();
@@ -426,8 +358,6 @@ impl Page {
         self.set_free_end(cursor as u16);
     }
 
-    /// Whole body slice (everything after the header). Useful for B+Tree
-    /// nodes that still serialise themselves into the body region.
     pub fn body(&self) -> &[u8] {
         &self.data[PAGE_HEADER_SIZE..]
     }

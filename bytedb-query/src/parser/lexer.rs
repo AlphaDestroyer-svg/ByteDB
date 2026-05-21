@@ -36,7 +36,6 @@ impl Lexer {
 
         let ch = self.input[self.pos];
 
-        // Comments
         if ch == '-' && self.peek_next() == Some('-') {
             self.skip_line_comment();
             return self.next_token();

@@ -42,13 +42,13 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
-    /// Microseconds since UNIX epoch.
+
     Timestamp(i64),
-    /// Days since UNIX epoch (1970-01-01 = 0).
+
     Date(i32),
-    /// Fixed-point decimal: value = mantissa * 10^-scale.
+
     Decimal(i128, u8),
-    /// Stored as 16 raw bytes; rendered as canonical hyphenated form.
+
     Uuid([u8; 16]),
 }
 
@@ -220,7 +220,6 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-/// Parse "YYYY-MM-DD" → days since 1970-01-01.
 pub fn parse_date(s: &str) -> Option<i32> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 { return None; }
@@ -236,7 +235,6 @@ pub fn format_date(days: i32) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// Howard Hinnant's date algorithm.
 fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     let y = y - if m <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -260,7 +258,6 @@ fn civil_from_days(z: i32) -> (i32, u32, u32) {
     (y, m, d)
 }
 
-/// Parse "123.45" or "-12" into (mantissa, scale).
 pub fn parse_decimal(s: &str) -> Option<(i128, u8)> {
     let s = s.trim();
     let (sign, body) = if let Some(rest) = s.strip_prefix('-') {

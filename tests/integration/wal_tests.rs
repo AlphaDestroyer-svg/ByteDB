@@ -55,14 +55,12 @@ mod tests {
         let path = temp_log_path();
         let log_manager = LogManager::new(&path).unwrap();
 
-        // Committed transaction
         log_manager.append(LogRecord::Begin { txn_id: 1 }).unwrap();
         log_manager.append(LogRecord::Insert {
             txn_id: 1, table_id: 1, page_id: 1, slot: 0, data: b"data1".to_vec(),
         }).unwrap();
         log_manager.append(LogRecord::Commit { txn_id: 1 }).unwrap();
 
-        // Uncommitted transaction (should be undone)
         log_manager.append(LogRecord::Begin { txn_id: 2 }).unwrap();
         log_manager.append(LogRecord::Insert {
             txn_id: 2, table_id: 1, page_id: 2, slot: 0, data: b"data2".to_vec(),

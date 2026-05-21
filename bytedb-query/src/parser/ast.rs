@@ -3,36 +3,36 @@ use bytedb_core::tuple::value::DataType;
 
 #[derive(Debug, Clone)]
 pub enum Statement {
-    // DDL
+
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(String),
     AlterTable(AlterTableStmt),
-    // Set operations
-    Union(Box<Statement>, Box<Statement>, bool), // left, right, all
+
+    Union(Box<Statement>, Box<Statement>, bool),
     Intersect(Box<Statement>, Box<Statement>, bool),
     Except(Box<Statement>, Box<Statement>, bool),
-    // DML
+
     Select(SelectStmt),
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
-    // KV
+
     KvGet(String),
     KvSet(String, String),
     KvDelete(String),
     KvScan(String, String),
-    // Document
+
     DocInsert(DocInsertStmt),
     DocFind(DocFindStmt),
     DocUpdate(DocUpdateStmt),
     DocDelete(DocDeleteStmt),
-    // Transaction
+
     Begin(Option<IsolationLevel>),
     Commit,
     Rollback,
-    // Utility
+
     ShowTables,
     ShowColumns(String),
     ShowCreateTable(String),
@@ -43,11 +43,9 @@ pub enum Statement {
     DropDatabase { name: String, if_exists: bool },
     UseDatabase(String),
     ShowDatabases,
-    /// `ANALYZE [TABLE] <name>` — recompute statistics for one table.
-    /// `ANALYZE` (no name) recomputes for every table in the current db.
+
     Analyze(Option<String>),
-    /// `SHOW STATS [FOR <table>]` — print stored stats. With no table
-    /// argument, prints stats for every table.
+
     ShowStats(Option<String>),
 }
 
@@ -86,7 +84,7 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     pub default: Option<Expr>,
     pub check: Option<Expr>,
-    pub references: Option<(String, String)>, // (table, column)
+    pub references: Option<(String, String)>,
     pub on_delete: FkAction,
     pub on_update: FkAction,
 }
@@ -216,7 +214,6 @@ pub struct DeleteStmt {
     pub returning: Option<Vec<SelectColumn>>,
 }
 
-// Document statements
 #[derive(Debug, Clone)]
 pub struct DocInsertStmt {
     pub collection: String,

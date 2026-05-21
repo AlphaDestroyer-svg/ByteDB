@@ -58,7 +58,7 @@ impl Parser {
             }
             Token::Analyze => {
                 self.advance();
-                // Optional `TABLE` keyword
+
                 if let Token::Ident(s) = self.current() {
                     if s.eq_ignore_ascii_case("TABLE") {
                         self.advance();
@@ -543,11 +543,11 @@ impl Parser {
         let mut table_checks: Vec<Expr> = Vec::new();
         let mut table_fks: Vec<ForeignKeyDef> = Vec::new();
         loop {
-            // Table-level constraint?
+
             if self.current() == &Token::Unique || self.current() == &Token::Primary
                 || matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("CHECK") || s.eq_ignore_ascii_case("CONSTRAINT") || s.eq_ignore_ascii_case("FOREIGN"))
             {
-                // CONSTRAINT name? <constraint>
+
                 if matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("CONSTRAINT")) {
                     self.advance();
                     let _ = self.expect_ident()?;
@@ -564,7 +564,7 @@ impl Parser {
                     self.expect(Token::LParen)?;
                     let cols = self.parse_ident_list()?;
                     self.expect(Token::RParen)?;
-                    // REFERENCES table(cols)
+
                     if !matches!(self.current(), Token::Ident(s) if s.eq_ignore_ascii_case("REFERENCES")) {
                         return Err(QueryError::Parse("Expected REFERENCES".into()));
                     }
@@ -602,9 +602,8 @@ impl Parser {
             let mut col_on_delete = FkAction::Restrict;
             let mut col_on_update = FkAction::Restrict;
 
-            // SERIAL implies auto-increment
             if matches!(data_type, bytedb_core::tuple::value::DataType::Int64)
-                && false  // placeholder; SERIAL handled in parse_data_type via separate token
+                && false
             {}
 
             loop {
@@ -654,7 +653,6 @@ impl Parser {
                 }
             }
 
-            // SERIAL token handling in data type
             if matches!(self.previous_data_type_serial(), true) {
                 auto_increment = true;
                 primary_key = true;
@@ -796,7 +794,7 @@ impl Parser {
                     self.advance();
                 }
                 let old_name = self.expect_ident()?;
-                // expect TO
+
                 if let Token::Ident(s) = self.current().clone() {
                     if s.to_uppercase() == "TO" {
                         self.advance();
@@ -878,7 +876,7 @@ impl Parser {
             }
             Token::Ident(ref s) if s.eq_ignore_ascii_case("STATS") => {
                 self.advance();
-                // Optional `FOR <table>`
+
                 let table = if let Token::Ident(kw) = self.current() {
                     if kw.eq_ignore_ascii_case("FOR") {
                         self.advance();
@@ -1033,7 +1031,6 @@ impl Parser {
         Ok(result)
     }
 
-    // Expression parsing with precedence climbing
     fn parse_expr(&mut self) -> Result<Expr> {
         self.parse_or_expr()
     }
@@ -1388,7 +1385,6 @@ impl Parser {
             _ => return Err(QueryError::Parse(format!("Unexpected token in expression: {:?}", self.current()))),
         };
 
-        // Postfix :: cast
         while self.current() == &Token::DoubleColon {
             self.advance();
             let data_type = self.parse_data_type()?;
@@ -1445,7 +1441,7 @@ impl Parser {
             _ => return Err(QueryError::Parse(format!("Expected data type, got {:?}", self.current()))),
         };
         self.advance();
-        // consume "PRECISION" after DOUBLE
+
         if matches!(dt, DataType::Float64 | DataType::Decimal) {
             if let Token::Ident(s) = self.current() {
                 if s.to_uppercase() == "PRECISION" {
@@ -1453,7 +1449,7 @@ impl Parser {
                 }
             }
         }
-        // consume optional (N) or (N,M) for VARCHAR(n), NUMERIC(p,s), etc.
+
         if self.current() == &Token::LParen {
             self.advance();
             let _ = self.expect_integer()?;
@@ -1466,7 +1462,6 @@ impl Parser {
         Ok(dt)
     }
 
-    // Helpers
     fn current(&self) -> &Token {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }

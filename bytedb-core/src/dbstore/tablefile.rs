@@ -7,8 +7,6 @@ use crate::error::{CoreError, Result};
 const TABLE_MAGIC: [u8; 4] = *b"BTBL";
 const TABLE_VERSION: u32 = 1;
 
-/// Disk file holding raw `(key, value)` pairs for one table. Written via
-/// atomic rename so a crashed flush leaves the previous file intact.
 pub struct TableFile;
 
 impl TableFile {

@@ -130,12 +130,6 @@ impl TransactionManager {
         self.active_txns.read().len()
     }
 
-    /// The oldest start timestamp of any currently-active transaction.
-    /// MVCC versions whose `deleted_ts` is older than this are no longer
-    /// visible to anyone and may be garbage-collected.
-    ///
-    /// Returns the next timestamp (i.e. "all versions are GC-eligible")
-    /// when there are no active transactions.
     pub fn oldest_active_start_ts(&self) -> Timestamp {
         let active = self.active_txns.read();
         active
@@ -145,19 +139,12 @@ impl TransactionManager {
             .unwrap_or_else(|| self.next_timestamp.load(Ordering::Relaxed))
     }
 
-    /// Snapshot all currently-active transaction ids. Useful for the
-    /// vacuum pass to know which creator txns to keep around.
     pub fn active_txn_ids(&self) -> Vec<TxnId> {
         self.active_txns.read().keys().copied().collect()
     }
 
-    /// Whether a transaction was aborted (and thus its created versions
-    /// are dead immediately).
     pub fn is_aborted(&self, txn_id: TxnId) -> bool {
-        // We currently drop aborted txns from active without recording
-        // them in committed_txns. So "not active and not committed" =>
-        // aborted-or-never-existed. For GC purposes that's fine: a txn
-        // that never existed has no versions to consider.
+
         !self.is_active(txn_id) && !self.is_committed(txn_id)
     }
 }

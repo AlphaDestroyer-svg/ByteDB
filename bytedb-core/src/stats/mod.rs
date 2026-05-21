@@ -1,18 +1,3 @@
-//! Catalog statistics for the cost-based optimiser (v0.2 stage 6).
-//!
-//! Each table gets a [`TableStats`] populated by [`compute_table_stats`].
-//! Per column we keep:
-//!   - `null_fraction` — fraction of rows whose value is NULL.
-//!   - `ndv` — number of distinct non-null values.
-//!   - `mcv` — top N (default 10) most-common values + their frequencies.
-//!   - `histogram` — equi-depth histogram with N buckets (default 10) of
-//!     non-null, non-MCV values. Used to estimate range selectivity.
-//!
-//! Stats are pure derived data: collecting them is a full scan, but the
-//! result is small (KBs). Stage 6 just *computes* and *stores* the
-//! stats; stage 7 plugs them into a cost model and stage 8 into the
-//! optimiser.
-
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -25,15 +10,13 @@ pub const DEFAULT_HISTOGRAM_BUCKETS: usize = 10;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ColumnStats {
     pub column: String,
-    /// Fraction in [0.0, 1.0] of rows whose value is NULL.
+
     pub null_fraction: f64,
-    /// Distinct non-null value count.
+
     pub ndv: u64,
-    /// Most common (value, frequency) pairs, frequency in (0.0, 1.0].
+
     pub mcv: Vec<(Value, f64)>,
-    /// Equi-depth histogram bucket boundaries for non-null, non-MCV
-    /// values. `bucket_bounds[i]..bucket_bounds[i+1]` is one bucket.
-    /// Empty if the column has no orderable, non-MCV values.
+
     pub bucket_bounds: Vec<Value>,
 }
 
@@ -42,7 +25,7 @@ pub struct TableStats {
     pub table: String,
     pub row_count: u64,
     pub columns: Vec<ColumnStats>,
-    /// Wall-clock seconds since epoch when these stats were computed.
+
     pub computed_at_secs: u64,
 }
 
@@ -52,12 +35,6 @@ impl TableStats {
     }
 }
 
-/// Compute table-level + per-column statistics from a row iterator.
-///
-/// Each iter element is one row, indexed by column name in `column_names`.
-/// `rows` should yield rows of the same arity as `column_names`. Rows
-/// shorter than `column_names` are tolerated (missing values count as
-/// NULL); longer rows are truncated.
 pub fn compute_table_stats(
     table: impl Into<String>,
     column_names: &[String],
@@ -119,8 +96,6 @@ fn compute_column_stats(
     }
     let null_fraction = null_count as f64 / total;
 
-    // Frequency table for non-null values. Keys: serialised Value as a
-    // canonical bytes form so we can use a HashMap.
     let mut freq: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
     for v in &non_null {
         let key = canonical_key(v);
@@ -128,7 +103,6 @@ fn compute_column_stats(
     }
     let ndv = freq.len() as u64;
 
-    // Pick top-K MCVs by count.
     let mut entries: Vec<(Value, u64)> =
         freq.values().map(|(v, c)| (v.clone(), *c)).collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1));
@@ -138,8 +112,6 @@ fn compute_column_stats(
         .map(|(v, c)| (v.clone(), *c as f64 / total))
         .collect();
 
-    // Build a histogram from the *non-MCV* values. Sort by Value's
-    // partial order; values that don't compare are skipped.
     let mcv_keys: std::collections::HashSet<Vec<u8>> = mcv
         .iter()
         .map(|(v, _)| canonical_key(v))
@@ -175,9 +147,6 @@ fn compute_column_stats(
     }
 }
 
-/// Serialise a `Value` to a canonical byte sequence so it can be a
-/// HashMap key. We don't need cross-version stability here — these
-/// keys live only inside one ANALYZE pass.
 fn canonical_key(v: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     match v {
@@ -288,7 +257,7 @@ mod tests {
         let s = compute_table_stats("t", &["a".to_string()], rs, 5, 10);
         let mcv = &s.columns[0].mcv;
         assert!(!mcv.is_empty());
-        // The most common value should be 7 with ~100/150 frequency.
+
         let (top_val, top_freq) = &mcv[0];
         assert_eq!(top_val.compare(&Value::Int64(7)), Some(std::cmp::Ordering::Equal));
         assert!(*top_freq > 0.6 && *top_freq < 0.7);
@@ -301,7 +270,7 @@ mod tests {
             rs.push(vec![Value::Int64(i)]);
         }
         let s = compute_table_stats("t", &["a".to_string()], rs, 0, 10);
-        // No MCVs (mcv_count=0), so histogram covers all 100 values.
+
         assert_eq!(s.columns[0].bucket_bounds.len(), 11);
     }
 }

@@ -16,7 +16,6 @@ impl RecoveryManager {
         let mut redo_records: Vec<(Lsn, LogRecord)> = Vec::new();
         let mut undo_records: Vec<(Lsn, LogRecord)> = Vec::new();
 
-        // Analysis pass
         for (_lsn, record) in &records {
             match record {
                 LogRecord::Begin { txn_id } => {
@@ -40,7 +39,6 @@ impl RecoveryManager {
             }
         }
 
-        // Redo pass: replay committed transactions
         for (lsn, record) in &records {
             if let Some(txn_id) = record.txn_id() {
                 if committed_txns.contains(&txn_id) {
@@ -56,7 +54,6 @@ impl RecoveryManager {
             }
         }
 
-        // Undo pass: rollback active (uncommitted) transactions
         for (lsn, record) in records.iter().rev() {
             if let Some(txn_id) = record.txn_id() {
                 if active_txns.contains(&txn_id) {

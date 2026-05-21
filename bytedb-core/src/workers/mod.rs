@@ -1,21 +1,3 @@
-//! Background worker threads (v0.2 stage 4).
-//!
-//! Each worker is a single thread driven by a fixed period; on every
-//! tick it does a small amount of work and goes back to sleep until
-//! either the period elapses or [`WorkerHandle::shutdown`] is called.
-//!
-//! Concrete workers ship in submodules:
-//!   - [`page_flusher`]: periodically calls `BufferPool::flush_all` to
-//!     bound dirty-page lag.
-//!   - [`wal_flusher`]: periodically calls `LogManager::flush` so async
-//!     writes don't sit in BufWriter forever.
-//!   - [`checkpoint`]: writes a CHECKPOINT record + flushes the buffer
-//!     pool so WAL can be truncated past that point.
-//!   - [`vacuum`]: prunes dead MVCC versions (full impl in stage 5; this
-//!     stage just stands up the worker scaffolding).
-//!
-//! All workers stop within one `period` of `shutdown()` being called.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -28,7 +10,6 @@ pub mod wal_flusher;
 pub mod checkpoint;
 pub mod vacuum;
 
-/// Shared shutdown flag + condvar that workers spin on.
 pub struct ShutdownLatch {
     flag: AtomicBool,
     cv: Condvar,
@@ -54,8 +35,6 @@ impl ShutdownLatch {
         self.flag.load(Ordering::Acquire)
     }
 
-    /// Sleep up to `dur` or until shutdown. Returns true if shutdown
-    /// was signalled while we slept.
     pub fn wait_until(&self, dur: Duration) -> bool {
         let mut g = self.lock.lock();
         if self.flag.load(Ordering::Acquire) {
@@ -76,7 +55,6 @@ impl Default for ShutdownLatch {
     }
 }
 
-/// Handle returned by `spawn_worker`. Drop or call `shutdown()` to stop.
 pub struct WorkerHandle {
     name: String,
     latch: Arc<ShutdownLatch>,
@@ -86,7 +64,6 @@ pub struct WorkerHandle {
 impl WorkerHandle {
     pub fn name(&self) -> &str { &self.name }
 
-    /// Signal shutdown and join. Safe to call multiple times.
     pub fn shutdown(&mut self) {
         self.latch.signal();
         if let Some(h) = self.handle.take() {
@@ -108,9 +85,6 @@ impl Drop for WorkerHandle {
     }
 }
 
-/// Spawn a periodic worker. The closure is called approximately every
-/// `period`; if a tick takes longer than `period`, the next tick fires
-/// immediately.
 pub fn spawn_periodic<F>(
     name: impl Into<String>,
     period: Duration,

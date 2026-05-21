@@ -31,8 +31,7 @@ pub struct Server {
     semaphore: Arc<Semaphore>,
     snapshot_manager: Arc<SnapshotManager>,
     wal: Arc<LogManager>,
-    /// Background workers — kept alive for the server's lifetime; their
-    /// Drop impl shuts them down gracefully.
+
     workers: parking_lot::Mutex<Vec<WorkerHandle>>,
 }
 
@@ -74,8 +73,6 @@ impl Server {
         let wal_for_engine = Arc::clone(&log_manager);
         let mut engine_owned = QueryEngine::with_wal(database, txn_manager, wal_for_engine);
 
-        // Disk-backed store rooted at the data directory. Per-database
-        // directories live under <data_dir>/databases/<name>/.
         match bytedb_query::executor::diskstore::DiskStore::open(
             config.data_dir.clone(),
             "bytedb",
@@ -103,11 +100,6 @@ impl Server {
         let session_manager = Arc::new(SessionManager::new());
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
-        // Background workers.
-        //   - wal_flusher: heartbeat fsync of the WAL.
-        //   - vacuum: MVCC GC over every registered version store.
-        // Page flusher / checkpoint workers activate when the page-based
-        // storage layer comes online.
         let vacuum_pass = {
             let engine = Arc::clone(&query_engine);
             let txn_mgr = engine.txn_manager_arc();
@@ -263,16 +255,14 @@ impl Server {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down gracefully...");
-                    // Stop background workers before the final snapshot
-                    // so they don't race the writer.
+
                     {
                         let mut ws = self.workers.lock();
                         for w in ws.iter_mut() {
                             w.shutdown();
                         }
                     }
-                    // Last WAL flush so any committed bytes still in the
-                    // BufWriter become durable.
+
                     let _ = self.wal.flush();
                     if !self.config.no_shutdown_snapshot {
                         Self::create_snapshot(&self.query_engine, &self.snapshot_manager);

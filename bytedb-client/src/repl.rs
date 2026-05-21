@@ -40,7 +40,6 @@ impl Repl {
                         let _ = rl.add_history_entry(trimmed);
                     }
 
-                    // Handle backslash continuation
                     if trimmed.ends_with('\\') {
                         buffer.push_str(&trimmed[..trimmed.len() - 1]);
                         buffer.push(' ');
@@ -49,7 +48,6 @@ impl Repl {
 
                     buffer.push_str(trimmed);
 
-                    // If no semicolon yet and not a special command, continue reading
                     let lower = buffer.trim().to_lowercase();
                     let is_special = lower == "exit" || lower == "quit" || lower.starts_with("\\")
                         || lower == "help" || lower == "ping";
@@ -85,7 +83,6 @@ impl Repl {
                         _ => {}
                     }
 
-                    // Handle \d table_name
                     if input.to_lowercase().starts_with("\\d ") {
                         let table = input[3..].trim().trim_end_matches(';');
                         let sql = format!("DESCRIBE {};", table);

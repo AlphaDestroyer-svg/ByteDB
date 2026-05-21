@@ -3,7 +3,7 @@ use tokio::net::TcpStream;
 
 use crate::error::{ServerError, Result};
 
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16MB
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 pub async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];

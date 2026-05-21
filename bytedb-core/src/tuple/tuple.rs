@@ -372,12 +372,12 @@ pub fn raw_filter_matches(data: &[u8], col_idx: usize, op: u8, literal: &Value) 
         _ => return None,
     };
     let matches = match op {
-        0 => ord == Ordering::Equal,      // Eq
-        1 => ord != Ordering::Equal,      // Neq
-        2 => ord == Ordering::Less,       // Lt
-        3 => ord == Ordering::Greater,    // Gt
-        4 => ord != Ordering::Greater,    // Lte
-        5 => ord != Ordering::Less,       // Gte
+        0 => ord == Ordering::Equal,
+        1 => ord != Ordering::Equal,
+        2 => ord == Ordering::Less,
+        3 => ord == Ordering::Greater,
+        4 => ord != Ordering::Greater,
+        5 => ord != Ordering::Less,
         _ => true,
     };
     Some(matches)

@@ -1,14 +1,3 @@
-//! Stage 7 cost model.
-//!
-//! Pure functions over `bytedb_core::stats::TableStats` plus a small set
-//! of tunable cpu/io constants. The cost model produces a [`PlanCost`]
-//! for any [`PhysicalPlan`]: estimated output cardinality and a unitless
-//! cost score. Stage 8 uses these scores to choose join orders and pick
-//! between sequential and index scans.
-//!
-//! No optimisation decisions live here. This module is intentionally
-//! free of side effects so it stays easy to unit-test.
-
 use std::collections::HashMap;
 
 use bytedb_core::stats::TableStats;
@@ -17,33 +6,26 @@ use bytedb_core::tuple::value::Value;
 use crate::parser::ast::*;
 use crate::planner::physical_plan::PhysicalPlan;
 
-/// Per-tuple CPU cost for a function/predicate evaluation.
 pub const CPU_TUPLE_COST: f64 = 0.01;
-/// Per-tuple CPU cost for an in-memory copy (e.g. projection).
+
 pub const CPU_OPERATOR_COST: f64 = 0.0025;
-/// Per-tuple I/O cost for a sequential scan. We don't yet track real
-/// pages, so this is a flat per-row charge.
+
 pub const IO_SEQ_PAGE_COST: f64 = 1.0;
-/// Per-tuple cost for a single-key index lookup. One B+Tree probe is
-/// roughly log_2(n) page reads, so we approximate by a small constant.
+
 pub const IO_RANDOM_PAGE_COST: f64 = 4.0;
-/// Floor on cardinality estimates so log/division operations stay safe.
+
 pub const MIN_CARD: f64 = 1.0;
-/// Default selectivity used when stats can't help (the planner falls
-/// back to PostgreSQL's classic 0.005 / 0.333 / 0.5 ladder elsewhere; we
-/// keep one constant for simplicity).
+
 pub const DEFAULT_EQ_SELECTIVITY: f64 = 0.005;
 pub const DEFAULT_RANGE_SELECTIVITY: f64 = 0.333;
 
-/// Output of cost analysis for one physical plan node.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanCost {
-    /// Estimated number of output rows (>= MIN_CARD).
+
     pub rows: f64,
-    /// Estimated total cost. Lower is better.
+
     pub total_cost: f64,
-    /// Cost to produce the *first* row, for plans that pipeline output
-    /// (LIMIT can prefer a higher-total but lower-startup plan).
+
     pub startup_cost: f64,
 }
 
@@ -61,12 +43,8 @@ impl PlanCost {
     }
 }
 
-/// Stats source. The optimiser passes a snapshot taken from
-/// [`crate::executor::engine::QueryEngine::stats`].
 pub type StatsCatalog = HashMap<String, TableStats>;
 
-/// Estimate the selectivity of a predicate against a single table.
-/// Returns a fraction in (0.0, 1.0]. NULL stats fall back to defaults.
 pub fn estimate_selectivity(
     expr: &Expr,
     table_stats: Option<&TableStats>,
@@ -107,7 +85,7 @@ pub fn estimate_selectivity(
             - column_null_fraction(inner, table_stats)
                 .unwrap_or(DEFAULT_EQ_SELECTIVITY),
         Expr::InList { list, .. } => {
-            // n distinct equalities OR'd: 1 - (1 - eq_sel)^n
+
             let n = list.len().max(1) as f64;
             let eq = DEFAULT_EQ_SELECTIVITY;
             (1.0 - (1.0 - eq).powf(n)).clamp(0.0, 1.0)
@@ -158,13 +136,13 @@ fn column_eq_selectivity(
     let val = literal_value(lit)?;
     let ts = ts?;
     let cs = ts.column(cname)?;
-    // MCV match wins.
+
     for (mcv_val, freq) in &cs.mcv {
         if mcv_val.compare(&val) == Some(std::cmp::Ordering::Equal) {
             return Some((*freq).clamp(MIN_CARD / f64::MAX, 1.0));
         }
     }
-    // Otherwise distribute the non-MCV mass over the remaining NDV.
+
     let mcv_total: f64 = cs.mcv.iter().map(|(_, f)| f).sum();
     let non_null_remain = (1.0 - cs.null_fraction - mcv_total).max(0.0);
     let remaining_ndv = (cs.ndv as f64 - cs.mcv.len() as f64).max(1.0);
@@ -184,8 +162,7 @@ fn column_range_selectivity(
     if cs.bucket_bounds.len() < 2 {
         return Some(DEFAULT_RANGE_SELECTIVITY);
     }
-    // Walk equi-depth buckets to estimate fraction below `val`. Each
-    // bucket holds 1/N of the non-null, non-MCV mass.
+
     let n_buckets = (cs.bucket_bounds.len() - 1) as f64;
     let mut below_buckets = 0.0;
     for win in cs.bucket_bounds.windows(2) {
@@ -222,7 +199,6 @@ fn column_null_fraction(expr: &Expr, ts: Option<&TableStats>) -> Option<f64> {
     Some(cs.null_fraction)
 }
 
-/// Cost a [`PhysicalPlan`] node bottom-up.
 pub fn cost_plan(plan: &PhysicalPlan, stats: &StatsCatalog) -> PlanCost {
     match plan {
         PhysicalPlan::SeqScan { table, filter, limit, .. } => {
@@ -242,7 +218,7 @@ pub fn cost_plan(plan: &PhysicalPlan, stats: &StatsCatalog) -> PlanCost {
         PhysicalPlan::IndexScan { table, .. } => {
             let ts = stats.get(table);
             let row_count = ts.map(|s| s.row_count as f64).unwrap_or(1000.0);
-            // Single-key probe: one logical row out, plus log-ish I/O.
+
             let probe_cost = IO_RANDOM_PAGE_COST + (row_count.max(2.0)).log2() * CPU_TUPLE_COST;
             PlanCost::new(MIN_CARD, probe_cost * 0.25, probe_cost)
         }
@@ -264,13 +240,10 @@ pub fn cost_plan(plan: &PhysicalPlan, stats: &StatsCatalog) -> PlanCost {
         | PhysicalPlan::NestedLoopJoin { left, right, .. } => {
             let l = cost_plan(left, stats);
             let r = cost_plan(right, stats);
-            // Cardinality: |L| * |R| / max(NDV_L, NDV_R) under the
-            // "contained values" assumption. We don't yet inspect the
-            // join key, so use the larger side's row count as the NDV
-            // proxy — same fallback PostgreSQL uses when no stats.
+
             let denom = l.rows.max(r.rows).max(MIN_CARD);
             let out = (l.rows * r.rows / denom).max(MIN_CARD);
-            // Hash build on the smaller side, then probe.
+
             let (build, probe) = if l.rows <= r.rows { (&l, &r) } else { (&r, &l) };
             let cost = build.total_cost
                 + probe.total_cost
@@ -280,8 +253,7 @@ pub fn cost_plan(plan: &PhysicalPlan, stats: &StatsCatalog) -> PlanCost {
         }
         PhysicalPlan::HashAggregate { input, group_by, .. } => {
             let inner = cost_plan(input, stats);
-            // Approximate groups as min(input_rows, prod(NDV)). With no
-            // stats per group_by column we fall back to sqrt(rows).
+
             let groups = if group_by.is_empty() {
                 MIN_CARD
             } else {
@@ -294,14 +266,13 @@ pub fn cost_plan(plan: &PhysicalPlan, stats: &StatsCatalog) -> PlanCost {
             let inner = cost_plan(input, stats);
             let n = inner.rows.max(2.0);
             let cost = inner.total_cost + n * n.log2() * CPU_OPERATOR_COST;
-            // Sort blocks output until it has consumed everything.
+
             PlanCost::new(inner.rows, cost, cost)
         }
         PhysicalPlan::Limit { input, count, .. } => {
             let inner = cost_plan(input, stats);
             let out = inner.rows.min(*count as f64).max(MIN_CARD);
-            // LIMIT scales total cost by the fraction of rows we actually
-            // consume, but never below the startup cost.
+
             let frac = (out / inner.rows.max(MIN_CARD)).clamp(0.0, 1.0);
             let total = inner.startup_cost + (inner.total_cost - inner.startup_cost) * frac;
             PlanCost::new(out, inner.startup_cost, total)
@@ -370,7 +341,7 @@ mod tests {
             right: Box::new(Expr::Literal(LiteralValue::Integer(7))),
         };
         let s = estimate_selectivity(&pred, Some(&ts));
-        // 100 / 150 = 0.666 — must come back close to that.
+
         assert!(s > 0.5 && s < 0.8, "sel was {}", s);
     }
 
@@ -384,7 +355,7 @@ mod tests {
             right: Box::new(Expr::Literal(LiteralValue::Integer(99999))),
         };
         let s = estimate_selectivity(&pred, Some(&ts));
-        // ~1/100 with no MCV match: well under 0.05.
+
         assert!(s < 0.05, "sel was {}", s);
     }
 
@@ -432,8 +403,7 @@ mod tests {
         let c1 = cost_plan(&unfiltered, &catalog);
         let c2 = cost_plan(&filtered, &catalog);
         assert!(c2.rows < c1.rows);
-        // I/O cost is the same — we still scan the whole table — but
-        // estimated rows differ.
+
         assert!((c1.total_cost - c2.total_cost).abs() < 1.0);
     }
 
@@ -473,7 +443,7 @@ mod tests {
             needed_columns: None,
         };
         let c = cost_plan(&scan, &catalog);
-        // Default 1000 rows * default eq selectivity (0.005) = 5.
+
         assert!(c.rows < 100.0);
         assert!(c.total_cost > 0.0);
     }

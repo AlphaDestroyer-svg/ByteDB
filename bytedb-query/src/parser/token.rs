@@ -1,6 +1,6 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Keywords
+
     Select,
     Distinct,
     From,
@@ -90,14 +90,14 @@ pub enum Token {
     Use,
     Cascade,
     Restrict,
-    // KV keywords
+
     Kv,
     Get,
     Scan,
-    // Doc keywords
+
     Doc,
     Find,
-    // Data types
+
     Int,
     Float,
     Text,
@@ -115,40 +115,40 @@ pub enum Token {
     Serial,
     Uuid,
     Date,
-    // Literals
+
     IntLit(i64),
     FloatLit(f64),
     StringLit(String),
     BoolLit(bool),
     NullLit,
-    // Identifiers
+
     Ident(String),
-    // Operators
-    Eq,        // =
-    Neq,       // != or <>
-    Lt,        // <
-    Gt,        // >
-    Lte,       // <=
-    Gte,       // >=
-    Plus,      // +
-    Minus,     // -
-    Star,      // *
-    Slash,     // /
-    Percent,   // %
-    DoubleColon, // ::
-    // Punctuation
-    LParen,    // (
-    RParen,    // )
-    LBrace,    // {
-    RBrace,    // }
-    LBracket,  // [
-    RBracket,  // ]
-    Comma,     // ,
-    Semicolon, // ;
-    Dot,       // .
-    DollarDot, // $.
-    Colon,     // :
-    // Special
+
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    DoubleColon,
+
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semicolon,
+    Dot,
+    DollarDot,
+    Colon,
+
     Eof,
 }
 

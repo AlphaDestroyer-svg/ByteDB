@@ -46,7 +46,6 @@ pub fn serialize_snapshot<W: Write>(snapshot: &FullSnapshot, writer: &mut W) -> 
                 .map_err(|e| CoreError::Internal(e.to_string()))?;
         }
 
-        // sequences (v2+)
         writer.write_all(&(table.sequences.len() as u32).to_le_bytes())
             .map_err(|e| CoreError::Internal(e.to_string()))?;
         for (col, val) in &table.sequences {

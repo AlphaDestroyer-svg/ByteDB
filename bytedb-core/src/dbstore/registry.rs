@@ -8,7 +8,6 @@ use crate::error::{CoreError, Result};
 const SERVER_META_MAGIC: [u8; 4] = *b"BSRV";
 const SERVER_META_VERSION: u32 = 1;
 
-/// Tracks which database directories exist on disk.
 pub struct DatabaseRegistry {
     root: PathBuf,
     databases: parking_lot::RwLock<BTreeSet<String>>,
@@ -16,9 +15,7 @@ pub struct DatabaseRegistry {
 }
 
 impl DatabaseRegistry {
-    /// Open or create the registry rooted at `root`. Always materialises a
-    /// `default_db` entry so a fresh server already has a valid current
-    /// database.
+
     pub fn open(root: PathBuf, default_db: &str) -> Result<Self> {
         fs::create_dir_all(&root).map_err(CoreError::Io)?;
         fs::create_dir_all(root.join("databases")).map_err(CoreError::Io)?;
@@ -37,7 +34,6 @@ impl DatabaseRegistry {
             default_db: default_db.to_string(),
         };
 
-        // Make sure the default db directory exists on disk.
         registry.ensure_db_dir(default_db)?;
         registry.write_meta()?;
         Ok(registry)
@@ -58,8 +54,6 @@ impl DatabaseRegistry {
         self.root.join("databases").join(sanitize(name))
     }
 
-    /// Create a new database directory. Returns true if a new database was
-    /// created; false if it already existed.
     pub fn create(&self, name: &str) -> Result<bool> {
         if name.is_empty() || name.len() > 128 {
             return Err(CoreError::Internal(format!(
@@ -79,8 +73,6 @@ impl DatabaseRegistry {
         Ok(true)
     }
 
-    /// Drop a database directory. Returns true if it was removed.
-    /// Refuses to drop the default database.
     pub fn drop_db(&self, name: &str) -> Result<bool> {
         if name == self.default_db {
             return Err(CoreError::Internal(format!(
@@ -158,7 +150,6 @@ impl DatabaseRegistry {
     }
 }
 
-/// Replace path-unfriendly characters so a database name can be a directory.
 fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| match c {

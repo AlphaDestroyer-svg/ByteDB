@@ -10,19 +10,16 @@ use crate::tuple::schema::Schema;
 const CATALOG_MAGIC: [u8; 4] = *b"BCAT";
 const CATALOG_VERSION: u32 = 1;
 
-/// One table's persisted metadata. Schema + sequence state. Data lives in a
-/// separate `.tbl` file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableCatalog {
     pub name: String,
     pub table_id: u32,
     pub schema: Schema,
-    /// (auto_increment_column_name, next_value).
+
     #[serde(default)]
     pub sequences: Vec<(String, i64)>,
 }
 
-/// All tables in a single database. Persisted to `<db>/catalog.bin`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DbCatalog {
     pub tables: Vec<TableCatalog>,

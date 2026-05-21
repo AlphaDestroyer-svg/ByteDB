@@ -24,7 +24,7 @@ pub struct TableSnapshot {
     pub table_id: u32,
     pub schema: Schema,
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// (column_name, next_value) for SERIAL/auto-increment columns.
+
     #[serde(default)]
     pub sequences: Vec<(String, i64)>,
 }
