@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
 
@@ -29,6 +30,8 @@ pub struct Transaction {
     pub start_ts: Timestamp,
     pub commit_ts: Option<Timestamp>,
     pub status: TxnStatus,
+    pub started_at: Instant,
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,7 @@ pub struct TransactionManager {
     next_timestamp: AtomicU64,
     active_txns: RwLock<HashMap<TxnId, Transaction>>,
     committed_txns: RwLock<HashMap<TxnId, Timestamp>>,
+    default_txn_timeout: RwLock<Option<Duration>>,
 }
 
 impl TransactionManager {
@@ -52,12 +56,30 @@ impl TransactionManager {
             next_timestamp: AtomicU64::new(1),
             active_txns: RwLock::new(HashMap::new()),
             committed_txns: RwLock::new(HashMap::new()),
+            default_txn_timeout: RwLock::new(None),
         }
     }
 
+    pub fn set_default_txn_timeout(&self, d: Option<Duration>) {
+        *self.default_txn_timeout.write() = d;
+    }
+
+    pub fn default_txn_timeout(&self) -> Option<Duration> {
+        *self.default_txn_timeout.read()
+    }
+
     pub fn begin(&self, isolation: IsolationLevel) -> TxnId {
+        self.begin_with_timeout(isolation, self.default_txn_timeout())
+    }
+
+    pub fn begin_with_timeout(
+        &self,
+        isolation: IsolationLevel,
+        timeout: Option<Duration>,
+    ) -> TxnId {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let start_ts = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
+        let now = Instant::now();
 
         let txn = Transaction {
             id: txn_id,
@@ -65,10 +87,38 @@ impl TransactionManager {
             start_ts,
             commit_ts: None,
             status: TxnStatus::Active,
+            started_at: now,
+            deadline: timeout.map(|d| now + d),
         };
 
         self.active_txns.write().insert(txn_id, txn);
         txn_id
+    }
+
+    pub fn check_deadline(&self, txn_id: TxnId) -> Result<()> {
+        let active = self.active_txns.read();
+        let txn = active.get(&txn_id)
+            .ok_or(CoreError::TransactionNotFound(txn_id))?;
+        if let Some(dl) = txn.deadline {
+            if Instant::now() >= dl {
+                return Err(CoreError::TransactionTimeout(txn_id));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn deadline(&self, txn_id: TxnId) -> Option<Instant> {
+        self.active_txns.read().get(&txn_id).and_then(|t| t.deadline)
+    }
+
+    pub fn timed_out_txns(&self) -> Vec<TxnId> {
+        let now = Instant::now();
+        self.active_txns
+            .read()
+            .values()
+            .filter(|t| t.deadline.map(|d| now >= d).unwrap_or(false))
+            .map(|t| t.id)
+            .collect()
     }
 
     pub fn commit(&self, txn_id: TxnId) -> Result<Timestamp> {

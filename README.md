@@ -16,6 +16,8 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 - **Page checksums (CRC32)** - every page is checksummed on write and verified on read. Silent corruption surfaces immediately as `ChecksumMismatch`, not weeks later.
 - **WAL integrity** - strict LSN chaining (each record carries `prev_lsn`), per-record CRC32 covering header+payload, and torn-write detection on recovery. A flipped bit anywhere in the WAL aborts replay with `WalCorrupted` instead of producing wrong data.
 - **Atomic file writes** - table files (`*.tbl`) and the catalog (`catalog.bin`) are written to `*.tmp`, fsynced, then atomically renamed. A crash mid-write leaves either the old file fully intact or the new file fully visible - never a half-written mix. Both formats now carry a CRC32 trailer over the payload.
+- **Row-level locking** - shared/exclusive locks per `(table, row-key)`, FIFO waiter queue, wait-for graph deadlock detection that aborts the requester with `Deadlock` instead of hanging, configurable lock-wait timeout (`LockTimeout`), and live metrics (acquires, releases, waits, timeouts, deadlocks, total wait micros).
+- **Per-transaction deadlines** - optional default timeout on every `begin`, plus `begin_with_timeout` for one-off overrides; `check_deadline` and `timed_out_txns` let the server abort runaway transactions with `TransactionTimeout`.
 - **Buffer pool with LRU-K (K=2)** - bounded-memory page cache replacing the previous read-everything-at-startup model.
 - **WAL group commit** - leader/follower fsync batching cuts disk syncs under concurrent writers.
 - **Background workers** - dedicated threads for WAL flushing, dirty-page writeback, periodic checkpoints, and MVCC vacuum/GC.
@@ -302,6 +304,8 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 - **Контрольные суммы страниц (CRC32)** - каждая страница вычисляет checksum при записи и сверяет его при чтении. Тихая порча данных всплывает сразу как `ChecksumMismatch`, а не через недели.
 - **Целостность WAL** - строгая цепочка LSN (каждая запись хранит `prev_lsn`), CRC32 на каждую запись (заголовок + payload), детекция torn-write при восстановлении. Любой битый бит в WAL прерывает replay с `WalCorrupted` вместо тихой выдачи неверных данных.
 - **Атомарная запись файлов** - файлы таблиц (`*.tbl`) и каталог (`catalog.bin`) пишутся через `*.tmp` → `fsync` → `rename`. Падение посреди записи оставляет либо старый файл целиком, либо новый файл целиком - никаких полузаписанных смесей. Оба формата теперь хранят CRC32-trailer по payload.
+- **Row-level блокировки** - shared/exclusive локи на `(table, row-key)`, FIFO-очередь ожидающих, детекция дедлоков по wait-for графу с прерыванием запросившего ошибкой `Deadlock` вместо вечного ожидания, настраиваемый таймаут ожидания (`LockTimeout`) и живые метрики (acquires, releases, waits, timeouts, deadlocks, total wait micros).
+- **Дедлайны транзакций** - опциональный дефолтный таймаут на каждый `begin`, плюс `begin_with_timeout` для разовых переопределений; `check_deadline` и `timed_out_txns` позволяют серверу прерывать зависшие транзакции ошибкой `TransactionTimeout`.
 - **Buffer pool с LRU-K (K=2)** - кеш страниц с ограниченной памятью вместо «прочитать всё при старте».
 - **WAL group commit** - fsync-батчинг по схеме лидер/последователь снижает число синхронизаций при параллельной записи.
 - **Фоновые воркеры** - отдельные потоки для flush WAL, записи грязных страниц, периодических чекпоинтов и vacuum/GC MVCC.

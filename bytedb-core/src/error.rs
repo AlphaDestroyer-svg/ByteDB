@@ -32,6 +32,12 @@ pub enum CoreError {
     #[error("Serialization conflict")]
     SerializationConflict,
 
+    #[error("Lock wait timeout for txn {0}")]
+    LockTimeout(u64),
+
+    #[error("Transaction {0} timed out")]
+    TransactionTimeout(u64),
+
     #[error("WAL corrupted at LSN {0}")]
     WalCorrupted(u64),
 
