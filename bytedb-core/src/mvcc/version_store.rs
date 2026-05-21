@@ -172,6 +172,27 @@ impl VersionStore {
         results
     }
 
+    pub fn snapshot_resolved(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> HashMap<Vec<u8>, Option<Tuple>> {
+        let mut out: HashMap<Vec<u8>, Option<Tuple>> = HashMap::new();
+        for shard_lock in &self.shards {
+            let shard = shard_lock.read();
+            for (key, chain) in shard.iter() {
+                let mut found_visible = false;
+                for version in chain.iter().rev() {
+                    if is_visible(version, txn_id, snapshot_ts, active_txns) {
+                        out.insert(key.clone(), Some(version.data.clone()));
+                        found_visible = true;
+                        break;
+                    }
+                }
+                if !found_visible {
+                    out.insert(key.clone(), None);
+                }
+            }
+        }
+        out
+    }
+
     pub fn gc(&self, oldest_active_ts: Timestamp) {
         self.gc_with_aborted(oldest_active_ts, &[]);
     }

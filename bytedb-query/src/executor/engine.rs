@@ -114,29 +114,28 @@ pub struct TableData {
 impl TableData {
     pub fn read_visible_entries(&self, txn_manager: &TransactionManager, txn_id: Option<TxnId>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if let Some(tid) = txn_id {
+            if self.version_store.key_count() == 0 {
+                return self.index.scan_all()
+                    .map_err(|e| QueryError::Execution(e.to_string()));
+            }
             let snapshot = txn_manager.get_snapshot(tid)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let resolved = self.version_store.snapshot_resolved(tid, snapshot.start_ts, &snapshot.active_txns);
             let base = self.index.scan_all()
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(base.len());
-            let mut keys_in_vs = std::collections::HashSet::new();
             for (k, v) in base {
-                match self.version_store.lookup_for_read(&k, tid, snapshot.start_ts, &snapshot.active_txns) {
-                    bytedb_core::mvcc::version_store::ReadResult::Visible(t) => {
-                        keys_in_vs.insert(k.clone());
-                        out.push((k, t.serialize()));
-                    }
-                    bytedb_core::mvcc::version_store::ReadResult::Tombstone => {
-                        keys_in_vs.insert(k);
-                    }
-                    bytedb_core::mvcc::version_store::ReadResult::NoVersions => {
-                        out.push((k, v));
-                    }
+                match resolved.get(&k) {
+                    None => out.push((k, v)),
+                    Some(None) => {}
+                    Some(Some(t)) => out.push((k, t.serialize())),
                 }
             }
-            for (k, t) in self.version_store.get_all_visible(tid, snapshot.start_ts, &snapshot.active_txns) {
-                if !keys_in_vs.contains(&k) {
-                    out.push((k, t.serialize()));
+            for (k, opt) in &resolved {
+                if let Some(t) = opt {
+                    if self.index.search(k).map_err(|e| QueryError::Execution(e.to_string()))?.is_none() {
+                        out.push((k.clone(), t.serialize()));
+                    }
                 }
             }
             Ok(out)
@@ -1706,24 +1705,97 @@ impl QueryEngine {
         let mut rows = Vec::new();
 
         if let Some(tid) = txn_id {
-            let snapshot = self.txn_manager.get_snapshot(tid)
-                .map_err(|e| QueryError::Execution(e.to_string()))?;
-            let visible = table_data.version_store.get_all_visible(
-                tid,
-                snapshot.start_ts,
-                &snapshot.active_txns,
-            );
-            for (_key, tuple) in visible {
-                self.account_scan_row()?;
-                let matches = if let Some(f) = filter {
-                    self.eval_predicate(f, &tuple, &table_data.schema)
+            if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
+                if let Some(data) = table_data.read_visible_one(&self.txn_manager, Some(tid), &key)? {
+                    if let Some(tuple) = Tuple::deserialize(&data) {
+                        self.account_scan_row()?;
+                        rows.push(tuple.values);
+                    }
+                }
+            } else if let Some((lo, hi)) = self.try_pk_range(filter, &table_data.schema) {
+                let snapshot = self.txn_manager.get_snapshot(tid)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                let base = table_data.index.range_scan(&lo, &hi)
+                    .map_err(|e| QueryError::Execution(e.to_string()))?;
+                let resolved = if table_data.version_store.key_count() == 0 {
+                    None
                 } else {
-                    true
+                    Some(table_data.version_store.snapshot_resolved(tid, snapshot.start_ts, &snapshot.active_txns))
                 };
-                if matches {
-                    rows.push(tuple.values);
-                    if let Some(lim) = limit {
-                        if rows.len() >= lim { break; }
+                for (k, v) in base {
+                    let data = match &resolved {
+                        None => v,
+                        Some(map) => match map.get(&k) {
+                            None => v,
+                            Some(None) => continue,
+                            Some(Some(t)) => t.serialize(),
+                        },
+                    };
+                    if let Some(tuple) = Tuple::deserialize(&data) {
+                        self.account_scan_row()?;
+                        if let Some(f) = filter {
+                            if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
+                        }
+                        rows.push(tuple.values);
+                        if let Some(lim) = limit {
+                            if rows.len() >= lim { break; }
+                        }
+                    }
+                }
+                if let Some(map) = resolved {
+                    for (k, opt) in &map {
+                        if let Some(t) = opt {
+                            if k.as_slice() >= lo.as_slice() && k.as_slice() <= hi.as_slice() {
+                                if table_data.index.search(k).map_err(|e| QueryError::Execution(e.to_string()))?.is_none() {
+                                    let data = t.serialize();
+                                    if let Some(tuple) = Tuple::deserialize(&data) {
+                                        if let Some(f) = filter {
+                                            if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
+                                        }
+                                        rows.push(tuple.values);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let entries = table_data.read_visible_entries(&self.txn_manager, Some(tid))?;
+                let fast_filter = filter.and_then(|f| self.try_fast_filter(f, &table_data.schema));
+                let op_code: u8 = fast_filter.as_ref().map(|(_, op, _)| match op {
+                    BinOp::Eq => 0, BinOp::Neq => 1, BinOp::Lt => 2,
+                    BinOp::Gt => 3, BinOp::Lte => 4, BinOp::Gte => 5, _ => 255,
+                }).unwrap_or(255);
+                for (_key, data) in &entries {
+                    if let Some((col_idx, _, ref lit_val)) = fast_filter {
+                        match raw_filter_matches(data, col_idx, op_code, lit_val) {
+                            Some(true) => {
+                                if let Some(tuple) = Tuple::deserialize(data) {
+                                    self.account_scan_row()?;
+                                    rows.push(tuple.values);
+                                    if let Some(lim) = limit {
+                                        if rows.len() >= lim { break; }
+                                    }
+                                }
+                                continue;
+                            }
+                            Some(false) => { self.account_scan_row()?; continue; }
+                            None => {}
+                        }
+                    }
+                    if let Some(tuple) = Tuple::deserialize(data) {
+                        self.account_scan_row()?;
+                        let matches = if let Some(f) = filter {
+                            self.eval_predicate(f, &tuple, &table_data.schema)
+                        } else {
+                            true
+                        };
+                        if matches {
+                            rows.push(tuple.values);
+                            if let Some(lim) = limit {
+                                if rows.len() >= lim { break; }
+                            }
+                        }
                     }
                 }
             }
@@ -1960,6 +2032,48 @@ impl QueryEngine {
             }
             _ => None,
         }
+    }
+
+    fn try_pk_range(&self, filter: Option<&Expr>, schema: &Schema) -> Option<(Vec<u8>, Vec<u8>)> {
+        let filter = filter?;
+        let pk_indices = schema.primary_key_columns();
+        if pk_indices.len() != 1 {
+            return None;
+        }
+        let pk_name = schema.columns[pk_indices[0]].name.clone();
+
+        fn extract_bound(expr: &Expr, pk_name: &str) -> Option<(BinOp, LiteralValue)> {
+            if let Expr::BinaryOp { left, op, right } = expr {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(n), Expr::Literal(lit)) if n == pk_name => Some((*op, lit.clone())),
+                    (Expr::Literal(lit), Expr::Column(n)) if n == pk_name => {
+                        let flipped = match op {
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Lte => BinOp::Gte,
+                            BinOp::Gte => BinOp::Lte,
+                            other => *other,
+                        };
+                        Some((flipped, lit.clone()))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+
+        if let Expr::BinaryOp { left, op: BinOp::And, right } = filter {
+            let l = extract_bound(left, &pk_name)?;
+            let r = extract_bound(right, &pk_name)?;
+            let (lo_lit, hi_lit) = match (l.0, r.0) {
+                (BinOp::Gte, BinOp::Lte) | (BinOp::Gt, BinOp::Lte) => (l.1, r.1),
+                (BinOp::Lte, BinOp::Gte) | (BinOp::Lte, BinOp::Gt) => (r.1, l.1),
+                _ => return None,
+            };
+            return Some((self.literal_to_key_bytes(&lo_lit), self.literal_to_key_bytes(&hi_lit)));
+        }
+        None
     }
 
     fn try_pk_lookup(&self, filter: Option<&Expr>, schema: &Schema) -> Option<Vec<u8>> {
