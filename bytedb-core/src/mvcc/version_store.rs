@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use parking_lot::RwLock;
+use ahash::RandomState;
 
 use super::transaction::{TxnId, Timestamp};
 use crate::tuple::tuple::Tuple;
@@ -172,8 +173,8 @@ impl VersionStore {
         results
     }
 
-    pub fn snapshot_resolved(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> HashMap<Vec<u8>, Option<Tuple>> {
-        let mut out: HashMap<Vec<u8>, Option<Tuple>> = HashMap::new();
+    pub fn snapshot_resolved(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> HashMap<Vec<u8>, Option<Tuple>, RandomState> {
+        let mut out: HashMap<Vec<u8>, Option<Tuple>, RandomState> = HashMap::with_hasher(RandomState::new());
         for shard_lock in &self.shards {
             let shard = shard_lock.read();
             for (key, chain) in shard.iter() {

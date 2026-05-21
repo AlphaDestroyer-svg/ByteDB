@@ -11,6 +11,7 @@ parking_lot = "0.12"
 crossbeam = "0.8"
 crc32fast = "1"
 bytes = "1"
+ahash = "0.8"
 
 [features]
 default = []

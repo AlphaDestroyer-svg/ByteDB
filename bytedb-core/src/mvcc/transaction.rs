@@ -126,21 +126,22 @@ impl TransactionManager {
     }
 
     pub fn commit(&self, txn_id: TxnId) -> Result<Timestamp> {
-        let mut active = self.active_txns.write();
-        let txn = active.get_mut(&txn_id)
-            .ok_or(CoreError::TransactionNotFound(txn_id))?;
+        let commit_ts = {
+            let mut active = self.active_txns.write();
+            let txn = active.get_mut(&txn_id)
+                .ok_or(CoreError::TransactionNotFound(txn_id))?;
 
-        if txn.status != TxnStatus::Active {
-            return Err(CoreError::TransactionAborted(txn_id));
-        }
+            if txn.status != TxnStatus::Active {
+                return Err(CoreError::TransactionAborted(txn_id));
+            }
 
-        let commit_ts = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
-        txn.status = TxnStatus::Committed;
-        txn.commit_ts = Some(commit_ts);
-
-        active.remove(&txn_id);
+            let commit_ts = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
+            txn.status = TxnStatus::Committed;
+            txn.commit_ts = Some(commit_ts);
+            active.remove(&txn_id);
+            commit_ts
+        };
         self.committed_txns.write().insert(txn_id, commit_ts);
-
         Ok(commit_ts)
     }
 
