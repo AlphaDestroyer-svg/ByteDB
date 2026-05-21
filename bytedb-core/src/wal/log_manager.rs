@@ -1,19 +1,38 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+use parking_lot::{Condvar, Mutex};
 
 use crate::error::{CoreError, Result};
 use super::log_record::{LogRecord, Lsn};
 
 const LOG_RECORD_HEADER_SIZE: usize = 8;
 
+/// Default group-commit linger window. 0 = no artificial delay; the
+/// leader still amortises any concurrent appends that landed before its
+/// fsync started.
+const DEFAULT_GROUP_COMMIT_DELAY_US: u64 = 0;
+
 pub struct LogManager {
     log_path: PathBuf,
     writer: Mutex<BufWriter<File>>,
     current_lsn: AtomicU64,
     flushed_lsn: AtomicU64,
+    /// Group commit coordination: waiters block on this condvar until
+    /// flushed_lsn >= their target_lsn.
+    flush_cv: Condvar,
+    flush_cv_lock: Mutex<()>,
+    /// True while a leader thread holds the fsync slot.
+    flushing: AtomicBool,
+    /// How long the leader lingers before issuing fsync, picking up any
+    /// concurrent appenders. Microseconds.
+    group_commit_delay_us: AtomicU64,
+    /// Stats: number of fsyncs issued, total commits served. Used to
+    /// measure batching effectiveness.
+    fsyncs: AtomicU64,
+    commits_served: AtomicU64,
 }
 
 impl LogManager {
@@ -38,7 +57,32 @@ impl LogManager {
             writer: Mutex::new(BufWriter::new(file)),
             current_lsn: AtomicU64::new(initial_lsn),
             flushed_lsn: AtomicU64::new(initial_lsn),
+            flush_cv: Condvar::new(),
+            flush_cv_lock: Mutex::new(()),
+            flushing: AtomicBool::new(false),
+            group_commit_delay_us: AtomicU64::new(DEFAULT_GROUP_COMMIT_DELAY_US),
+            fsyncs: AtomicU64::new(0),
+            commits_served: AtomicU64::new(0),
         })
+    }
+
+    /// Tune how long the group-commit leader waits for additional
+    /// committers before issuing fsync. Higher values amortise more
+    /// commits per fsync at the cost of latency.
+    pub fn set_group_commit_delay_us(&self, us: u64) {
+        self.group_commit_delay_us.store(us, Ordering::Relaxed);
+    }
+
+    pub fn group_commit_delay_us(&self) -> u64 {
+        self.group_commit_delay_us.load(Ordering::Relaxed)
+    }
+
+    pub fn fsync_count(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    pub fn commits_served(&self) -> u64 {
+        self.commits_served.load(Ordering::Relaxed)
     }
 
     pub fn append(&self, record: LogRecord) -> Result<Lsn> {
@@ -55,13 +99,80 @@ impl LogManager {
         Ok(lsn)
     }
 
+    /// Block until the WAL has been fsynced through *at least* `target_lsn`.
+    ///
+    /// Implements group commit: the first thread to enter becomes the
+    /// leader and performs one fsync covering every record committed up
+    /// to that point; concurrent callers wait on a condvar and are woken
+    /// up by the leader. The result is at most one fsync per
+    /// `group_commit_delay_us` window even under heavy contention.
+    pub fn flush_through(&self, target_lsn: Lsn) -> Result<Lsn> {
+        // Already durable? Cheap fast path.
+        if self.flushed_lsn.load(Ordering::Acquire) >= target_lsn {
+            self.commits_served.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.flushed_lsn.load(Ordering::Acquire));
+        }
+
+        // Try to become the leader.
+        let am_leader = self
+            .flushing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+
+        if !am_leader {
+            // Wait for whoever is leading to publish a flushed_lsn that
+            // covers us. Use the condvar with the dummy lock.
+            let mut g = self.flush_cv_lock.lock();
+            while self.flushed_lsn.load(Ordering::Acquire) < target_lsn {
+                self.flush_cv.wait(&mut g);
+            }
+            self.commits_served.fetch_add(1, Ordering::Relaxed);
+            return Ok(self.flushed_lsn.load(Ordering::Acquire));
+        }
+
+        // Leader path. Optionally linger so other threads can pile in.
+        let delay_us = self.group_commit_delay_us.load(Ordering::Relaxed);
+        if delay_us > 0 {
+            std::thread::sleep(Duration::from_micros(delay_us));
+        }
+
+        // Snapshot the high-water LSN AFTER the linger so we cover every
+        // record that landed during the wait.
+        let snapshot_lsn = self.current_lsn.load(Ordering::SeqCst);
+
+        let result = (|| -> Result<()> {
+            let mut writer = self.writer.lock();
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.flushed_lsn.store(snapshot_lsn, Ordering::Release);
+                self.fsyncs.fetch_add(1, Ordering::Relaxed);
+                self.commits_served.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.flushing.store(false, Ordering::Release);
+                let _g = self.flush_cv_lock.lock();
+                self.flush_cv.notify_all();
+                return Err(e);
+            }
+        }
+
+        // Hand off the leader slot and wake everyone waiting.
+        self.flushing.store(false, Ordering::Release);
+        let _g = self.flush_cv_lock.lock();
+        self.flush_cv.notify_all();
+
+        Ok(self.flushed_lsn.load(Ordering::Acquire))
+    }
+
+    /// Back-compat: flush every record seen so far.
     pub fn flush(&self) -> Result<Lsn> {
-        let mut writer = self.writer.lock();
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        let current = self.current_lsn.load(Ordering::SeqCst);
-        self.flushed_lsn.store(current, Ordering::SeqCst);
-        Ok(current)
+        let target = self.current_lsn.load(Ordering::SeqCst);
+        self.flush_through(target)
     }
 
     pub fn current_lsn(&self) -> Lsn {
@@ -136,5 +247,80 @@ impl LogManager {
         self.current_lsn.store(0, Ordering::SeqCst);
         self.flushed_lsn.store(0, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+    use crate::wal::log_record::LogRecord;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use tempfile::tempdir;
+
+    fn fresh() -> (tempfile::TempDir, Arc<LogManager>) {
+        let d = tempdir().unwrap();
+        let p = d.path().join("wal.log");
+        let lm = Arc::new(LogManager::new(&p).unwrap());
+        (d, lm)
+    }
+
+    fn append_commit(lm: &LogManager) -> Lsn {
+        lm.append(LogRecord::Commit { txn_id: 1 }).unwrap()
+    }
+
+    #[test]
+    fn single_thread_flush_advances_flushed_lsn() {
+        let (_d, lm) = fresh();
+        let l1 = append_commit(&lm);
+        let l2 = append_commit(&lm);
+        let f = lm.flush().unwrap();
+        assert!(f >= l2);
+        assert!(f >= l1);
+        assert_eq!(lm.fsync_count(), 1);
+    }
+
+    #[test]
+    fn group_commit_batches_concurrent_flushes() {
+        // With many threads each calling flush() once, fsync_count should
+        // be much less than the number of threads.
+        let (_d, lm) = fresh();
+        // Use a small linger so the leader can pick up siblings.
+        lm.set_group_commit_delay_us(2_000); // 2 ms
+
+        let total_committers: u64 = 32;
+        let started = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..total_committers {
+            let lm = Arc::clone(&lm);
+            let started = Arc::clone(&started);
+            handles.push(thread::spawn(move || {
+                let lsn = append_commit(&lm);
+                started.fetch_add(1, Ordering::Relaxed);
+                lm.flush_through(lsn).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(lm.commits_served(), total_committers);
+        assert!(
+            lm.fsync_count() < total_committers,
+            "expected batching: got {} fsyncs for {} commits",
+            lm.fsync_count(),
+            total_committers
+        );
+    }
+
+    #[test]
+    fn flush_through_skips_when_already_durable() {
+        let (_d, lm) = fresh();
+        let l1 = append_commit(&lm);
+        lm.flush_through(l1).unwrap();
+        let fsyncs_before = lm.fsync_count();
+        // Asking for an already-flushed LSN should not issue a new fsync.
+        lm.flush_through(l1).unwrap();
+        assert_eq!(lm.fsync_count(), fsyncs_before);
     }
 }
