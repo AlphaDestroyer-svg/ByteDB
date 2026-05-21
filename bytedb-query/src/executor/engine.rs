@@ -3566,6 +3566,20 @@ impl QueryEngine {
         &self.txn_manager
     }
 
+    pub fn txn_manager_arc(&self) -> Arc<TransactionManager> {
+        Arc::clone(&self.txn_manager)
+    }
+
+    /// Snapshot the per-table version stores. Used by the background
+    /// vacuum worker to GC dead MVCC versions across every table.
+    pub fn snapshot_version_stores(&self) -> Vec<Arc<bytedb_core::mvcc::version_store::VersionStore>> {
+        self.tables
+            .read()
+            .values()
+            .map(|t| Arc::clone(&t.version_store))
+            .collect()
+    }
+
     pub fn database(&self) -> &Database {
         &self.database
     }

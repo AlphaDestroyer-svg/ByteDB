@@ -16,7 +16,7 @@ use bytedb_core::snapshot::format::{FullSnapshot, SnapshotFormat, TableSnapshot}
 use bytedb_core::snapshot::manager::SnapshotManager;
 use bytedb_core::wal::log_manager::LogManager;
 use bytedb_core::wal::recovery::RecoveryManager;
-use bytedb_core::workers::{wal_flusher, WorkerHandle};
+use bytedb_core::workers::{wal_flusher, vacuum, WorkerHandle};
 use bytedb_query::executor::engine::{QueryEngine, TableData};
 use bytedb_query::kv::kv_engine::KvEngine;
 use bytedb_query::document::doc_engine::DocEngine;
@@ -103,14 +103,22 @@ impl Server {
         let session_manager = Arc::new(SessionManager::new());
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
-        // Background workers — for now just the WAL flusher heartbeat.
-        // Page flusher / checkpoint workers will activate when the page-
-        // based storage layer comes online; vacuum activates with stage 5.
+        // Background workers.
+        //   - wal_flusher: heartbeat fsync of the WAL.
+        //   - vacuum: MVCC GC over every registered version store.
+        // Page flusher / checkpoint workers activate when the page-based
+        // storage layer comes online.
+        let vacuum_pass = {
+            let engine = Arc::clone(&query_engine);
+            let txn_mgr = engine.txn_manager_arc();
+            vacuum::MvccVacuum::new(txn_mgr, move || engine.snapshot_version_stores())
+        };
         let workers = vec![
             wal_flusher::start(
                 Arc::clone(&log_manager),
                 wal_flusher::WalFlusherConfig::default(),
             ),
+            vacuum::start(vacuum_pass, vacuum::VacuumConfig::default()),
         ];
 
         Server {

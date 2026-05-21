@@ -80,18 +80,66 @@ impl VersionStore {
     }
 
     pub fn gc(&self, oldest_active_ts: Timestamp) {
-        let mut versions = self.versions.write();
-        versions.retain(|_, chain| {
-            chain.retain(|v| {
-                if let Some(deleted_ts) = v.deleted_ts {
-                    deleted_ts >= oldest_active_ts
-                } else {
-                    true
-                }
-            });
-            !chain.is_empty()
-        });
+        self.gc_with_aborted(oldest_active_ts, &[]);
     }
+
+    /// Run a GC pass that drops:
+    ///   - tombstoned versions older than every live snapshot
+    ///     (`deleted_ts < oldest_active_ts`), and
+    ///   - any version whose creator txn id appears in `aborted_txns`.
+    /// Returns `(versions_removed, keys_removed)`.
+    pub fn gc_with_aborted(
+        &self,
+        oldest_active_ts: Timestamp,
+        aborted_txns: &[TxnId],
+    ) -> GcStats {
+        let mut versions = self.versions.write();
+        let mut versions_removed: u64 = 0;
+        let mut keys_removed: u64 = 0;
+        versions.retain(|_, chain| {
+            let before = chain.len();
+            chain.retain(|v| {
+                // Aborted creator => version never existed.
+                if aborted_txns.contains(&v.created_by) {
+                    return false;
+                }
+                // Tombstone visible to nobody => purge.
+                if let Some(deleted_ts) = v.deleted_ts {
+                    if deleted_ts < oldest_active_ts {
+                        return false;
+                    }
+                }
+                true
+            });
+            versions_removed += (before - chain.len()) as u64;
+            if chain.is_empty() {
+                keys_removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        GcStats {
+            versions_removed,
+            keys_removed,
+        }
+    }
+
+    /// Number of distinct keys currently tracked.
+    pub fn key_count(&self) -> usize {
+        self.versions.read().len()
+    }
+
+    /// Total versions across all keys (for instrumentation).
+    pub fn total_versions(&self) -> usize {
+        self.versions.read().values().map(|c| c.len()).sum()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcStats {
+    pub versions_removed: u64,
+    pub keys_removed: u64,
 }
 
 fn is_visible(version: &VersionedTuple, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> bool {
