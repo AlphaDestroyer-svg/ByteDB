@@ -1,32 +1,51 @@
 use std::sync::Arc;
-use parking_lot::{RwLock, Mutex};
+use parking_lot::RwLock;
 
 use crate::error::{CoreError, Result};
 
 pub struct BPlusTree {
-    root: Arc<RwLock<BTreeNode>>,
+    root: RwLock<Arc<RwLock<BTreeNode>>>,
     order: usize,
     name: String,
-    write_latch: Mutex<()>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum BTreeNode {
     Internal(InternalNode),
     Leaf(LeafNode),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct InternalNode {
     keys: Vec<Vec<u8>>,
     children: Vec<Arc<RwLock<BTreeNode>>>,
+    high_key: Option<Vec<u8>>,
+    right_link: Option<Arc<RwLock<BTreeNode>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LeafNode {
     keys: Vec<Vec<u8>>,
     values: Vec<Vec<u8>>,
-    next: Option<Arc<RwLock<BTreeNode>>>,
+    high_key: Option<Vec<u8>>,
+    right_link: Option<Arc<RwLock<BTreeNode>>>,
+}
+
+impl BTreeNode {
+    fn high_key(&self) -> Option<&Vec<u8>> {
+        match self {
+            BTreeNode::Internal(n) => n.high_key.as_ref(),
+            BTreeNode::Leaf(n) => n.high_key.as_ref(),
+        }
+    }
+
+    fn right_link(&self) -> Option<&Arc<RwLock<BTreeNode>>> {
+        match self {
+            BTreeNode::Internal(n) => n.right_link.as_ref(),
+            BTreeNode::Leaf(n) => n.right_link.as_ref(),
+        }
+    }
+
 }
 
 impl BPlusTree {
@@ -34,14 +53,14 @@ impl BPlusTree {
         let leaf = BTreeNode::Leaf(LeafNode {
             keys: Vec::new(),
             values: Vec::new(),
-            next: None,
+            high_key: None,
+            right_link: None,
         });
 
         BPlusTree {
-            root: Arc::new(RwLock::new(leaf)),
+            root: RwLock::new(Arc::new(RwLock::new(leaf))),
             order,
             name: name.into(),
-            write_latch: Mutex::new(()),
         }
     }
 
@@ -49,43 +68,245 @@ impl BPlusTree {
         &self.name
     }
 
+    fn root_arc(&self) -> Arc<RwLock<BTreeNode>> {
+        Arc::clone(&*self.root.read())
+    }
+
+    fn move_right_read(&self, mut node_arc: Arc<RwLock<BTreeNode>>, key: &[u8]) -> Arc<RwLock<BTreeNode>> {
+        loop {
+            let node = node_arc.read();
+            let should_move = match (node.high_key(), node.right_link()) {
+                (Some(hk), Some(_)) => key > hk.as_slice(),
+                _ => false,
+            };
+            if !should_move {
+                drop(node);
+                return node_arc;
+            }
+            let next = Arc::clone(node.right_link().unwrap());
+            drop(node);
+            node_arc = next;
+        }
+    }
+
+    fn move_right_write(&self, mut node_arc: Arc<RwLock<BTreeNode>>, key: &[u8]) -> Arc<RwLock<BTreeNode>> {
+        loop {
+            let node = node_arc.read();
+            let should_move = match (node.high_key(), node.right_link()) {
+                (Some(hk), Some(_)) => key > hk.as_slice(),
+                _ => false,
+            };
+            if !should_move {
+                drop(node);
+                return node_arc;
+            }
+            let next = Arc::clone(node.right_link().unwrap());
+            drop(node);
+            node_arc = next;
+        }
+    }
+
     pub fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let _structural = self.write_latch.lock();
-        let root = self.root.read();
-        match &*root {
-            BTreeNode::Leaf(leaf) => {
-                if leaf.keys.len() < self.order - 1 {
-                    drop(root);
-                    self.insert_into_leaf(key, value)?;
-                } else {
-                    drop(root);
-                    self.insert_and_split(key, value)?;
+        loop {
+            let root = self.root_arc();
+            let mut path: Vec<Arc<RwLock<BTreeNode>>> = Vec::new();
+            let mut current = root.clone();
+
+            loop {
+                current = self.move_right_write(current, &key);
+                let node = current.read();
+                match &*node {
+                    BTreeNode::Leaf(_) => {
+                        drop(node);
+                        break;
+                    }
+                    BTreeNode::Internal(internal) => {
+                        let mut idx = internal.keys.len();
+                        for (i, k) in internal.keys.iter().enumerate() {
+                            if key.as_slice() < k.as_slice() {
+                                idx = i;
+                                break;
+                            }
+                        }
+                        let next = Arc::clone(&internal.children[idx]);
+                        path.push(Arc::clone(&current));
+                        drop(node);
+                        current = next;
+                    }
                 }
             }
-            BTreeNode::Internal(_) => {
-                drop(root);
-                if let Some((split_key, new_child)) = self.insert_recursive(&self.root, key, value)? {
-                    let mut root_w = self.root.write();
-                    let old_root = std::mem::replace(&mut *root_w, BTreeNode::Leaf(LeafNode {
-                        keys: Vec::new(),
-                        values: Vec::new(),
-                        next: None,
-                    }));
-                    let left = Arc::new(RwLock::new(old_root));
-                    *root_w = BTreeNode::Internal(InternalNode {
-                        keys: vec![split_key],
-                        children: vec![left, new_child],
-                    });
+
+            let split = {
+                let mut leaf_w = current.write();
+                match &mut *leaf_w {
+                    BTreeNode::Leaf(leaf) => {
+                        if let Some(hk) = &leaf.high_key {
+                            if key.as_slice() > hk.as_slice() && leaf.right_link.is_some() {
+                                continue;
+                            }
+                        }
+                        self.leaf_insert_locked(leaf, key.clone(), value.clone())
+                    }
+                    _ => return Err(CoreError::Internal("Expected leaf node".into())),
                 }
+            };
+
+            let mut split = match split {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            for parent_arc in path.iter().rev() {
+                let parent_arc = self.move_right_write(Arc::clone(parent_arc), &split.0);
+                let mut parent_w = parent_arc.write();
+                match &mut *parent_w {
+                    BTreeNode::Internal(internal) => {
+                        let new_split = self.internal_insert_locked(internal, split.0, split.1);
+                        match new_split {
+                            Some(s) => split = s,
+                            None => return Ok(()),
+                        }
+                    }
+                    _ => return Err(CoreError::Internal("Expected internal node".into())),
+                }
+            }
+
+            let mut root_guard = self.root.write();
+            if !Arc::ptr_eq(&*root_guard, &root) {
+                let mut current = Arc::clone(&*root_guard);
+                drop(root_guard);
+                loop {
+                    current = self.move_right_write(current, &split.0);
+                    let node = current.read();
+                    let is_root_child = match &*node {
+                        BTreeNode::Internal(internal) => {
+                            internal.children.iter().any(|c| Arc::ptr_eq(c, &split.1))
+                        }
+                        _ => false,
+                    };
+                    if is_root_child {
+                        drop(node);
+                        return Ok(());
+                    }
+                    match &*node {
+                        BTreeNode::Internal(internal) => {
+                            let mut idx = internal.keys.len();
+                            for (i, k) in internal.keys.iter().enumerate() {
+                                if split.0.as_slice() < k.as_slice() {
+                                    idx = i;
+                                    break;
+                                }
+                            }
+                            let next = Arc::clone(&internal.children[idx]);
+                            drop(node);
+                            current = next;
+                        }
+                        BTreeNode::Leaf(_) => {
+                            drop(node);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            let old_root = Arc::clone(&*root_guard);
+            let new_root = Arc::new(RwLock::new(BTreeNode::Internal(InternalNode {
+                keys: vec![split.0],
+                children: vec![old_root, split.1],
+                high_key: None,
+                right_link: None,
+            })));
+            *root_guard = new_root;
+            return Ok(());
+        }
+    }
+
+    fn leaf_insert_locked(
+        &self,
+        leaf: &mut LeafNode,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Option<(Vec<u8>, Arc<RwLock<BTreeNode>>)> {
+        let pos = leaf.keys.iter().position(|k| k.as_slice() >= key.as_slice())
+            .unwrap_or(leaf.keys.len());
+
+        if pos < leaf.keys.len() && leaf.keys[pos] == key {
+            leaf.values[pos] = value;
+            return None;
+        }
+
+        leaf.keys.insert(pos, key);
+        leaf.values.insert(pos, value);
+
+        if leaf.keys.len() < self.order {
+            return None;
+        }
+
+        let mid = leaf.keys.len() / 2;
+        let right_keys = leaf.keys.split_off(mid);
+        let right_values = leaf.values.split_off(mid);
+        let split_key = right_keys[0].clone();
+        let right_high_key = right_keys.last().cloned();
+
+        let right_leaf = Arc::new(RwLock::new(BTreeNode::Leaf(LeafNode {
+            keys: right_keys,
+            values: right_values,
+            high_key: right_high_key,
+            right_link: leaf.right_link.take(),
+        })));
+
+        leaf.high_key = leaf.keys.last().cloned();
+        leaf.right_link = Some(Arc::clone(&right_leaf));
+
+        Some((split_key, right_leaf))
+    }
+
+    fn internal_insert_locked(
+        &self,
+        internal: &mut InternalNode,
+        split_key: Vec<u8>,
+        new_child: Arc<RwLock<BTreeNode>>,
+    ) -> Option<(Vec<u8>, Arc<RwLock<BTreeNode>>)> {
+        let mut idx = internal.keys.len();
+        for (i, k) in internal.keys.iter().enumerate() {
+            if split_key.as_slice() < k.as_slice() {
+                idx = i;
+                break;
             }
         }
-        Ok(())
+        internal.keys.insert(idx, split_key);
+        internal.children.insert(idx + 1, new_child);
+
+        if internal.keys.len() < self.order {
+            return None;
+        }
+
+        let mid = internal.keys.len() / 2;
+        let promoted = internal.keys[mid].clone();
+
+        let right_keys: Vec<Vec<u8>> = internal.keys.split_off(mid + 1);
+        internal.keys.pop();
+        let right_children: Vec<Arc<RwLock<BTreeNode>>> = internal.children.split_off(mid + 1);
+
+        let parent_high_key = internal.high_key.take();
+
+        let right_node = Arc::new(RwLock::new(BTreeNode::Internal(InternalNode {
+            keys: right_keys,
+            children: right_children,
+            high_key: parent_high_key,
+            right_link: internal.right_link.take(),
+        })));
+
+        internal.high_key = Some(promoted.clone());
+        internal.right_link = Some(Arc::clone(&right_node));
+
+        Some((promoted, right_node))
     }
 
     pub fn search(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let node = self.find_leaf(key);
-        let node_read = node.read();
-        match &*node_read {
+        let leaf_arc = self.find_leaf_read(key);
+        let node = leaf_arc.read();
+        match &*node {
             BTreeNode::Leaf(leaf) => {
                 for (i, k) in leaf.keys.iter().enumerate() {
                     if k.as_slice() == key {
@@ -99,10 +320,9 @@ impl BPlusTree {
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let _structural = self.write_latch.lock();
-        let node = self.find_leaf(key);
-        let mut node_write = node.write();
-        match &mut *node_write {
+        let leaf_arc = self.find_leaf_write(key);
+        let mut node_w = leaf_arc.write();
+        match &mut *node_w {
             BTreeNode::Leaf(leaf) => {
                 if let Some(pos) = leaf.keys.iter().position(|k| k.as_slice() == key) {
                     leaf.keys.remove(pos);
@@ -116,9 +336,57 @@ impl BPlusTree {
         }
     }
 
+    fn find_leaf_read(&self, key: &[u8]) -> Arc<RwLock<BTreeNode>> {
+        let mut current = self.root_arc();
+        loop {
+            current = self.move_right_read(current, key);
+            let node = current.read();
+            match &*node {
+                BTreeNode::Leaf(_) => {
+                    drop(node);
+                    return current;
+                }
+                BTreeNode::Internal(internal) => {
+                    let mut idx = internal.keys.len();
+                    for (i, k) in internal.keys.iter().enumerate() {
+                        if key < k.as_slice() {
+                            idx = i;
+                            break;
+                        }
+                    }
+                    let next = Arc::clone(&internal.children[idx]);
+                    drop(node);
+                    current = next;
+                }
+            }
+        }
+    }
+
+    fn find_leaf_write(&self, key: &[u8]) -> Arc<RwLock<BTreeNode>> {
+        self.find_leaf_read(key)
+    }
+
+    fn find_leftmost_leaf(&self) -> Arc<RwLock<BTreeNode>> {
+        let mut current = self.root_arc();
+        loop {
+            let node = current.read();
+            match &*node {
+                BTreeNode::Leaf(_) => {
+                    drop(node);
+                    return current;
+                }
+                BTreeNode::Internal(internal) => {
+                    let next = Arc::clone(&internal.children[0]);
+                    drop(node);
+                    current = next;
+                }
+            }
+        }
+    }
+
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
-        let leaf_node = self.find_leaf(start);
+        let leaf_node = self.find_leaf_read(start);
         let mut current = Some(leaf_node);
 
         'outer: while let Some(node_arc) = current {
@@ -132,7 +400,7 @@ impl BPlusTree {
                             break 'outer;
                         }
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -154,7 +422,7 @@ impl BPlusTree {
                     for (i, k) in leaf.keys.iter().enumerate() {
                         results.push((k.clone(), leaf.values[i].clone()));
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -180,7 +448,7 @@ impl BPlusTree {
                             return Ok(());
                         }
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -213,7 +481,7 @@ impl BPlusTree {
                             owned_batch.clear();
                         }
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -242,7 +510,7 @@ impl BPlusTree {
                     if !leaf.values.is_empty() && !f(&leaf.values) {
                         return Ok(());
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -268,7 +536,7 @@ impl BPlusTree {
                     if !entries.is_empty() {
                         leaves.push(entries);
                     }
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -288,7 +556,7 @@ impl BPlusTree {
             match &*node {
                 BTreeNode::Leaf(leaf) => {
                     count += leaf.keys.len();
-                    current = leaf.next.clone();
+                    current = leaf.right_link.clone();
                 }
                 _ => break,
             }
@@ -296,194 +564,5 @@ impl BPlusTree {
         }
 
         count
-    }
-
-    fn find_leaf(&self, key: &[u8]) -> Arc<RwLock<BTreeNode>> {
-        let mut current = Arc::clone(&self.root);
-        loop {
-            let node = current.read();
-            match &*node {
-                BTreeNode::Leaf(_) => {
-                    drop(node);
-                    return current;
-                }
-                BTreeNode::Internal(internal) => {
-                    let mut idx = internal.keys.len();
-                    for (i, k) in internal.keys.iter().enumerate() {
-                        if key < k.as_slice() {
-                            idx = i;
-                            break;
-                        }
-                    }
-                    let next = Arc::clone(&internal.children[idx]);
-                    drop(node);
-                    current = next;
-                }
-            }
-        }
-    }
-
-    fn find_leftmost_leaf(&self) -> Arc<RwLock<BTreeNode>> {
-        let mut current = Arc::clone(&self.root);
-        loop {
-            let node = current.read();
-            match &*node {
-                BTreeNode::Leaf(_) => {
-                    drop(node);
-                    return current;
-                }
-                BTreeNode::Internal(internal) => {
-                    let next = Arc::clone(&internal.children[0]);
-                    drop(node);
-                    current = next;
-                }
-            }
-        }
-    }
-
-    fn insert_into_leaf(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let leaf_node = self.find_leaf(&key);
-        let mut node = leaf_node.write();
-        match &mut *node {
-            BTreeNode::Leaf(leaf) => {
-                let pos = leaf.keys.iter().position(|k| k.as_slice() >= key.as_slice())
-                    .unwrap_or(leaf.keys.len());
-
-                if pos < leaf.keys.len() && leaf.keys[pos] == key {
-                    leaf.values[pos] = value;
-                } else {
-                    leaf.keys.insert(pos, key);
-                    leaf.values.insert(pos, value);
-                }
-                Ok(())
-            }
-            _ => Err(CoreError::Internal("Expected leaf node".into())),
-        }
-    }
-
-    fn insert_and_split(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let mut root = self.root.write();
-        match &mut *root {
-            BTreeNode::Leaf(leaf) => {
-                let pos = leaf.keys.iter().position(|k| k.as_slice() >= key.as_slice())
-                    .unwrap_or(leaf.keys.len());
-
-                if pos < leaf.keys.len() && leaf.keys[pos] == key {
-                    leaf.values[pos] = value;
-                    return Ok(());
-                }
-
-                leaf.keys.insert(pos, key);
-                leaf.values.insert(pos, value);
-
-                let mid = leaf.keys.len() / 2;
-                let right_keys = leaf.keys.split_off(mid);
-                let right_values = leaf.values.split_off(mid);
-                let split_key = right_keys[0].clone();
-
-                let right_leaf = Arc::new(RwLock::new(BTreeNode::Leaf(LeafNode {
-                    keys: right_keys,
-                    values: right_values,
-                    next: leaf.next.take(),
-                })));
-
-                leaf.next = Some(Arc::clone(&right_leaf));
-
-                let left_leaf = Arc::new(RwLock::new(BTreeNode::Leaf(LeafNode {
-                    keys: std::mem::take(&mut leaf.keys),
-                    values: std::mem::take(&mut leaf.values),
-                    next: Some(Arc::clone(&right_leaf)),
-                })));
-
-                *root = BTreeNode::Internal(InternalNode {
-                    keys: vec![split_key],
-                    children: vec![left_leaf, right_leaf],
-                });
-
-                Ok(())
-            }
-            _ => Err(CoreError::Internal("Expected leaf for split".into())),
-        }
-    }
-
-    fn insert_recursive(&self, node_arc: &Arc<RwLock<BTreeNode>>, key: Vec<u8>, value: Vec<u8>) -> Result<Option<(Vec<u8>, Arc<RwLock<BTreeNode>>)>> {
-        let node = node_arc.read();
-        match &*node {
-            BTreeNode::Leaf(_) => {
-                drop(node);
-                let mut node_w = node_arc.write();
-                match &mut *node_w {
-                    BTreeNode::Leaf(leaf) => {
-                        let pos = leaf.keys.iter().position(|k| k.as_slice() >= key.as_slice())
-                            .unwrap_or(leaf.keys.len());
-
-                        if pos < leaf.keys.len() && leaf.keys[pos] == key {
-                            leaf.values[pos] = value;
-                            return Ok(None);
-                        }
-
-                        leaf.keys.insert(pos, key);
-                        leaf.values.insert(pos, value);
-
-                        if leaf.keys.len() >= self.order {
-                            let mid = leaf.keys.len() / 2;
-                            let right_keys = leaf.keys.split_off(mid);
-                            let right_values = leaf.values.split_off(mid);
-                            let split_key = right_keys[0].clone();
-
-                            let right_leaf = Arc::new(RwLock::new(BTreeNode::Leaf(LeafNode {
-                                keys: right_keys,
-                                values: right_values,
-                                next: leaf.next.take(),
-                            })));
-                            leaf.next = Some(Arc::clone(&right_leaf));
-
-                            return Ok(Some((split_key, right_leaf)));
-                        }
-                        Ok(None)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            BTreeNode::Internal(internal) => {
-                let mut idx = internal.keys.len();
-                for (i, k) in internal.keys.iter().enumerate() {
-                    if key.as_slice() < k.as_slice() {
-                        idx = i;
-                        break;
-                    }
-                }
-                let child = Arc::clone(&internal.children[idx]);
-                drop(node);
-
-                if let Some((split_key, new_child)) = self.insert_recursive(&child, key, value)? {
-                    let mut node_w = node_arc.write();
-                    match &mut *node_w {
-                        BTreeNode::Internal(internal) => {
-                            internal.keys.insert(idx, split_key);
-                            internal.children.insert(idx + 1, new_child);
-
-                            if internal.keys.len() >= self.order {
-                                let mid = internal.keys.len() / 2;
-                                let split_key = internal.keys[mid].clone();
-
-                                let right_keys = internal.keys.split_off(mid + 1);
-                                internal.keys.pop();
-                                let right_children = internal.children.split_off(mid + 1);
-
-                                let right_node = Arc::new(RwLock::new(BTreeNode::Internal(InternalNode {
-                                    keys: right_keys,
-                                    children: right_children,
-                                })));
-
-                                return Ok(Some((split_key, right_node)));
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                Ok(None)
-            }
-        }
     }
 }
