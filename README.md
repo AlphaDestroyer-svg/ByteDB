@@ -2,14 +2,30 @@
 
 A hybrid storage engine in Rust: relational SQL + key-value + document, with MVCC, WAL/ARIES recovery, B+Tree indexes, and a vectorized executor.
 
+**v0.2** — full storage rewrite to 8KB slotted pages, LRU-K buffer pool, WAL group commit, background workers (WAL flusher, page flusher, checkpoint, vacuum), and a real cost-based optimizer driven by table statistics.
+
 > 📖 Doc language: [English](#english) · [Русский](#русский)
 
 ---
 
 ## English
 
+### What's new in v0.2
+
+- **Slotted pages (8KB)** — every table file is a sequence of fixed-size pages with a 32-byte header and slot directory.
+- **Buffer pool with LRU-K (K=2)** — bounded-memory page cache replacing the previous read-everything-at-startup model.
+- **WAL group commit** — leader/follower fsync batching cuts disk syncs under concurrent writers.
+- **Background workers** — dedicated threads for WAL flushing, dirty-page writeback, periodic checkpoints, and MVCC vacuum/GC.
+- **MVCC garbage collector** — old versions invisible to all active transactions are reclaimed automatically.
+- **`ANALYZE` statistics** — per-column NDV, MCV (top-K most common values), and equi-depth histograms; query with `SHOW STATS [FOR <table>]`.
+- **Cost-based optimizer** — selectivity estimation from MCV/histograms, join cardinality from NDV, greedy reordering of left-deep INNER join chains by smallest cardinality. Outer joins are conservatively kept in source order.
+- **Clean break** — v0.2 storage format is incompatible with v0.1 (new BSDB magic stamp).
+
 ### Status
 
+- ✅ Storage: 8KB slotted pages, LRU-K buffer pool, WAL with group commit, ARIES recovery
+- ✅ Concurrency: MVCC snapshot isolation, background vacuum/GC, periodic checkpoints
+- ✅ Optimizer: cost-based join reordering driven by `ANALYZE` statistics (NDV, MCV, histograms)
 - ✅ DDL: `CREATE/DROP TABLE`, `CREATE INDEX`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN)
 - ✅ DML: `INSERT` (incl. `INSERT...SELECT`, `RETURNING`, `ON CONFLICT`), `UPDATE`, `DELETE`, `SELECT`
 - ✅ Constraints: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY`, `SERIAL`
@@ -19,7 +35,7 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 - ✅ Transactions: `BEGIN [SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, MVCC snapshot isolation
 - ✅ KV mode: `KV GET/SET/DELETE/SCAN`
 - ✅ Document mode: `DOC INSERT/FIND/UPDATE/DELETE` with JSON path
-- ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
+- ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE/STATS`, `ANALYZE [TABLE]`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
 - ✅ Persistence: snapshot (binary + JSON) + WAL with ARIES-style recovery
 - ✅ Performance: zero-copy filter, fast top-N, fast aggregate, prepared-statement cache
 
@@ -140,6 +156,17 @@ SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) AS rn FRO
 WITH big AS (SELECT * FROM orders WHERE amount > 100)
 SELECT * FROM big;
 ```
+
+#### ANALYZE & statistics
+
+```sql
+ANALYZE TABLE users;       -- collect NDV, MCV, histograms for one table
+ANALYZE;                   -- analyze every user table
+SHOW STATS FOR users;      -- per-column row count / null fraction / NDV / MCVs
+SHOW STATS;                -- summary across all tables
+```
+
+The optimizer consults this catalog for selectivity and join cardinality. Without stats, plans fall back to source order — same behaviour as v0.1.
 
 ### Storage modes
 
@@ -266,8 +293,22 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 
 ## Русский
 
+### Что нового в v0.2
+
+- **Slotted pages (8KB)** — файл каждой таблицы — последовательность страниц фиксированного размера с 32-байтным заголовком и слот-директорией.
+- **Buffer pool с LRU-K (K=2)** — кеш страниц с ограниченной памятью вместо «прочитать всё при старте».
+- **WAL group commit** — fsync-батчинг по схеме лидер/последователь снижает число синхронизаций при параллельной записи.
+- **Фоновые воркеры** — отдельные потоки для flush WAL, записи грязных страниц, периодических чекпоинтов и vacuum/GC MVCC.
+- **Сборщик мусора MVCC** — старые версии, невидимые ни одной активной транзакции, освобождаются автоматически.
+- **Статистика `ANALYZE`** — NDV, MCV (top-K самых частых значений) и equi-depth гистограммы по колонкам; смотреть через `SHOW STATS [FOR <table>]`.
+- **Cost-based оптимизатор** — оценка селективности по MCV/гистограммам, кардинальность join по NDV, жадная переупорядочка left-deep INNER-join цепочек по наименьшей кардинальности. Внешние джойны консервативно остаются в исходном порядке.
+- **Чистый break** — формат хранения v0.2 несовместим с v0.1 (новый magic stamp BSDB).
+
 ### Состояние
 
+- ✅ Хранение: 8KB slotted pages, LRU-K buffer pool, WAL с group commit, ARIES recovery
+- ✅ Конкурентность: MVCC snapshot isolation, фоновый vacuum/GC, периодические чекпоинты
+- ✅ Оптимизатор: cost-based перестановка джойнов на основе `ANALYZE` статистики (NDV, MCV, гистограммы)
 - ✅ DDL: `CREATE/DROP TABLE`, `CREATE INDEX`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN)
 - ✅ DML: `INSERT` (включая `INSERT...SELECT`, `RETURNING`, `ON CONFLICT`), `UPDATE`, `DELETE`, `SELECT`
 - ✅ Ограничения: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `FOREIGN KEY`, `SERIAL`
@@ -277,7 +318,7 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 - ✅ Транзакции: `BEGIN [SERIALIZABLE]`, `COMMIT`, `ROLLBACK`, MVCC snapshot isolation
 - ✅ KV-режим: `KV GET/SET/DELETE/SCAN`
 - ✅ Документный режим: `DOC INSERT/FIND/UPDATE/DELETE` с JSON-путями
-- ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
+- ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE/STATS`, `ANALYZE [TABLE]`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
 - ✅ Персистентность: snapshot (binary + JSON) + WAL с восстановлением в стиле ARIES
 - ✅ Производительность: zero-copy фильтр, fast top-N, fast aggregate, кеш подготовленных стейтментов
 
@@ -396,6 +437,17 @@ SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) AS rn FRO
 WITH big AS (SELECT * FROM orders WHERE amount > 100)
 SELECT * FROM big;
 ```
+
+#### ANALYZE и статистика
+
+```sql
+ANALYZE TABLE users;       -- собрать NDV, MCV, гистограммы для одной таблицы
+ANALYZE;                   -- проанализировать все пользовательские таблицы
+SHOW STATS FOR users;      -- по колонкам: row count / null fraction / NDV / MCV
+SHOW STATS;                -- сводка по всем таблицам
+```
+
+Оптимизатор использует этот каталог для оценки селективности и кардинальности джойнов. Без статистики планы возвращаются к исходному порядку — поведение совпадает с v0.1.
 
 ### Режимы хранения
 
