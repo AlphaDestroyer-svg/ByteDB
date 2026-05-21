@@ -19,8 +19,9 @@ use bytedb_core::stats::{compute_table_stats, TableStats, DEFAULT_HISTOGRAM_BUCK
 use crate::error::{QueryError, Result};
 use crate::executor::batch::{SelectionVector, deserialize_batch};
 use crate::parser::ast::*;
+use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
-use crate::planner::optimizer::optimize;
+use crate::planner::optimizer::{optimize_with_stats};
 use crate::planner::physical_plan::PhysicalPlan;
 
 const STMT_CACHE_SIZE: usize = 256;
@@ -483,7 +484,8 @@ impl QueryEngine {
             _ => {
                 let stmt = Self::rewrite_aliases(stmt);
                 let logical = build_logical_plan(&stmt)?;
-                let physical = optimize(logical)?;
+                let stats_snapshot = self.stats_snapshot();
+                let physical = optimize_with_stats(logical, &stats_snapshot)?;
                 self.execute_physical(physical, txn_id)
             }
         }
@@ -3581,6 +3583,13 @@ impl QueryEngine {
     /// the cost model in stage 7+.
     pub fn stats(&self) -> &parking_lot::RwLock<HashMap<String, TableStats>> {
         &self.stats
+    }
+
+    /// Clone the current stats map for use by the optimiser. The
+    /// optimiser reads stats once per query, so this avoids holding the
+    /// lock across a long planning pass.
+    fn stats_snapshot(&self) -> StatsCatalog {
+        self.stats.read().clone()
     }
 
     fn collect_table_rows(&self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
