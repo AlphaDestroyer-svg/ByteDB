@@ -12,6 +12,7 @@ pub mod workers;
 pub mod metrics;
 pub mod backup;
 pub mod migration;
+pub mod chaos;
 pub mod error;
 
 #[cfg(test)]

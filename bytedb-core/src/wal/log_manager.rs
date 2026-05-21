@@ -162,10 +162,14 @@ impl LogManager {
 
         let snapshot_lsn = self.current_lsn.load(Ordering::SeqCst);
 
+        crate::chaos::wal_flush_hook();
+
         let result = (|| -> Result<()> {
             let mut writer = self.writer.lock();
             writer.flush()?;
-            writer.get_ref().sync_all()?;
+            if !crate::chaos::should_skip_fsync() {
+                writer.get_ref().sync_all()?;
+            }
             Ok(())
         })();
 

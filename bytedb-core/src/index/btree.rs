@@ -242,6 +242,8 @@ impl BPlusTree {
             return None;
         }
 
+        crate::chaos::split_hook();
+
         let mid = leaf.keys.len() / 2;
         let right_keys = leaf.keys.split_off(mid);
         let right_values = leaf.values.split_off(mid);
@@ -304,6 +306,7 @@ impl BPlusTree {
     }
 
     pub fn search(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        crate::chaos::index_traversal_hook();
         let leaf_arc = self.find_leaf_read(key);
         let node = leaf_arc.read();
         match &*node {

@@ -51,6 +51,7 @@ struct ThreadStats {
 }
 
 fn main() {
+    bytedb_core::chaos::configure_from_env();
     let num_users: usize = std::env::var("USERS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     let num_threads: usize = std::env::var("THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let test_secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
