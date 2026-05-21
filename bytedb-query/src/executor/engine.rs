@@ -71,11 +71,16 @@ pub struct QueryEngine {
     database: Arc<Database>,
     txn_manager: Arc<TransactionManager>,
     tables: Arc<parking_lot::RwLock<HashMap<String, TableData>>>,
+    /// Per-database tables map. The active set lives in `tables`; switching
+    /// USE moves the current map back into this cache and pulls/loads the
+    /// target database's tables.
+    db_tables: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, TableData>>>>,
     wal: Option<Arc<LogManager>>,
     stmt_cache: parking_lot::Mutex<StmtCache>,
     /// Logical database catalog (names only). Default db is `database.name()`.
     databases: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
     current_db: Arc<parking_lot::RwLock<String>>,
+    disk_store: Option<Arc<crate::executor::diskstore::DiskStore>>,
 }
 
 pub struct TableData {
@@ -95,10 +100,12 @@ impl QueryEngine {
             database,
             txn_manager,
             tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            db_tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             wal: None,
             stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
             databases: Arc::new(parking_lot::RwLock::new(dbs)),
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
+            disk_store: None,
         }
     }
 
@@ -110,10 +117,113 @@ impl QueryEngine {
             database,
             txn_manager,
             tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            db_tables: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             wal: Some(wal),
             stmt_cache: parking_lot::Mutex::new(StmtCache::new()),
             databases: Arc::new(parking_lot::RwLock::new(dbs)),
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
+            disk_store: None,
+        }
+    }
+
+    /// Attach a disk store. After this call, every CREATE/DROP/INSERT/UPDATE/
+    /// DELETE flushes the affected table to disk, and the engine restores
+    /// content from disk on startup.
+    pub fn attach_disk_store(&mut self, store: Arc<crate::executor::diskstore::DiskStore>) {
+        // Seed the in-memory database registry with on-disk databases.
+        let mut dbs = self.databases.write();
+        for n in store.registry().list() {
+            dbs.insert(n);
+        }
+        drop(dbs);
+        self.disk_store = Some(store);
+        let _ = self.restore_current_db_from_disk();
+    }
+
+    pub fn disk_store(&self) -> Option<Arc<crate::executor::diskstore::DiskStore>> {
+        self.disk_store.as_ref().map(Arc::clone)
+    }
+
+    /// Reload the active database's tables from disk into the in-memory map.
+    fn restore_current_db_from_disk(&self) -> Result<()> {
+        let Some(ds) = self.disk_store.as_ref() else { return Ok(()); };
+        let mut tables = self.tables.write();
+        tables.clear();
+        for tcat in ds.list_tables() {
+            let entries = ds.load_table_data(&tcat.name)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let index = Arc::new(BPlusTree::new(format!("{}_pk", tcat.name), 128));
+            for (k, v) in entries {
+                let _ = index.insert(k, v);
+            }
+            let mut sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>> = HashMap::new();
+            for c in &tcat.schema.columns {
+                if c.auto_increment {
+                    let start = tcat.sequences.iter()
+                        .find(|(n, _)| n == &c.name)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(1);
+                    sequences.insert(c.name.clone(), Arc::new(bytedb_core::tuple::schema::SequenceGenerator::new(start)));
+                }
+            }
+            // Best-effort register in catalog. Ignore duplicates.
+            let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
+            let _ = self.database.create_table(meta);
+            tables.insert(tcat.name.clone(), TableData {
+                schema: tcat.schema,
+                index,
+                version_store: Arc::new(VersionStore::new()),
+                check_exprs: Vec::new(),
+                sequences,
+            });
+        }
+        Ok(())
+    }
+
+    /// Stash the active database's tables and load `name`'s tables
+    /// (from in-memory cache or disk) into the active map.
+    fn switch_to_database(&self, name: &str) -> Result<()> {
+        let current = self.current_db.read().clone();
+        if current == name { return Ok(()); }
+
+        // Move current tables into the cache.
+        {
+            let mut tables = self.tables.write();
+            let mut cache = self.db_tables.write();
+            let snapshot = std::mem::take(&mut *tables);
+            cache.insert(current.clone(), snapshot);
+        }
+
+        // Try in-memory cache first.
+        let cached = self.db_tables.write().remove(name);
+        if let Some(map) = cached {
+            *self.tables.write() = map;
+        } else if let Some(ds) = &self.disk_store {
+            ds.switch_database(name)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            *self.current_db.write() = name.to_string();
+            self.restore_current_db_from_disk()?;
+            return Ok(());
+        }
+        *self.current_db.write() = name.to_string();
+        if let Some(ds) = &self.disk_store {
+            let _ = ds.switch_database(name);
+        }
+        Ok(())
+    }
+
+    fn flush_table_to_disk(&self, table: &str) {
+        let Some(ds) = self.disk_store.as_ref() else { return; };
+        let tables = self.tables.read();
+        let Some(td) = tables.get(table) else { return; };
+        if let Ok(entries) = td.index.scan_all() {
+            let _ = ds.flush_table_data(table, &entries);
+        }
+        let seqs: Vec<(String, i64)> = td.sequences.iter()
+            .map(|(c, s)| (c.clone(), s.counter.load(std::sync::atomic::Ordering::SeqCst)))
+            .collect();
+        if !seqs.is_empty() {
+            let _ = ds.flush_table_sequences(table, seqs);
         }
     }
 
@@ -223,16 +333,19 @@ impl QueryEngine {
                 })
             }
             Statement::Truncate(name) => {
-                let tables = self.tables.read();
-                let table_data = tables.get(&name)
-                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
-                let keys: Vec<Vec<u8>> = table_data.index.scan_all()
-                    .map_err(|e| QueryError::Execution(e.to_string()))?
-                    .into_iter().map(|(k, _)| k).collect();
-                for key in keys {
-                    table_data.index.delete(&key)
-                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                {
+                    let tables = self.tables.read();
+                    let table_data = tables.get(&name)
+                        .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                    let keys: Vec<Vec<u8>> = table_data.index.scan_all()
+                        .map_err(|e| QueryError::Execution(e.to_string()))?
+                        .into_iter().map(|(k, _)| k).collect();
+                    for key in keys {
+                        table_data.index.delete(&key)
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                    }
                 }
+                self.flush_table_to_disk(&name);
                 Ok(ExecutionResult::Ok(format!("TRUNCATE TABLE")))
             }
             Statement::KvGet(_) | Statement::KvSet(_, _) | Statement::KvDelete(_) | Statement::KvScan(_, _) => {
@@ -250,6 +363,10 @@ impl QueryEngine {
                     }
                     return Err(QueryError::Execution(format!("Database '{}' already exists", name)));
                 }
+                if let Some(ds) = &self.disk_store {
+                    ds.create_database(&name)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                }
                 dbs.insert(name.clone());
                 Ok(ExecutionResult::Ok(format!("Database {} created", name)))
             }
@@ -265,7 +382,12 @@ impl QueryEngine {
                     }
                     return Err(QueryError::Execution(format!("Database '{}' not found", name)));
                 }
+                if let Some(ds) = &self.disk_store {
+                    ds.drop_database(&name)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                }
                 dbs.remove(&name);
+                self.db_tables.write().remove(&name);
                 Ok(ExecutionResult::Ok(format!("Database {} dropped", name)))
             }
             Statement::UseDatabase(name) => {
@@ -274,7 +396,7 @@ impl QueryEngine {
                     return Err(QueryError::Execution(format!("Database '{}' not found", name)));
                 }
                 drop(dbs);
-                *self.current_db.write() = name.clone();
+                self.switch_to_database(&name)?;
                 Ok(ExecutionResult::Ok(format!("Now using database {}", name)))
             }
             Statement::ShowDatabases => {
@@ -296,13 +418,27 @@ impl QueryEngine {
                 })
             }
             Statement::Insert(ins) => {
-                self.exec_insert(&ins.table, ins.columns, ins.source, ins.on_conflict, ins.returning, txn_id)
+                let tname = ins.table.clone();
+                let r = self.exec_insert(&ins.table, ins.columns, ins.source, ins.on_conflict, ins.returning, txn_id);
+                if r.is_ok() { self.flush_table_to_disk(&tname); }
+                r
             }
             Statement::Update(upd) => {
-                self.exec_update(&upd.table, upd.assignments, upd.where_clause, upd.returning, txn_id)
+                let tname = upd.table.clone();
+                let r = self.exec_update(&upd.table, upd.assignments, upd.where_clause, upd.returning, txn_id);
+                if r.is_ok() { self.flush_table_to_disk(&tname); }
+                r
             }
             Statement::Delete(del) => {
-                self.exec_delete(&del.table, del.where_clause, del.returning, txn_id)
+                let tname = del.table.clone();
+                let r = self.exec_delete(&del.table, del.where_clause, del.returning, txn_id);
+                if r.is_ok() {
+                    // DELETE may have cascaded to other tables; flush all.
+                    let names: Vec<String> = self.tables.read().keys().cloned().collect();
+                    for n in names { self.flush_table_to_disk(&n); }
+                    let _ = tname;
+                }
+                r
             }
             Statement::Select(ref select) if !select.ctes.is_empty() || matches!(select.from, FromClause::Subquery(_)) => {
                 let ctes = select.ctes.clone();
@@ -496,13 +632,22 @@ impl QueryEngine {
             .map_err(|e| QueryError::Execution(e.to_string()))?;
 
         let table_data = TableData {
-            schema,
+            schema: schema.clone(),
             index: Arc::new(BPlusTree::new(format!("{}_pk", ct.name), 128)),
             version_store: Arc::new(VersionStore::new()),
             check_exprs: ct.check_constraints.clone(),
-            sequences,
+            sequences: sequences.clone(),
         };
         self.tables.write().insert(ct.name.clone(), table_data);
+
+        // Persist catalog + empty data file.
+        if let Some(ds) = &self.disk_store {
+            let seqs: Vec<(String, i64)> = sequences.iter()
+                .map(|(c, s)| (c.clone(), s.counter.load(std::sync::atomic::Ordering::SeqCst)))
+                .collect();
+            let _ = ds.upsert_table(&ct.name, table_id, &schema, seqs);
+            let _ = ds.flush_table_data(&ct.name, &[]);
+        }
 
         Ok(ExecutionResult::Ok(format!("Table {} created", ct.name)))
     }
@@ -511,6 +656,9 @@ impl QueryEngine {
         match self.database.drop_table(&dt.name) {
             Ok(_) => {
                 self.tables.write().remove(&dt.name);
+                if let Some(ds) = &self.disk_store {
+                    let _ = ds.drop_table(&dt.name);
+                }
                 Ok(ExecutionResult::Ok(format!("Table {} dropped", dt.name)))
             }
             Err(e) => {
@@ -3209,10 +3357,13 @@ impl QueryEngine {
                         } else { Value::Null }
                     }
                     "NOW" | "CURRENT_TIMESTAMP" => {
-                        Value::Text(chrono_now())
+                        Value::Timestamp(now_micros())
                     }
                     "CURRENT_DATE" => {
-                        Value::Text(chrono_date())
+                        Value::Date(today_days())
+                    }
+                    "CURRENT_TIME" => {
+                        Value::Text(chrono_now())
                     }
                     "EXTRACT" => {
                         if args.len() == 2 {
@@ -3561,6 +3712,21 @@ fn chrono_now() -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, time_secs / 3600, (time_secs % 3600) / 60, time_secs % 60)
 }
 
+fn now_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+fn today_days() -> i32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    (secs / 86400) as i32
+}
+
+#[allow(dead_code)]
 fn chrono_date() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();

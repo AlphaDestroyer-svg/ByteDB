@@ -1303,4 +1303,92 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
     }
+
+    #[test]
+    fn test_now_returns_native_timestamp() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE n (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("INSERT INTO n VALUES (1)", None).unwrap();
+        let r = engine.execute_sql("SELECT NOW(), CURRENT_DATE() FROM n", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                match &rows[0][0] {
+                    Value::Timestamp(_) => {}
+                    other => panic!("Expected Timestamp, got {:?}", other),
+                }
+                match &rows[0][1] {
+                    Value::Date(_) => {}
+                    other => panic!("Expected Date, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_disk_persistence_round_trip() {
+        use crate::executor::diskstore::DiskStore;
+        let dir = std::env::temp_dir().join(format!("bytedb_disk_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First boot — create a table, insert rows.
+        {
+            let mut engine = setup_engine();
+            let store = DiskStore::open(dir.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            engine.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)", None).unwrap();
+            engine.execute_sql("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')", None).unwrap();
+        }
+
+        // Second boot — same dir; rows must come back without snapshots.
+        {
+            let mut engine = setup_engine();
+            let store = DiskStore::open(dir.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            let r = engine.execute_sql("SELECT id, name FROM t ORDER BY id", None).unwrap();
+            match r {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0][0], Value::Int64(1));
+                    assert_eq!(rows[1][0], Value::Int64(2));
+                }
+                _ => panic!("Expected Rows"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_disk_create_drop_database() {
+        use crate::executor::diskstore::DiskStore;
+        let dir = std::env::temp_dir().join(format!("bytedb_dbsw_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut engine = setup_engine();
+        let store = DiskStore::open(dir.clone(), "test").unwrap();
+        engine.attach_disk_store(store);
+
+        engine.execute_sql("CREATE DATABASE shop", None).unwrap();
+        let r = engine.execute_sql("SHOW DATABASES", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                let names: Vec<String> = rows.into_iter()
+                    .map(|r| match &r[0] { Value::Text(s) => s.clone(), _ => String::new() })
+                    .collect();
+                assert!(names.contains(&"shop".to_string()));
+                assert!(names.contains(&"test".to_string()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        // The directory must exist on disk
+        assert!(dir.join("databases").join("shop").exists());
+
+        engine.execute_sql("DROP DATABASE shop", None).unwrap();
+        assert!(!dir.join("databases").join("shop").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

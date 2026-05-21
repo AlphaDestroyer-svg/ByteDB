@@ -66,7 +66,24 @@ impl Server {
 
         let database = Arc::new(Database::new("bytedb"));
         let txn_manager = Arc::new(TransactionManager::new());
-        let query_engine = Arc::new(QueryEngine::with_wal(database, txn_manager, log_manager));
+        let mut engine_owned = QueryEngine::with_wal(database, txn_manager, log_manager);
+
+        // Disk-backed store rooted at the data directory. Per-database
+        // directories live under <data_dir>/databases/<name>/.
+        match bytedb_query::executor::diskstore::DiskStore::open(
+            config.data_dir.clone(),
+            "bytedb",
+        ) {
+            Ok(ds) => {
+                engine_owned.attach_disk_store(ds);
+                info!("Disk store attached at {:?}", config.data_dir);
+            }
+            Err(e) => {
+                warn!("Failed to open disk store: {}. Continuing in-memory only.", e);
+            }
+        }
+
+        let query_engine = Arc::new(engine_owned);
 
         if let Ok(Some(snapshot)) = snapshot_manager.load_latest() {
             info!("Restoring from snapshot (LSN: {}, {} tables)", snapshot.header.lsn, snapshot.tables.len());
@@ -159,17 +176,23 @@ impl Server {
 
         let timeout_secs = self.config.connection_timeout_secs;
 
-        let snap_engine = Arc::clone(&self.query_engine);
-        let snap_manager = Arc::clone(&self.snapshot_manager);
         let snap_interval = self.snapshot_manager.interval();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(snap_interval);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                Self::create_snapshot(&snap_engine, &snap_manager);
-            }
-        });
+        let snapshots_disabled = self.config.no_snapshot || snap_interval.as_secs() == 0;
+        if snapshots_disabled {
+            info!("Background snapshots disabled (no_snapshot={}, interval_secs={})",
+                self.config.no_snapshot, snap_interval.as_secs());
+        } else {
+            let snap_engine = Arc::clone(&self.query_engine);
+            let snap_manager = Arc::clone(&self.snapshot_manager);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(snap_interval);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    Self::create_snapshot(&snap_engine, &snap_manager);
+                }
+            });
+        }
 
         loop {
             tokio::select! {
@@ -214,8 +237,12 @@ impl Server {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down gracefully...");
-                    Self::create_snapshot(&self.query_engine, &self.snapshot_manager);
-                    info!("Final snapshot saved. Goodbye.");
+                    if !self.config.no_shutdown_snapshot {
+                        Self::create_snapshot(&self.query_engine, &self.snapshot_manager);
+                        info!("Final snapshot saved. Goodbye.");
+                    } else {
+                        info!("Shutdown snapshot skipped (--no-shutdown-snapshot). Goodbye.");
+                    }
                     break;
                 }
             }

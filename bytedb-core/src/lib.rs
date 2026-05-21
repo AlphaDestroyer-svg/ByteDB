@@ -6,6 +6,7 @@ pub mod tuple;
 pub mod mvcc;
 pub mod catalog;
 pub mod snapshot;
+pub mod dbstore;
 pub mod error;
 
 #[cfg(test)]

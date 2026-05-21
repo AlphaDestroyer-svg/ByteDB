@@ -22,14 +22,24 @@ pub struct Config {
     #[arg(long, default_value_t = 300)]
     pub connection_timeout_secs: u64,
 
-    #[arg(long, default_value_t = 300)]
+    /// Snapshot interval in seconds. 0 disables time-based snapshotting.
+    #[arg(long, default_value_t = 1800)]
     pub snapshot_interval_secs: u64,
 
-    #[arg(long, default_value_t = 100000)]
+    /// Snapshot after this many writes. 0 disables write-count snapshots.
+    #[arg(long, default_value_t = 0)]
     pub snapshot_write_threshold: u64,
 
     #[arg(long, default_value = "binary")]
     pub snapshot_format: String,
+
+    /// Disable all background snapshots (one final snapshot still taken on Ctrl-C).
+    #[arg(long, default_value_t = false)]
+    pub no_snapshot: bool,
+
+    /// Skip the final snapshot on shutdown as well.
+    #[arg(long, default_value_t = false)]
+    pub no_shutdown_snapshot: bool,
 }
 
 impl Config {

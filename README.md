@@ -98,12 +98,20 @@ Supported actions: `RESTRICT` (default), `CASCADE`, `SET NULL`, `NO ACTION` (ali
 
 #### Multi-database
 
+Each database lives in its own directory under `<data-dir>/databases/<name>/` with its own catalog and table files.
+
 ```sql
 CREATE DATABASE analytics;
 USE analytics;
 SHOW DATABASES;
 DROP DATABASE analytics;
 ```
+
+`USE` swaps the active table set; `CREATE DATABASE` materializes the directory immediately; `DROP DATABASE` deletes it.
+
+#### Built-in date/time
+
+`NOW()`, `CURRENT_TIMESTAMP` → native `Timestamp` (microseconds since epoch). `CURRENT_DATE()` → native `Date`. Use them in `INSERT` / `WHERE` and the executor stores the typed value, not a formatted string.
 
 #### Transactions
 
@@ -153,15 +161,31 @@ ByteDB persists a database as a directory on disk. Pass `--data-dir <path>` to t
 
 ```
 <data-dir>/
+├── server.meta              # registry of all databases
+├── databases/
+│   └── <db-name>/
+│       ├── catalog.bin      # schemas, sequences, FK metadata
+│       └── tables/
+│           ├── users.tbl    # raw key/value pairs (binary)
+│           └── orders.tbl
 ├── bytedb.wal               # Write-Ahead Log (ARIES-style)
-└── snapshots/
-    ├── snapshot_0001.bin    # binary snapshot, monotonic id
-    ├── snapshot_0002.bin
-    └── ...
+└── snapshots/               # optional periodic full-state snapshots
+    └── snapshot_*.bin
 ```
 
-- **WAL** (`bytedb.wal`) - every `INSERT/UPDATE/DELETE/COMMIT/ROLLBACK` is appended here first. Used to redo committed and undo uncommitted work on restart.
-- **Snapshots** (`snapshots/`) - full materialized state of all tables, written periodically (`--snapshot-interval-secs`, default 300s) and after `--snapshot-write-threshold` writes (default 100000), and on graceful shutdown (Ctrl+C). On boot the latest snapshot is loaded, then WAL replay is applied on top.
+- **Per-table data files** (`databases/<db>/tables/<table>.tbl`) — every committed `INSERT/UPDATE/DELETE` rewrites the affected table file via atomic rename. **Schema and data are stored separately**: `catalog.bin` holds metadata, `*.tbl` holds rows. No periodic flush is needed — the file on disk is always up to date after each successful mutation.
+- **WAL** (`bytedb.wal`) — durability for in-flight transactions; redo committed / undo uncommitted on restart.
+- **Snapshots** (`snapshots/`) — optional full-state archives. Disabled by default (`--snapshot-write-threshold 0`); time-based snapshots default to every 30 min. To turn them off entirely use `--no-snapshot`. Set `--no-shutdown-snapshot` to skip the final snapshot on Ctrl+C.
+
+#### Tuning snapshots
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--snapshot-interval-secs N` | 1800 | Take a snapshot every N seconds. `0` disables. |
+| `--snapshot-write-threshold N` | 0 | Take a snapshot after N writes. `0` disables. |
+| `--no-snapshot` | off | Disable all background snapshots. |
+| `--no-shutdown-snapshot` | off | Skip final snapshot on Ctrl+C. |
+| `--snapshot-format binary\|json` | binary | Snapshot encoding. |
 
 #### Creating a physical database
 
@@ -332,12 +356,18 @@ CREATE TABLE child (
 
 #### Несколько баз данных
 
+Каждая база живёт в своей директории `<data-dir>/databases/<имя>/` со своим каталогом и файлами таблиц.
+
 ```sql
-CREATE DATABASE analytics;       -- создать новую БД
-USE analytics;                   -- переключиться на неё
+CREATE DATABASE analytics;       -- создать новую БД (создаётся директория на диске)
+USE analytics;                   -- переключиться на неё (меняется активный набор таблиц)
 SHOW DATABASES;                  -- список всех БД
-DROP DATABASE analytics;         -- удалить БД (нельзя удалить текущую)
+DROP DATABASE analytics;         -- удалить БД (нельзя удалить текущую или базу по умолчанию)
 ```
+
+#### Встроенные функции даты/времени
+
+`NOW()`, `CURRENT_TIMESTAMP` → нативный `Timestamp` (микросекунды от эпохи). `CURRENT_DATE()` → нативный `Date`. Используйте в `INSERT` / `WHERE` — executor сохранит типизированное значение, а не строку.
 
 #### Транзакции
 
@@ -387,15 +417,31 @@ ByteDB сохраняет базу как директорию на диске. 
 
 ```
 <data-dir>/
+├── server.meta              # реестр всех БД
+├── databases/
+│   └── <имя-бд>/
+│       ├── catalog.bin      # схемы, sequences, FK-метаданные
+│       └── tables/
+│           ├── users.tbl    # пары ключ/значение в бинарном формате
+│           └── orders.tbl
 ├── bytedb.wal               # Write-Ahead Log (в стиле ARIES)
-└── snapshots/
-    ├── snapshot_0001.bin    # бинарный снапшот, монотонный id
-    ├── snapshot_0002.bin
-    └── ...
+└── snapshots/               # опциональные периодические снапшоты
+    └── snapshot_*.bin
 ```
 
-- **WAL** (`bytedb.wal`) - каждый `INSERT/UPDATE/DELETE/COMMIT/ROLLBACK` сперва дописывается сюда. Используется для REDO зафиксированных и UNDO незафиксированных транзакций при рестарте.
-- **Snapshots** (`snapshots/`) - полное материализованное состояние всех таблиц, пишется периодически (`--snapshot-interval-secs`, по умолчанию 300с) и при достижении `--snapshot-write-threshold` записей (по умолчанию 100000), а также при штатной остановке (Ctrl+C). При старте загружается последний снапшот, поверх него проигрывается WAL.
+- **Файлы таблиц** (`databases/<db>/tables/<table>.tbl`) — каждый зафиксированный `INSERT/UPDATE/DELETE` атомарно перезаписывает файл соответствующей таблицы (через `rename`). **Схема и данные хранятся раздельно**: `catalog.bin` для метаданных, `*.tbl` для строк. Никаких периодических флашей не нужно — файл на диске всегда актуален после успешной мутации.
+- **WAL** (`bytedb.wal`) — durability для in-flight транзакций; на рестарте REDO/UNDO.
+- **Snapshots** (`snapshots/`) — опциональные архивы полного состояния. По умолчанию write-threshold отключён (`--snapshot-write-threshold 0`); по времени снапшоты пишутся раз в 30 минут. Чтобы выключить полностью — `--no-snapshot`. Чтобы пропустить финальный снапшот при Ctrl+C — `--no-shutdown-snapshot`.
+
+#### Настройка снапшотов
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--snapshot-interval-secs N` | 1800 | Снапшот каждые N секунд. `0` отключает. |
+| `--snapshot-write-threshold N` | 0 | Снапшот после N записей. `0` отключает. |
+| `--no-snapshot` | off | Полностью отключить фоновые снапшоты. |
+| `--no-shutdown-snapshot` | off | Не делать финальный снапшот на Ctrl+C. |
+| `--snapshot-format binary\|json` | binary | Формат снапшота. |
 
 #### Создание физической базы
 
