@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "bytedb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytedb-core",
  "bytedb-query",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "bytedb-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytedb-core",
  "bytes",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "bytedb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "bytedb-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytedb-core",
  "parking_lot",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "bytedb-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "bytedb-core",
