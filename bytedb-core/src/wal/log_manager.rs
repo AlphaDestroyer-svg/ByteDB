@@ -114,17 +114,18 @@ impl LogManager {
     }
 
     pub fn append(&self, record: LogRecord) -> Result<Lsn> {
-        let lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-        let prev_lsn = lsn.saturating_sub(1);
         let data = record.serialize();
         let len = data.len() as u32;
+
+        let mut writer = self.writer.lock();
+        let lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+        let prev_lsn = lsn.saturating_sub(1);
 
         let mut chained = Vec::with_capacity(8 + data.len());
         chained.extend_from_slice(&prev_lsn.to_le_bytes());
         chained.extend_from_slice(&data);
         let checksum = crc32fast::hash(&chained);
 
-        let mut writer = self.writer.lock();
         writer.write_all(&len.to_le_bytes())?;
         writer.write_all(&checksum.to_le_bytes())?;
         writer.write_all(&prev_lsn.to_le_bytes())?;
@@ -209,9 +210,11 @@ impl LogManager {
 
     pub fn read_all_records(&self) -> Result<Vec<(Lsn, LogRecord)>> {
         let mut file = File::open(&self.log_path)?;
+        let total_len = file.metadata()?.len();
         let mut records = Vec::new();
         let mut lsn: Lsn = 0;
         let mut expected_prev: Lsn = 0;
+        let mut last_good_offset: u64 = 0;
 
         loop {
             let mut header = [0u8; LOG_RECORD_HEADER_SIZE];
@@ -228,9 +231,16 @@ impl LogManager {
                 header[12], header[13], header[14], header[15],
             ]);
 
+            let cur_offset = last_good_offset;
+            let frame_end = cur_offset + LOG_RECORD_HEADER_SIZE as u64 + len as u64;
+
             let mut data = vec![0u8; len];
             if let Err(e) = file.read_exact(&mut data) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    if frame_end > total_len {
+                        Self::truncate_to(&self.log_path, last_good_offset)?;
+                        break;
+                    }
                     return Err(CoreError::WalCorrupted(lsn + 1));
                 }
                 return Err(CoreError::Io(e));
@@ -241,9 +251,17 @@ impl LogManager {
             chained.extend_from_slice(&data);
             let actual_checksum = crc32fast::hash(&chained);
             if actual_checksum != expected_checksum {
+                if frame_end >= total_len {
+                    Self::truncate_to(&self.log_path, last_good_offset)?;
+                    break;
+                }
                 return Err(CoreError::WalCorrupted(lsn + 1));
             }
             if prev_lsn != expected_prev {
+                if frame_end >= total_len {
+                    Self::truncate_to(&self.log_path, last_good_offset)?;
+                    break;
+                }
                 return Err(CoreError::WalCorrupted(lsn + 1));
             }
 
@@ -251,12 +269,25 @@ impl LogManager {
             expected_prev = lsn;
             if let Some(record) = LogRecord::deserialize(&data) {
                 records.push((lsn, record));
+                last_good_offset = frame_end;
             } else {
+                if frame_end == total_len || frame_end > total_len {
+                    Self::truncate_to(&self.log_path, last_good_offset)?;
+                    break;
+                }
                 return Err(CoreError::WalCorrupted(lsn));
             }
         }
 
         Ok(records)
+    }
+
+    fn truncate_to(path: &Path, offset: u64) -> Result<()> {
+        use std::fs::OpenOptions;
+        let f = OpenOptions::new().write(true).open(path)?;
+        f.set_len(offset)?;
+        f.sync_all()?;
+        Ok(())
     }
 
     fn count_records(path: &Path) -> Result<u64> {
@@ -401,6 +432,28 @@ mod group_commit_tests {
         lm.commit(lsn).unwrap();
         assert!(lm.fsync_count() >= 1, "strict mode must fsync");
         assert_eq!(lm.relaxed_acks(), 0);
+    }
+
+    #[test]
+    fn torn_tail_truncated_on_recovery() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("wal.log");
+        let lm = Arc::new(LogManager::new(&p).unwrap());
+        for _ in 0..3 {
+            append_commit(&lm);
+        }
+        lm.flush().unwrap();
+        drop(lm);
+
+        let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(&[0xAA, 0xBB, 0xCC]).unwrap();
+        drop(f);
+
+        let lm2 = LogManager::new(&p).unwrap();
+        let recs = lm2.read_all_records().expect("torn tail should not error");
+        assert_eq!(recs.len(), 3, "should recover 3 valid records and drop torn tail");
     }
 
     #[test]

@@ -440,6 +440,10 @@ impl QueryEngine {
         Ok(())
     }
 
+    pub fn wal_handle(&self) -> Option<Arc<LogManager>> {
+        self.wal.as_ref().map(Arc::clone)
+    }
+
     fn wal_append(&self, record: LogRecord) {
         if let Some(ref wal) = self.wal {
             let _ = wal.append(record);
