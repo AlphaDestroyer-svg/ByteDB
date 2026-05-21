@@ -55,7 +55,34 @@ impl Server {
             LogManager::new(&wal_path).expect("Failed to open WAL")
         );
 
-        match RecoveryManager::recover(&log_manager) {
+        let pitr_marker = config.data_dir.join("pitr_target.txt");
+        let pitr_target: Option<u64> = if pitr_marker.exists() {
+            match std::fs::read_to_string(&pitr_marker) {
+                Ok(s) => match s.trim().parse::<u64>() {
+                    Ok(lsn) => {
+                        info!("PITR target LSN={} detected, replaying up to that point", lsn);
+                        Some(lsn)
+                    }
+                    Err(e) => {
+                        warn!("Invalid pitr_target.txt contents: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to read pitr_target.txt: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let recovery_result = match pitr_target {
+            Some(lsn) => RecoveryManager::recover_to_lsn(&log_manager, lsn),
+            None => RecoveryManager::recover(&log_manager),
+        };
+
+        match recovery_result {
             Ok(result) => {
                 let redo_count = result.redo_records.len();
                 let undo_count = result.undo_records.len();
@@ -65,6 +92,12 @@ impl Server {
             }
             Err(e) => {
                 warn!("WAL recovery failed: {}", e);
+            }
+        }
+
+        if pitr_marker.exists() {
+            if let Err(e) = std::fs::remove_file(&pitr_marker) {
+                warn!("Failed to remove pitr_target.txt after replay: {}", e);
             }
         }
 

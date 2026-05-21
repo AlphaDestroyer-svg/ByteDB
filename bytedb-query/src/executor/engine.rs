@@ -548,6 +548,9 @@ impl QueryEngine {
                 Ok(ExecutionResult::Rows { columns: vec!["database".into()], rows })
             }
             Statement::Analyze(table) => self.exec_analyze(table.as_deref()),
+            Statement::Backup { path } => self.exec_backup(&path),
+            Statement::Restore { path, to_lsn } => self.exec_restore(&path, to_lsn),
+            Statement::Migrate => self.exec_migrate(),
             Statement::ShowStats(table) => self.exec_show_stats(table.as_deref()),
             Statement::Union(left, right, all) => self.exec_union(*left, *right, all, txn_id),
             Statement::Intersect(left, right, all) => self.exec_intersect(*left, *right, all, txn_id),
@@ -3802,6 +3805,60 @@ impl QueryEngine {
         }
 
         Ok(ExecutionResult::Ok(format!("ANALYZE {}", analyzed)))
+    }
+
+    fn exec_backup(&self, path: &str) -> Result<ExecutionResult> {
+        use bytedb_core::backup::Backup;
+        use bytedb_core::migration::STORAGE_FORMAT_VERSION;
+        let ds = self.disk_store.as_ref().ok_or_else(|| {
+            QueryError::Execution("BACKUP requires a disk-backed engine".into())
+        })?;
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            QueryError::Execution("BACKUP requires WAL".into())
+        })?;
+        let data_dir = ds.registry().root().to_path_buf();
+        let backup_dir = std::path::PathBuf::from(path);
+        let manifest = Backup::create(&data_dir, wal, &backup_dir, STORAGE_FORMAT_VERSION)
+            .map_err(|e| QueryError::Execution(format!("backup failed: {}", e)))?;
+        Ok(ExecutionResult::Ok(format!(
+            "BACKUP at LSN {} -> {}", manifest.backup_lsn, backup_dir.display()
+        )))
+    }
+
+    fn exec_restore(&self, path: &str, to_lsn: Option<u64>) -> Result<ExecutionResult> {
+        use bytedb_core::backup::Backup;
+        let ds = self.disk_store.as_ref().ok_or_else(|| {
+            QueryError::Execution("RESTORE requires a disk-backed engine".into())
+        })?;
+        let target = ds.registry().root().to_path_buf();
+        let backup_dir = std::path::PathBuf::from(path);
+        let manifest = Backup::restore_to(&backup_dir, &target)
+            .map_err(|e| QueryError::Execution(format!("restore failed: {}", e)))?;
+        if let Some(lsn) = to_lsn {
+            let marker = target.join("pitr_target.txt");
+            std::fs::write(&marker, lsn.to_string())
+                .map_err(|e| QueryError::Execution(format!("write pitr marker: {}", e)))?;
+        }
+        Ok(ExecutionResult::Ok(format!(
+            "RESTORE from {} (backup_lsn={}{}). Restart the server to load restored data.",
+            backup_dir.display(),
+            manifest.backup_lsn,
+            match to_lsn { Some(l) => format!(", PITR target LSN {}", l), None => String::new() },
+        )))
+    }
+
+    fn exec_migrate(&self) -> Result<ExecutionResult> {
+        use bytedb_core::migration::Migration;
+        let ds = self.disk_store.as_ref().ok_or_else(|| {
+            QueryError::Execution("MIGRATE requires a disk-backed engine".into())
+        })?;
+        let data_dir = ds.registry().root().to_path_buf();
+        let report = Migration::migrate_to_current(&data_dir)
+            .map_err(|e| QueryError::Execution(format!("migration failed: {}", e)))?;
+        Ok(ExecutionResult::Ok(format!(
+            "MIGRATE scanned {} files, migrated {}, backups {}",
+            report.scanned.len(), report.migrated.len(), report.backups.len()
+        )))
     }
 
     fn exec_show_stats(&self, table: Option<&str>) -> Result<ExecutionResult> {

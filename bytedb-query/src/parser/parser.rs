@@ -70,8 +70,35 @@ impl Parser {
                 };
                 Ok(Statement::Analyze(table))
             }
+            Token::Backup => self.parse_backup(),
+            Token::Restore => self.parse_restore(),
+            Token::Migrate => { self.advance(); Ok(Statement::Migrate) }
             _ => Err(QueryError::Parse(format!("Unexpected token: {:?}", self.current()))),
         }
+    }
+
+    fn parse_backup(&mut self) -> Result<Statement> {
+        self.expect(Token::Backup)?;
+        self.expect(Token::To)?;
+        let path = self.expect_string()?;
+        Ok(Statement::Backup { path })
+    }
+
+    fn parse_restore(&mut self) -> Result<Statement> {
+        self.expect(Token::Restore)?;
+        self.expect(Token::From)?;
+        let path = self.expect_string()?;
+        let to_lsn = if self.current() == &Token::To {
+            self.advance();
+            self.expect(Token::Lsn)?;
+            match self.current().clone() {
+                Token::IntLit(n) => { self.advance(); Some(n as u64) }
+                t => return Err(QueryError::Parse(format!("expected LSN integer, got {:?}", t))),
+            }
+        } else {
+            None
+        };
+        Ok(Statement::Restore { path, to_lsn })
     }
 
     fn parse_explain(&mut self) -> Result<Statement> {
@@ -795,14 +822,10 @@ impl Parser {
                 }
                 let old_name = self.expect_ident()?;
 
-                if let Token::Ident(s) = self.current().clone() {
-                    if s.to_uppercase() == "TO" {
-                        self.advance();
-                    } else {
-                        return Err(QueryError::Parse("Expected TO after column name in RENAME".into()));
-                    }
-                } else {
-                    return Err(QueryError::Parse("Expected TO after column name in RENAME".into()));
+                match self.current().clone() {
+                    Token::To => { self.advance(); }
+                    Token::Ident(s) if s.to_uppercase() == "TO" => { self.advance(); }
+                    _ => return Err(QueryError::Parse("Expected TO after column name in RENAME".into())),
                 }
                 let new_name = self.expect_ident()?;
                 AlterTableAction::RenameColumn { old_name, new_name }

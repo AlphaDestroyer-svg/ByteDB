@@ -10,6 +10,8 @@ pub mod dbstore;
 pub mod stats;
 pub mod workers;
 pub mod metrics;
+pub mod backup;
+pub mod migration;
 pub mod error;
 
 #[cfg(test)]

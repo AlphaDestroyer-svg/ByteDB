@@ -47,6 +47,10 @@ pub enum Statement {
     Analyze(Option<String>),
 
     ShowStats(Option<String>),
+
+    Backup { path: String },
+    Restore { path: String, to_lsn: Option<u64> },
+    Migrate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1555,6 +1555,142 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_restore_round_trip_via_sql() {
+        use crate::executor::diskstore::DiskStore;
+        use bytedb_core::wal::log_manager::LogManager;
+        let dir_a = std::env::temp_dir().join(format!("bytedb_bk_src_{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("bytedb_bk_dst_{}", std::process::id()));
+        let backup_dir = std::env::temp_dir().join(format!("bytedb_bk_pkg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        {
+            let db = Arc::new(Database::new("test"));
+            let txn = Arc::new(TransactionManager::new());
+            let wal = Arc::new(LogManager::new(&dir_a.join("bytedb.wal")).unwrap());
+            let mut engine = QueryEngine::with_wal(db, txn, wal);
+            let store = DiskStore::open(dir_a.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            engine.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)", None).unwrap();
+            engine.execute_sql("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')", None).unwrap();
+            let r = engine.execute_sql(&format!("BACKUP TO '{}'", backup_dir.display().to_string().replace('\\', "/")), None).unwrap();
+            match r {
+                ExecutionResult::Ok(msg) => assert!(msg.starts_with("BACKUP"), "got: {}", msg),
+                _ => panic!("Expected Ok"),
+            }
+        }
+
+        {
+            let db = Arc::new(Database::new("test"));
+            let txn = Arc::new(TransactionManager::new());
+            let wal = Arc::new(LogManager::new(&dir_b.join("bytedb.wal")).unwrap());
+            let mut engine = QueryEngine::with_wal(db, txn, wal);
+            let store = DiskStore::open(dir_b.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            let r = engine.execute_sql(&format!("RESTORE FROM '{}'", backup_dir.display().to_string().replace('\\', "/")), None).unwrap();
+            match r {
+                ExecutionResult::Ok(msg) => assert!(msg.starts_with("RESTORE"), "got: {}", msg),
+                _ => panic!("Expected Ok"),
+            }
+        }
+
+        {
+            let db = Arc::new(Database::new("test"));
+            let txn = Arc::new(TransactionManager::new());
+            let wal = Arc::new(LogManager::new(&dir_b.join("bytedb.wal")).unwrap());
+            let mut engine = QueryEngine::with_wal(db, txn, wal);
+            let store = DiskStore::open(dir_b.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            let r = engine.execute_sql("SELECT id, name FROM t ORDER BY id", None).unwrap();
+            match r {
+                ExecutionResult::Rows { rows, .. } => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0][0], Value::Int64(1));
+                    assert_eq!(rows[0][1], Value::Text("alice".into()));
+                    assert_eq!(rows[1][0], Value::Int64(2));
+                    assert_eq!(rows[1][1], Value::Text("bob".into()));
+                }
+                _ => panic!("Expected Rows"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn test_restore_with_pitr_writes_marker() {
+        use crate::executor::diskstore::DiskStore;
+        use bytedb_core::wal::log_manager::LogManager;
+        let dir_a = std::env::temp_dir().join(format!("bytedb_pitr_src_{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("bytedb_pitr_dst_{}", std::process::id()));
+        let backup_dir = std::env::temp_dir().join(format!("bytedb_pitr_pkg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        {
+            let db = Arc::new(Database::new("test"));
+            let txn = Arc::new(TransactionManager::new());
+            let wal = Arc::new(LogManager::new(&dir_a.join("bytedb.wal")).unwrap());
+            let mut engine = QueryEngine::with_wal(db, txn, wal);
+            let store = DiskStore::open(dir_a.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            engine.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", None).unwrap();
+            engine.execute_sql(&format!("BACKUP TO '{}'", backup_dir.display().to_string().replace('\\', "/")), None).unwrap();
+        }
+
+        {
+            let db = Arc::new(Database::new("test"));
+            let txn = Arc::new(TransactionManager::new());
+            let wal = Arc::new(LogManager::new(&dir_b.join("bytedb.wal")).unwrap());
+            let mut engine = QueryEngine::with_wal(db, txn, wal);
+            let store = DiskStore::open(dir_b.clone(), "test").unwrap();
+            engine.attach_disk_store(store);
+            engine.execute_sql(&format!("RESTORE FROM '{}' TO LSN 42", backup_dir.display().to_string().replace('\\', "/")), None).unwrap();
+        }
+
+        let marker = dir_b.join("pitr_target.txt");
+        assert!(marker.exists(), "pitr_target.txt should be written");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "42");
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn test_migrate_command_runs() {
+        use crate::executor::diskstore::DiskStore;
+        use bytedb_core::wal::log_manager::LogManager;
+        let dir = std::env::temp_dir().join(format!("bytedb_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db = Arc::new(Database::new("test"));
+        let txn = Arc::new(TransactionManager::new());
+        let wal = Arc::new(LogManager::new(&dir.join("bytedb.wal")).unwrap());
+        let mut engine = QueryEngine::with_wal(db, txn, wal);
+        let store = DiskStore::open(dir.clone(), "test").unwrap();
+        engine.attach_disk_store(store);
+        engine.execute_sql("CREATE TABLE t (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("INSERT INTO t VALUES (1)", None).unwrap();
+        let r = engine.execute_sql("MIGRATE", None).unwrap();
+        match r {
+            ExecutionResult::Ok(msg) => assert!(msg.starts_with("MIGRATE"), "got: {}", msg),
+            _ => panic!("Expected Ok"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_analyze_all_tables() {
         let engine = setup_engine();
         engine.execute_sql("CREATE TABLE a (id INT PRIMARY KEY)", None).unwrap();

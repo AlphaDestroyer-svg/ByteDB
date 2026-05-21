@@ -283,17 +283,23 @@ Snapshot restored successfully
 ByteDB server listening on 0.0.0.0:7654
 ```
 
-#### Backups
+#### Backups, restore, PITR
 
-A consistent snapshot is a single binary file. To back up:
+ByteDB has a built-in **online backup / restore / point-in-time recovery** path driven entirely by SQL. No `cp -r` of the live data dir, no stop-the-server-first dance.
 
-```bash
-# while server is running, force a snapshot:
-kill -INT $(pidof bytedb-server)   # graceful shutdown writes final snapshot
-cp -r /var/lib/bytedb /backup/bytedb-$(date +%F)
+```sql
+BACKUP TO '/var/backups/bytedb-2026-05-21';
+RESTORE FROM '/var/backups/bytedb-2026-05-21';
+RESTORE FROM '/var/backups/bytedb-2026-05-21' TO LSN 12345;
+MIGRATE;
 ```
 
-Restore = copy the directory back and start the server pointing at it.
+- **`BACKUP TO 'path'`** — hot backup. Flushes WAL to capture a `backup_lsn`, then atomically copies `bytedb.wal`, `snapshots/`, `databases/`, `server.meta` into the target directory (each file via `*.tmp` + rename, so a crashed backup leaves no half-written files). A `manifest.bin` (magic `BBKM`, version, `backup_lsn`, timestamp, source format version, CRC32) is written last — its presence is the only signal that the backup is valid. Safe to run while the server keeps serving traffic.
+- **`RESTORE FROM 'path'`** — restores a backup into the current data dir. Verifies the manifest CRC, copies all files back atomically. After it returns, **restart the server** to load the restored state.
+- **`RESTORE FROM 'path' TO LSN n`** — same as above, plus writes a `pitr_target.txt` marker into the data dir. On the next server start, recovery will replay only WAL records with `lsn ≤ n`, then delete the marker. Transactions whose `Begin` is included but whose `Commit` falls past the cutoff end up in the abort set (UNDO), exactly as they would on a clean crash at that point in time.
+- **`MIGRATE`** — scans the data dir for files written by an older `STORAGE_FORMAT_VERSION`, copies each to a `.v0.2.bak` sibling, and rewrites in place to the current version. Future versions are rejected with an error. Idempotent: a fully-current data dir is a no-op. The `.v0.2.bak` files are kept on disk so you can roll back manually if a newer reader misbehaves.
+
+All three commands require a disk-backed engine (i.e. the server, not a pure in-memory `QueryEngine`).
 
 #### Snapshot format
 
@@ -579,17 +585,23 @@ Snapshot restored successfully
 ByteDB server listening on 0.0.0.0:7654
 ```
 
-#### Бэкапы
+#### Бэкапы, восстановление, PITR
 
-Консистентный снапшот - это один бинарный файл. Чтобы сделать бэкап:
+В ByteDB встроен **онлайн backup / restore / point-in-time recovery**, целиком управляемый SQL. Никакого `cp -r` живой директории и остановки сервера.
 
-```bash
-# при работающем сервере - принудительно записать снапшот:
-kill -INT $(pidof bytedb-server)   # graceful shutdown пишет финальный снапшот
-cp -r /var/lib/bytedb /backup/bytedb-$(date +%F)
+```sql
+BACKUP TO '/var/backups/bytedb-2026-05-21';
+RESTORE FROM '/var/backups/bytedb-2026-05-21';
+RESTORE FROM '/var/backups/bytedb-2026-05-21' TO LSN 12345;
+MIGRATE;
 ```
 
-Восстановление = скопировать директорию обратно и запустить сервер с указанием на неё.
+- **`BACKUP TO 'path'`** — горячий бэкап. Делает flush WAL, чтобы зафиксировать `backup_lsn`, затем атомарно копирует `bytedb.wal`, `snapshots/`, `databases/`, `server.meta` в целевую директорию (каждый файл через `*.tmp` + rename, так что падение посреди бэкапа не оставляет полу-записанных файлов). В конце пишется `manifest.bin` (magic `BBKM`, версия, `backup_lsn`, timestamp, исходная версия формата, CRC32) — его наличие и есть единственный признак валидного бэкапа. Безопасно запускать на работающем сервере, не прерывая трафик.
+- **`RESTORE FROM 'path'`** — восстанавливает бэкап в текущую data dir. Проверяет CRC манифеста, атомарно копирует все файлы обратно. После завершения — **перезапустите сервер**, чтобы он подхватил восстановленное состояние.
+- **`RESTORE FROM 'path' TO LSN n`** — то же самое, плюс пишет в data dir файл-маркер `pitr_target.txt`. На следующем старте сервера recovery проиграет только записи WAL с `lsn ≤ n`, после чего маркер удаляется. Транзакции, чей `Begin` попал внутрь окна, но чей `Commit` оказался за границей, уходят в UNDO — ровно как при честном падении в этой точке времени.
+- **`MIGRATE`** — сканирует data dir на файлы старой `STORAGE_FORMAT_VERSION`, копирует каждый в `.v0.2.bak` рядом и переписывает в текущую версию. Файлы из будущего отвергаются с ошибкой. Идемпотентно: полностью свежая data dir — no-op. `.v0.2.bak` остаются на диске, чтобы вручную откатиться, если новый ридер вдруг поведёт себя некорректно.
+
+Все три команды требуют disk-backed движка (т.е. сервер, не чистый in-memory `QueryEngine`).
 
 #### Формат снапшота
 
