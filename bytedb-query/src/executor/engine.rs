@@ -75,9 +75,9 @@ pub enum ExecutionResult {
 pub struct QueryEngine {
     database: Arc<Database>,
     txn_manager: Arc<TransactionManager>,
-    tables: Arc<parking_lot::RwLock<HashMap<String, TableData>>>,
+    tables: Arc<parking_lot::RwLock<HashMap<String, Arc<TableData>>>>,
 
-    db_tables: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, TableData>>>>,
+    db_tables: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, Arc<TableData>>>>>,
     wal: Option<Arc<LogManager>>,
     stmt_cache: parking_lot::Mutex<StmtCache>,
 
@@ -124,16 +124,18 @@ impl TableData {
             let base = self.index.scan_all()
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
             let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(base.len());
-            for (k, v) in base {
-                match resolved.get(&k) {
-                    None => out.push((k, v)),
+            let mut seen_keys: std::collections::HashSet<&[u8], ahash::RandomState> = std::collections::HashSet::with_capacity_and_hasher(base.len(), ahash::RandomState::new());
+            for (k, v) in &base {
+                seen_keys.insert(k.as_slice());
+                match resolved.get(k.as_slice()) {
+                    None => out.push((k.clone(), v.clone())),
                     Some(None) => {}
-                    Some(Some(t)) => out.push((k, t.serialize())),
+                    Some(Some(t)) => out.push((k.clone(), t.serialize())),
                 }
             }
             for (k, opt) in &resolved {
                 if let Some(t) = opt {
-                    if self.index.search(k).map_err(|e| QueryError::Execution(e.to_string()))?.is_none() {
+                    if !seen_keys.contains(k.as_slice()) {
                         out.push((k.clone(), t.serialize()));
                     }
                 }
@@ -249,13 +251,13 @@ impl QueryEngine {
 
             let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
             let _ = self.database.create_table(meta);
-            tables.insert(tcat.name.clone(), TableData {
+            tables.insert(tcat.name.clone(), Arc::new(TableData {
                 schema: tcat.schema,
                 index,
                 version_store: Arc::new(VersionStore::new()),
                 check_exprs: Vec::new(),
                 sequences,
-            });
+            }));
         }
         Ok(())
     }
@@ -878,7 +880,7 @@ impl QueryEngine {
             check_exprs: ct.check_constraints.clone(),
             sequences: sequences.clone(),
         };
-        self.tables.write().insert(ct.name.clone(), table_data);
+        self.tables.write().insert(ct.name.clone(), Arc::new(table_data));
 
         if let Some(ds) = &self.disk_store {
             let seqs: Vec<(String, i64)> = sequences.iter()
@@ -932,7 +934,14 @@ impl QueryEngine {
 
                 let mut columns = table_data.schema.columns.clone();
                 columns.push(col);
-                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+                let new_td = TableData {
+                    schema: Schema::new(table_data.schema.table_name.clone(), columns),
+                    index: Arc::clone(&table_data.index),
+                    version_store: Arc::clone(&table_data.version_store),
+                    check_exprs: table_data.check_exprs.clone(),
+                    sequences: table_data.sequences.clone(),
+                };
+                *table_data = Arc::new(new_td);
 
                 Ok(ExecutionResult::Ok(format!("Column '{}' added", col_def.name)))
             }
@@ -947,7 +956,14 @@ impl QueryEngine {
 
                 let mut columns = table_data.schema.columns.clone();
                 columns.remove(idx);
-                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+                let new_td = TableData {
+                    schema: Schema::new(table_data.schema.table_name.clone(), columns),
+                    index: Arc::clone(&table_data.index),
+                    version_store: Arc::clone(&table_data.version_store),
+                    check_exprs: table_data.check_exprs.clone(),
+                    sequences: table_data.sequences.clone(),
+                };
+                *table_data = Arc::new(new_td);
 
                 Ok(ExecutionResult::Ok(format!("Column '{}' dropped", col_name)))
             }
@@ -957,7 +973,14 @@ impl QueryEngine {
 
                 let mut columns = table_data.schema.columns.clone();
                 columns[idx].name = new_name.clone();
-                table_data.schema = Schema::new(table_data.schema.table_name.clone(), columns);
+                let new_td = TableData {
+                    schema: Schema::new(table_data.schema.table_name.clone(), columns),
+                    index: Arc::clone(&table_data.index),
+                    version_store: Arc::clone(&table_data.version_store),
+                    check_exprs: table_data.check_exprs.clone(),
+                    sequences: table_data.sequences.clone(),
+                };
+                *table_data = Arc::new(new_td);
 
                 Ok(ExecutionResult::Ok(format!("Column '{}' renamed to '{}'", old_name, new_name)))
             }
@@ -1058,9 +1081,12 @@ impl QueryEngine {
     fn exec_insert(&self, table: &str, columns: Option<Vec<String>>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
         let rows_to_insert: Vec<Vec<Value>> = match source {
             InsertSource::Values(values) => {
-                let tables = self.tables.read();
-                let table_data = tables.get(table)
-                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+                let table_data = {
+                    let tables = self.tables.read();
+                    tables.get(table)
+                        .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                        .clone()
+                };
                 let num_cols = table_data.schema.columns.len();
 
                 let col_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
@@ -1099,9 +1125,12 @@ impl QueryEngine {
             }
         };
 
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                .clone()
+        };
 
         let table_id = table_data.schema.columns.len() as u32;
         let pk_cols = table_data.schema.primary_key_columns();
@@ -1200,6 +1229,7 @@ impl QueryEngine {
                     }
                 }
                 if any_null { continue; }
+                let tables = self.tables.read();
                 let parent = tables.get(&fk.ref_table)
                     .ok_or_else(|| QueryError::Execution(format!("Foreign key references unknown table '{}'", fk.ref_table)))?;
                 let parent_idxs: Vec<usize> = fk.ref_columns.iter()
@@ -1284,9 +1314,12 @@ impl QueryEngine {
     }
 
     fn exec_update(&self, table: &str, assignments: Vec<(String, Expr)>, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                .clone()
+        };
 
         let table_id = table_data.schema.columns.len() as u32;
 
@@ -1369,6 +1402,7 @@ impl QueryEngine {
                             }
                         }
                         if any_null { continue; }
+                        let tables = self.tables.read();
                         let parent = tables.get(&fk.ref_table)
                             .ok_or_else(|| QueryError::Execution(format!("FK references unknown table '{}'", fk.ref_table)))?;
                         let parent_idxs: Vec<usize> = fk.ref_columns.iter()
@@ -1435,9 +1469,12 @@ impl QueryEngine {
     }
 
     fn exec_delete(&self, table: &str, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                .clone()
+        };
 
         let table_id = table_data.schema.columns.len() as u32;
 
@@ -1464,6 +1501,7 @@ impl QueryEngine {
                 if matches {
 
                     let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
+                    let tables = self.tables.read();
                     for (other_name, other_td) in tables.iter() {
                         if other_name == table { continue; }
                         for fk in &other_td.schema.foreign_keys {
@@ -1640,7 +1678,7 @@ impl QueryEngine {
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
         }
 
-        self.tables.write().insert(name.to_string(), table_data);
+        self.tables.write().insert(name.to_string(), Arc::new(table_data));
         Ok(())
     }
 
@@ -1694,9 +1732,12 @@ impl QueryEngine {
             return self.exec_information_schema_columns(filter);
         }
 
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                .clone()
+        };
 
         let col_names: Vec<String> = table_data.schema.columns.iter()
             .map(|c| c.name.clone())
@@ -4142,7 +4183,7 @@ impl QueryEngine {
         &self.database
     }
 
-    pub fn tables(&self) -> &parking_lot::RwLock<HashMap<String, TableData>> {
+    pub fn tables(&self) -> &parking_lot::RwLock<HashMap<String, Arc<TableData>>> {
         &self.tables
     }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use ahash::RandomState;
 
@@ -20,6 +21,7 @@ pub struct VersionedTuple {
 
 pub struct VersionStore {
     shards: Vec<RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>>>,
+    approx_keys: AtomicUsize,
 }
 
 impl VersionStore {
@@ -28,7 +30,11 @@ impl VersionStore {
         for _ in 0..SHARD_COUNT {
             shards.push(RwLock::new(HashMap::new()));
         }
-        VersionStore { shards }
+        VersionStore { shards, approx_keys: AtomicUsize::new(0) }
+    }
+
+    pub fn is_empty_fast(&self) -> bool {
+        self.approx_keys.load(Ordering::Relaxed) == 0
     }
 
     fn shard_index(key: &[u8]) -> usize {
@@ -50,7 +56,11 @@ impl VersionStore {
             deleted_ts: None,
         };
         let mut shard = self.shard_for(&key).write();
+        let was_empty = !shard.contains_key(&key);
         shard.entry(key).or_insert_with(Vec::new).push(versioned);
+        if was_empty {
+            self.approx_keys.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp) -> bool {
@@ -100,6 +110,7 @@ impl VersionStore {
 
     pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
         let mut shard = self.shard_for(&key).write();
+        let was_empty_chain = !shard.contains_key(&key);
         let chain = shard.entry(key).or_insert_with(Vec::new);
         if let Some(latest) = chain.last() {
             if let Some(deleter) = latest.deleted_by {
@@ -126,6 +137,9 @@ impl VersionStore {
             created_ts: ts,
             deleted_ts: None,
         });
+        if was_empty_chain {
+            self.approx_keys.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -229,6 +243,9 @@ impl VersionStore {
                 }
             });
         }
+        if keys_removed > 0 {
+            self.approx_keys.fetch_sub(keys_removed as usize, Ordering::Relaxed);
+        }
         GcStats {
             versions_removed,
             keys_removed,
@@ -236,7 +253,7 @@ impl VersionStore {
     }
 
     pub fn key_count(&self) -> usize {
-        self.shards.iter().map(|s| s.read().len()).sum()
+        self.approx_keys.load(Ordering::Relaxed)
     }
 
     pub fn total_versions(&self) -> usize {

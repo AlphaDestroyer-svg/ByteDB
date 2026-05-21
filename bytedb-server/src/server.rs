@@ -182,13 +182,13 @@ impl Server {
             }
             let meta = TableMeta::new(table_snap.name.clone(), schema.clone(), table_snap.table_id);
             let _ = engine.database().create_table(meta);
-            tables.insert(table_snap.name.clone(), TableData {
+            tables.insert(table_snap.name.clone(), Arc::new(TableData {
                 schema,
                 index,
                 version_store: Arc::new(VersionStore::new()),
                 check_exprs: Vec::new(),
                 sequences,
-            });
+            }));
         }
     }
 

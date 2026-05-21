@@ -153,6 +153,7 @@ dependencies = [
 name = "bytedb-query"
 version = "0.2.0"
 dependencies = [
+ "ahash",
  "bytedb-core",
  "parking_lot",
  "serde",
