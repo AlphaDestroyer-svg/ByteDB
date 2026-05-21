@@ -14,6 +14,8 @@ use bytedb_core::tuple::value::{DataType, Value};
 use bytedb_core::wal::log_manager::LogManager;
 use bytedb_core::wal::log_record::LogRecord;
 
+use bytedb_core::stats::{compute_table_stats, TableStats, DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_MCV_COUNT};
+
 use crate::error::{QueryError, Result};
 use crate::executor::batch::{SelectionVector, deserialize_batch};
 use crate::parser::ast::*;
@@ -81,6 +83,10 @@ pub struct QueryEngine {
     databases: Arc<parking_lot::RwLock<std::collections::HashSet<String>>>,
     current_db: Arc<parking_lot::RwLock<String>>,
     disk_store: Option<Arc<crate::executor::diskstore::DiskStore>>,
+    /// Per-table statistics, populated by `ANALYZE`. Cleared lazily when
+    /// the table is dropped or altered. Keyed by table name in the active
+    /// database.
+    stats: Arc<parking_lot::RwLock<HashMap<String, TableStats>>>,
 }
 
 pub struct TableData {
@@ -106,6 +112,7 @@ impl QueryEngine {
             databases: Arc::new(parking_lot::RwLock::new(dbs)),
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
+            stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -123,6 +130,7 @@ impl QueryEngine {
             databases: Arc::new(parking_lot::RwLock::new(dbs)),
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
+            stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -406,6 +414,8 @@ impl QueryEngine {
                 let rows: Vec<Vec<Value>> = names.into_iter().map(|n| vec![Value::Text(n)]).collect();
                 Ok(ExecutionResult::Rows { columns: vec!["database".into()], rows })
             }
+            Statement::Analyze(table) => self.exec_analyze(table.as_deref()),
+            Statement::ShowStats(table) => self.exec_show_stats(table.as_deref()),
             Statement::Union(left, right, all) => self.exec_union(*left, *right, all, txn_id),
             Statement::Intersect(left, right, all) => self.exec_intersect(*left, *right, all, txn_id),
             Statement::Except(left, right, all) => self.exec_except(*left, *right, all, txn_id),
@@ -656,6 +666,7 @@ impl QueryEngine {
         match self.database.drop_table(&dt.name) {
             Ok(_) => {
                 self.tables.write().remove(&dt.name);
+                self.stats.write().remove(&dt.name);
                 if let Some(ds) = &self.disk_store {
                     let _ = ds.drop_table(&dt.name);
                 }
@@ -3564,6 +3575,104 @@ impl QueryEngine {
 
     pub fn txn_manager(&self) -> &TransactionManager {
         &self.txn_manager
+    }
+
+    /// Per-table statistics map. Populated by `ANALYZE`; consulted by
+    /// the cost model in stage 7+.
+    pub fn stats(&self) -> &parking_lot::RwLock<HashMap<String, TableStats>> {
+        &self.stats
+    }
+
+    fn collect_table_rows(&self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let tables = self.tables.read();
+        let td = tables.get(table)
+            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let col_names: Vec<String> = td.schema.columns.iter().map(|c| c.name.clone()).collect();
+        let entries = td.index.scan_all()
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(entries.len());
+        for (_, data) in entries {
+            if let Some(t) = Tuple::deserialize(&data) {
+                rows.push(t.values.to_vec());
+            }
+        }
+        Ok((col_names, rows))
+    }
+
+    fn exec_analyze(&self, table: Option<&str>) -> Result<ExecutionResult> {
+        let target_tables: Vec<String> = if let Some(t) = table {
+            if !self.tables.read().contains_key(t) {
+                return Err(QueryError::Execution(format!("Table '{}' not found", t)));
+            }
+            vec![t.to_string()]
+        } else {
+            self.tables.read().keys().cloned().collect()
+        };
+
+        let mut analyzed = 0u64;
+        for name in &target_tables {
+            let (col_names, rows) = self.collect_table_rows(name)?;
+            let s = compute_table_stats(
+                name.clone(),
+                &col_names,
+                rows,
+                DEFAULT_MCV_COUNT,
+                DEFAULT_HISTOGRAM_BUCKETS,
+            );
+            self.stats.write().insert(name.clone(), s);
+            analyzed += 1;
+        }
+
+        Ok(ExecutionResult::Ok(format!("ANALYZE {}", analyzed)))
+    }
+
+    fn exec_show_stats(&self, table: Option<&str>) -> Result<ExecutionResult> {
+        let columns = vec![
+            "table".to_string(),
+            "row_count".to_string(),
+            "column".to_string(),
+            "null_fraction".to_string(),
+            "ndv".to_string(),
+            "mcv_count".to_string(),
+            "histogram_buckets".to_string(),
+            "computed_at_secs".to_string(),
+        ];
+
+        let stats = self.stats.read();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let names: Vec<String> = if let Some(t) = table {
+            if !stats.contains_key(t) {
+                return Ok(ExecutionResult::Rows { columns, rows });
+            }
+            vec![t.to_string()]
+        } else {
+            let mut all: Vec<String> = stats.keys().cloned().collect();
+            all.sort();
+            all
+        };
+
+        for tname in &names {
+            let Some(ts) = stats.get(tname) else { continue; };
+            for col in &ts.columns {
+                let buckets = if col.bucket_bounds.is_empty() {
+                    0
+                } else {
+                    (col.bucket_bounds.len() - 1) as i64
+                };
+                rows.push(vec![
+                    Value::Text(ts.table.clone()),
+                    Value::Int64(ts.row_count as i64),
+                    Value::Text(col.column.clone()),
+                    Value::Float64(col.null_fraction),
+                    Value::Int64(col.ndv as i64),
+                    Value::Int64(col.mcv.len() as i64),
+                    Value::Int64(buckets),
+                    Value::Int64(ts.computed_at_secs as i64),
+                ]);
+            }
+        }
+
+        Ok(ExecutionResult::Rows { columns, rows })
     }
 
     pub fn txn_manager_arc(&self) -> Arc<TransactionManager> {

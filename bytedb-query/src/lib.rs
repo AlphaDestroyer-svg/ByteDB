@@ -1391,4 +1391,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_analyze_populates_stats() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, n INT)", None).unwrap();
+        for i in 1..=20 {
+            let cat = if i % 3 == 0 { "a" } else if i % 3 == 1 { "b" } else { "c" };
+            engine.execute_sql(&format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i), None).unwrap();
+        }
+
+        let r = engine.execute_sql("ANALYZE t", None).unwrap();
+        match r {
+            ExecutionResult::Ok(msg) => assert!(msg.contains("ANALYZE")),
+            _ => panic!("Expected Ok"),
+        }
+
+        let stats = engine.stats().read();
+        let ts = stats.get("t").expect("stats for 't'");
+        assert_eq!(ts.row_count, 20);
+        assert_eq!(ts.columns.len(), 3);
+        let cat_stats = ts.column("cat").expect("col 'cat'");
+        assert_eq!(cat_stats.ndv, 3);
+        assert!(!cat_stats.mcv.is_empty());
+        let n_stats = ts.column("n").expect("col 'n'");
+        assert_eq!(n_stats.ndv, 20);
+        drop(stats);
+
+        let r = engine.execute_sql("SHOW STATS FOR t", None).unwrap();
+        match r {
+            ExecutionResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"ndv".to_string()));
+                assert_eq!(rows.len(), 3, "one row per analyzed column");
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_all_tables() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE a (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("CREATE TABLE b (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("INSERT INTO a VALUES (1), (2)", None).unwrap();
+        engine.execute_sql("INSERT INTO b VALUES (1), (2), (3)", None).unwrap();
+
+        engine.execute_sql("ANALYZE", None).unwrap();
+        let stats = engine.stats().read();
+        assert!(stats.contains_key("a"));
+        assert!(stats.contains_key("b"));
+        assert_eq!(stats.get("a").unwrap().row_count, 2);
+        assert_eq!(stats.get("b").unwrap().row_count, 3);
+    }
 }

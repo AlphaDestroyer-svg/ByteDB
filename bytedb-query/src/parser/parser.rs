@@ -56,6 +56,20 @@ impl Parser {
                 let name = self.expect_ident()?;
                 Ok(Statement::UseDatabase(name))
             }
+            Token::Analyze => {
+                self.advance();
+                // Optional `TABLE` keyword
+                if let Token::Ident(s) = self.current() {
+                    if s.eq_ignore_ascii_case("TABLE") {
+                        self.advance();
+                    }
+                }
+                let table = match self.current() {
+                    Token::Ident(_) => Some(self.expect_ident()?),
+                    _ => None,
+                };
+                Ok(Statement::Analyze(table))
+            }
             _ => Err(QueryError::Parse(format!("Unexpected token: {:?}", self.current()))),
         }
     }
@@ -862,7 +876,22 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowDatabases)
             }
-            _ => Err(QueryError::Parse("Expected TABLES, COLUMNS, CREATE, or DATABASES after SHOW".into())),
+            Token::Ident(ref s) if s.eq_ignore_ascii_case("STATS") => {
+                self.advance();
+                // Optional `FOR <table>`
+                let table = if let Token::Ident(kw) = self.current() {
+                    if kw.eq_ignore_ascii_case("FOR") {
+                        self.advance();
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(Statement::ShowStats(table))
+            }
+            _ => Err(QueryError::Parse("Expected TABLES, COLUMNS, CREATE, DATABASES, or STATS after SHOW".into())),
         }
     }
 

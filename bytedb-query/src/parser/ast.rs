@@ -43,6 +43,12 @@ pub enum Statement {
     DropDatabase { name: String, if_exists: bool },
     UseDatabase(String),
     ShowDatabases,
+    /// `ANALYZE [TABLE] <name>` — recompute statistics for one table.
+    /// `ANALYZE` (no name) recomputes for every table in the current db.
+    Analyze(Option<String>),
+    /// `SHOW STATS [FOR <table>]` — print stored stats. With no table
+    /// argument, prints stats for every table.
+    ShowStats(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

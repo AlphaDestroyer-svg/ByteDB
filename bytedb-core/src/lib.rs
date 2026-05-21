@@ -7,6 +7,7 @@ pub mod mvcc;
 pub mod catalog;
 pub mod snapshot;
 pub mod dbstore;
+pub mod stats;
 pub mod workers;
 pub mod error;
 
