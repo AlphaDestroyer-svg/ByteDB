@@ -18,6 +18,7 @@ use bytedb_core::stats::{compute_table_stats, TableStats, DEFAULT_HISTOGRAM_BUCK
 
 use crate::error::{QueryError, Result};
 use crate::executor::batch::{SelectionVector, deserialize_batch};
+use crate::executor::context::QueryContext;
 use crate::parser::ast::*;
 use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
@@ -84,6 +85,8 @@ pub struct QueryEngine {
     disk_store: Option<Arc<crate::executor::diskstore::DiskStore>>,
 
     stats: Arc<parking_lot::RwLock<HashMap<String, TableStats>>>,
+
+    active_ctx: parking_lot::RwLock<Option<Arc<QueryContext>>>,
 }
 
 pub struct TableData {
@@ -110,6 +113,7 @@ impl QueryEngine {
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            active_ctx: parking_lot::RwLock::new(None),
         }
     }
 
@@ -128,6 +132,7 @@ impl QueryEngine {
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            active_ctx: parking_lot::RwLock::new(None),
         }
     }
 
@@ -241,6 +246,77 @@ impl QueryEngine {
             s
         };
         self.execute(stmt, txn_id)
+    }
+
+    pub fn execute_sql_with_ctx(
+        &self,
+        sql: &str,
+        txn_id: Option<TxnId>,
+        ctx: Arc<QueryContext>,
+    ) -> Result<ExecutionResult> {
+        self.set_active_ctx(Some(ctx.clone()));
+        let res = self.execute_sql(sql, txn_id);
+        self.set_active_ctx(None);
+        if let Err(_) = ctx.check() {
+            return ctx.check().map(|_| unreachable!());
+        }
+        res
+    }
+
+    pub fn execute_with_ctx(
+        &self,
+        stmt: Statement,
+        txn_id: Option<TxnId>,
+        ctx: Arc<QueryContext>,
+    ) -> Result<ExecutionResult> {
+        self.set_active_ctx(Some(ctx.clone()));
+        let res = self.execute(stmt, txn_id);
+        self.set_active_ctx(None);
+        if let Err(_) = ctx.check() {
+            return ctx.check().map(|_| unreachable!());
+        }
+        res
+    }
+
+    fn set_active_ctx(&self, ctx: Option<Arc<QueryContext>>) {
+        *self.active_ctx.write() = ctx;
+    }
+
+    pub fn active_ctx(&self) -> Option<Arc<QueryContext>> {
+        self.active_ctx.read().as_ref().map(Arc::clone)
+    }
+
+    fn poll_ctx(&self) -> Result<()> {
+        if let Some(ctx) = self.active_ctx.read().as_ref() {
+            ctx.check()?;
+        }
+        Ok(())
+    }
+
+    fn account_scan_row(&self) -> Result<()> {
+        if let Some(ctx) = self.active_ctx.read().as_ref() {
+            ctx.account_scan_row()?;
+            let usage = ctx.usage();
+            if usage.scan_rows % 1024 == 0 {
+                ctx.check()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn account_memory(&self, bytes: u64) -> Result<()> {
+        if let Some(ctx) = self.active_ctx.read().as_ref() {
+            ctx.account_memory(bytes)?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn account_temp_spill(&self, bytes: u64) -> Result<()> {
+        if let Some(ctx) = self.active_ctx.read().as_ref() {
+            ctx.account_temp_spill(bytes)?;
+        }
+        Ok(())
     }
 
     fn wal_append(&self, record: LogRecord) {
@@ -1461,6 +1537,7 @@ impl QueryEngine {
                 &snapshot.active_txns,
             );
             for (_key, tuple) in visible {
+                self.account_scan_row()?;
                 let matches = if let Some(f) = filter {
                     self.eval_predicate(f, &tuple, &table_data.schema)
                 } else {
@@ -1483,6 +1560,7 @@ impl QueryEngine {
             let schema = &table_data.schema;
             let scan_limit = limit;
             let fast_filter = filter.and_then(|f| self.try_fast_filter(f, schema));
+            let scan_err: std::cell::RefCell<Option<QueryError>> = std::cell::RefCell::new(None);
             if let Some((col_idx, op, ref lit_val)) = fast_filter {
                 let op_code: u8 = match op {
                     BinOp::Eq => 0,
@@ -1494,6 +1572,10 @@ impl QueryEngine {
                     _ => 255,
                 };
                 table_data.index.for_each(|_key, data| {
+                    if let Err(e) = self.account_scan_row() {
+                        *scan_err.borrow_mut() = Some(e);
+                        return false;
+                    }
                     match raw_filter_matches(data, col_idx, op_code, lit_val) {
                         Some(true) => {
                             if let Some(tuple) = Tuple::deserialize(data) {
@@ -1504,15 +1586,16 @@ impl QueryEngine {
                             }
                         }
                         Some(false) => {}
-                        None => {
-
-                        }
+                        None => {}
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
-
                 table_data.index.for_each(|_key, data| {
+                    if let Err(e) = self.account_scan_row() {
+                        *scan_err.borrow_mut() = Some(e);
+                        return false;
+                    }
                     if let Some(tuple) = Tuple::deserialize(data) {
                         rows.push(tuple.values);
                     }
@@ -1520,6 +1603,10 @@ impl QueryEngine {
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else {
                 table_data.index.for_each(|_key, data| {
+                    if let Err(e) = self.account_scan_row() {
+                        *scan_err.borrow_mut() = Some(e);
+                        return false;
+                    }
                     let tuple = if let Some(nc) = needed_columns {
                         Tuple::deserialize_columns(data, nc)
                     } else {
@@ -1540,6 +1627,9 @@ impl QueryEngine {
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
+            }
+            if let Some(e) = scan_err.into_inner() {
+                return Err(e);
             }
         }
 
@@ -2056,7 +2146,8 @@ impl QueryEngine {
             ExecutionResult::Rows { columns, rows } => {
                 let mut seen = std::collections::HashSet::new();
                 let mut unique_rows = Vec::new();
-                for row in rows {
+                for (i, row) in rows.into_iter().enumerate() {
+                    if i % 1024 == 0 { self.poll_ctx()?; }
                     let key: Vec<u8> = row.iter().flat_map(|v| {
                         let mut buf = Vec::new();
                         match v {
@@ -2345,7 +2436,9 @@ impl QueryEngine {
 
         if left_all_int {
             let mut hash_table: HashMap<i64, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+            self.account_memory((right_rows.len() as u64) * 24)?;
             for (i, row) in right_rows.iter().enumerate() {
+                if i % 1024 == 0 { self.poll_ctx()?; }
                 if let Some(Value::Int64(k)) = row.get(right_key_idx) {
                     hash_table.entry(*k).or_default().push(i);
                 }
@@ -2413,7 +2506,9 @@ impl QueryEngine {
         } else {
             let mut hash_table: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(right_rows.len());
             for (i, row) in right_rows.iter().enumerate() {
+                if i % 1024 == 0 { self.poll_ctx()?; }
                 let key = self.hash_key(&row[right_key_idx]);
+                self.account_memory(key.len() as u64 + 24)?;
                 hash_table.entry(key).or_default().push(i);
             }
 
@@ -2644,9 +2739,12 @@ impl QueryEngine {
 
         let mut groups: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::with_capacity(rows.len().min(1024));
         for (row_idx, row) in rows.iter().enumerate() {
+            self.poll_ctx()?;
             let key: Vec<Vec<u8>> = group_indices.iter().map(|&i| {
                 self.hash_key(row.get(i).unwrap_or(&Value::Null))
             }).collect();
+            let key_bytes: u64 = key.iter().map(|k| k.len() as u64).sum::<u64>() + 24;
+            self.account_memory(key_bytes)?;
             groups.entry(key).or_default().push(row_idx);
         }
 

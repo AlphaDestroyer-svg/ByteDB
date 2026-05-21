@@ -15,6 +15,8 @@ mod tests {
     use crate::parser::parser::Parser;
     use crate::parser::ast::*;
     use crate::executor::engine::{QueryEngine, ExecutionResult};
+    use crate::executor::context::QueryContext;
+    use crate::error::QueryError;
     use crate::kv::kv_engine::KvEngine;
     use crate::document::doc_engine::DocEngine;
 
@@ -1413,6 +1415,84 @@ mod tests {
             }
             _ => panic!("Expected Rows"),
         }
+    }
+
+    #[test]
+    fn test_query_cancellation_via_ctx() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE big (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..200 {
+            engine.execute_sql(&format!("INSERT INTO big VALUES ({}, {})", i, i), None).unwrap();
+        }
+        let ctx = QueryContext::new();
+        ctx.cancel();
+        let r = engine.execute_sql_with_ctx("SELECT * FROM big", None, ctx);
+        assert!(matches!(r, Err(QueryError::Cancelled)), "expected Cancelled, got {:?}", r);
+    }
+
+    #[test]
+    fn test_query_scan_rows_limit() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE rows_t (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..50 {
+            engine.execute_sql(&format!("INSERT INTO rows_t VALUES ({}, {})", i, i), None).unwrap();
+        }
+        let ctx = QueryContext::builder().max_scan_rows(10).build();
+        let r = engine.execute_sql_with_ctx("SELECT * FROM rows_t", None, ctx);
+        match r {
+            Err(QueryError::ResourceLimit(msg)) => assert!(msg.contains("max_scan_rows")),
+            other => panic!("expected ResourceLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_query_memory_limit() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE m1 (id INT PRIMARY KEY, k INT)", None).unwrap();
+        engine.execute_sql("CREATE TABLE m2 (id INT PRIMARY KEY, k INT)", None).unwrap();
+        for i in 0..100 {
+            engine.execute_sql(&format!("INSERT INTO m1 VALUES ({}, {})", i, i % 5), None).unwrap();
+            engine.execute_sql(&format!("INSERT INTO m2 VALUES ({}, {})", i, i % 5), None).unwrap();
+        }
+        let ctx = QueryContext::builder().max_memory_bytes(100).build();
+        let r = engine.execute_sql_with_ctx(
+            "SELECT * FROM m1 JOIN m2 ON m1.k = m2.k",
+            None,
+            ctx,
+        );
+        match r {
+            Err(QueryError::ResourceLimit(msg)) => assert!(msg.contains("max_memory_bytes")),
+            other => panic!("expected memory ResourceLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_query_timeout_after_deadline() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE tm (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..2000 {
+            engine.execute_sql(&format!("INSERT INTO tm VALUES ({}, {})", i, i), None).unwrap();
+        }
+        let ctx = QueryContext::with_timeout(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let r = engine.execute_sql_with_ctx("SELECT * FROM tm", None, ctx);
+        assert!(matches!(r, Err(QueryError::QueryTimeout(_))), "expected QueryTimeout, got {:?}", r);
+    }
+
+    #[test]
+    fn test_query_ctx_no_limits_runs_normally() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE n_t (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..10 {
+            engine.execute_sql(&format!("INSERT INTO n_t VALUES ({}, {})", i, i), None).unwrap();
+        }
+        let ctx = QueryContext::new();
+        let r = engine.execute_sql_with_ctx("SELECT * FROM n_t", None, ctx.clone()).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => assert_eq!(rows.len(), 10),
+            _ => panic!("Expected Rows"),
+        }
+        assert_eq!(ctx.usage().scan_rows, 10);
     }
 
     #[test]

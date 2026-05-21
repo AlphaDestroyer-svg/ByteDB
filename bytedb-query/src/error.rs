@@ -31,6 +31,15 @@ pub enum QueryError {
 
     #[error("Column '{0}' not found")]
     ColumnNotFound(String),
+
+    #[error("Query cancelled")]
+    Cancelled,
+
+    #[error("Query timed out after {0} ms")]
+    QueryTimeout(u64),
+
+    #[error("Resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
 
 impl QueryError {
