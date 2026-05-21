@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 
 use crate::error::{CoreError, Result};
 
@@ -7,6 +7,7 @@ pub struct BPlusTree {
     root: Arc<RwLock<BTreeNode>>,
     order: usize,
     name: String,
+    write_latch: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ impl BPlusTree {
             root: Arc::new(RwLock::new(leaf)),
             order,
             name: name.into(),
+            write_latch: Mutex::new(()),
         }
     }
 
@@ -48,6 +50,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let _structural = self.write_latch.lock();
         let root = self.root.read();
         match &*root {
             BTreeNode::Leaf(leaf) => {
@@ -96,6 +99,7 @@ impl BPlusTree {
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        let _structural = self.write_latch.lock();
         let node = self.find_leaf(key);
         let mut node_write = node.write();
         match &mut *node_write {

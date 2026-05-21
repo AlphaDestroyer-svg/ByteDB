@@ -51,6 +51,52 @@ impl VersionStore {
         false
     }
 
+    pub fn try_delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<bool, crate::error::CoreError> {
+        let mut versions = self.versions.write();
+        if let Some(chain) = versions.get_mut(key) {
+            if let Some(latest) = chain.last_mut() {
+                if let Some(deleter) = latest.deleted_by {
+                    if deleter != txn_id && active_txns.contains(&deleter) {
+                        return Err(crate::error::CoreError::WriteConflict);
+                    }
+                    if deleter != txn_id {
+                        return Ok(false);
+                    }
+                }
+                if latest.created_by != txn_id && active_txns.contains(&latest.created_by) {
+                    return Err(crate::error::CoreError::WriteConflict);
+                }
+                latest.deleted_by = Some(txn_id);
+                latest.deleted_ts = Some(ts);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
+        let mut versions = self.versions.write();
+        let chain = versions.entry(key).or_insert_with(Vec::new);
+        if let Some(latest) = chain.last() {
+            if let Some(deleter) = latest.deleted_by {
+                if deleter != txn_id && active_txns.contains(&deleter) {
+                    return Err(crate::error::CoreError::WriteConflict);
+                }
+            }
+            if latest.created_by != txn_id && active_txns.contains(&latest.created_by) {
+                return Err(crate::error::CoreError::WriteConflict);
+            }
+        }
+        chain.push(VersionedTuple {
+            data: new_tuple,
+            created_by: txn_id,
+            deleted_by: None,
+            created_ts: ts,
+            deleted_ts: None,
+        });
+        Ok(())
+    }
+
     pub fn get_visible(&self, key: &[u8], txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Option<Tuple> {
         let versions = self.versions.read();
         if let Some(chain) = versions.get(key) {

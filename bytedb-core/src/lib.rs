@@ -88,6 +88,66 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_concurrent_inserts() {
+        use std::sync::Arc;
+        use std::thread;
+        let tree = Arc::new(BPlusTree::new("concurrent", 64));
+        let n_threads = 16;
+        let per_thread = 1000;
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let tree = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                for i in 0..per_thread {
+                    let id = t * per_thread + i;
+                    let key = format!("key_{:08}", id);
+                    let val = format!("val_{:08}", id);
+                    tree.insert(key.into_bytes(), val.into_bytes()).unwrap();
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        for t in 0..n_threads {
+            for i in 0..per_thread {
+                let id = t * per_thread + i;
+                let key = format!("key_{:08}", id);
+                let val = format!("val_{:08}", id);
+                assert_eq!(
+                    tree.search(key.as_bytes()).unwrap(),
+                    Some(val.into_bytes()),
+                    "missing key {}", id
+                );
+            }
+        }
+        assert_eq!(tree.count(), n_threads * per_thread);
+    }
+
+    #[test]
+    fn test_version_store_write_conflict() {
+        use crate::mvcc::version_store::VersionStore;
+        use crate::tuple::tuple::Tuple;
+        use crate::tuple::value::Value;
+        let vs = VersionStore::new();
+        let key = b"row1".to_vec();
+        vs.insert(key.clone(), Tuple::new(vec![Value::Int64(1)]), 1, 1);
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, &[2, 3]).unwrap();
+        let r = vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, &[2, 3]);
+        assert!(matches!(r, Err(crate::error::CoreError::WriteConflict)));
+    }
+
+    #[test]
+    fn test_version_store_no_conflict_after_commit() {
+        use crate::mvcc::version_store::VersionStore;
+        use crate::tuple::tuple::Tuple;
+        use crate::tuple::value::Value;
+        let vs = VersionStore::new();
+        let key = b"row1".to_vec();
+        vs.insert(key.clone(), Tuple::new(vec![Value::Int64(1)]), 1, 1);
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(2)]), 2, 2, &[2]).unwrap();
+        vs.try_update(key.clone(), Tuple::new(vec![Value::Int64(3)]), 3, 3, &[3]).unwrap();
+    }
+
+    #[test]
     fn test_wal_append_and_read() {
         let path = format!("./test_wal_{}.log", std::process::id());
         let log_manager = LogManager::new(&path).unwrap();

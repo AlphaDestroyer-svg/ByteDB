@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("Serialization conflict")]
     SerializationConflict,
 
+    #[error("Write conflict: row was modified by concurrent transaction")]
+    WriteConflict,
+
     #[error("Lock wait timeout for txn {0}")]
     LockTimeout(u64),
 

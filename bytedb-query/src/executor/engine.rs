@@ -1338,6 +1338,14 @@ impl QueryEngine {
                     let new_data = tuple.serialize();
 
                     if let Some(tid) = txn_id {
+                        let active = self.txn_manager.active_txn_ids();
+                        table_data.version_store.try_update(
+                            key.clone(),
+                            tuple.clone(),
+                            tid,
+                            tid,
+                            &active,
+                        )?;
                         self.wal_append(LogRecord::Update {
                             txn_id: tid,
                             table_id,
@@ -1458,6 +1466,8 @@ impl QueryEngine {
                         }
                     }
                     if let Some(tid) = txn_id {
+                        let active = self.txn_manager.active_txn_ids();
+                        table_data.version_store.try_delete(&key, tid, tid, &active)?;
                         self.wal_append(LogRecord::Delete {
                             txn_id: tid,
                             table_id,
@@ -1465,7 +1475,6 @@ impl QueryEngine {
                             slot: count as u16,
                             old_data: data,
                         });
-                        table_data.version_store.delete(&key, tid, tid);
                     }
                     if returning.is_some() {
                         returned_rows.push(tuple.values.to_vec());
