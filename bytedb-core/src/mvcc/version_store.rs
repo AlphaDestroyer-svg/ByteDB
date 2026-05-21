@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use parking_lot::RwLock;
 
 use super::transaction::{TxnId, Timestamp};
 use crate::tuple::tuple::Tuple;
+
+const SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct VersionedTuple {
@@ -14,14 +18,26 @@ pub struct VersionedTuple {
 }
 
 pub struct VersionStore {
-    versions: RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>>,
+    shards: Vec<RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>>>,
 }
 
 impl VersionStore {
     pub fn new() -> Self {
-        VersionStore {
-            versions: RwLock::new(HashMap::new()),
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
+            shards.push(RwLock::new(HashMap::new()));
         }
+        VersionStore { shards }
+    }
+
+    fn shard_index(key: &[u8]) -> usize {
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        (h.finish() as usize) % SHARD_COUNT
+    }
+
+    fn shard_for(&self, key: &[u8]) -> &RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>> {
+        &self.shards[Self::shard_index(key)]
     }
 
     pub fn insert(&self, key: Vec<u8>, tuple: Tuple, txn_id: TxnId, ts: Timestamp) {
@@ -32,14 +48,13 @@ impl VersionStore {
             created_ts: ts,
             deleted_ts: None,
         };
-
-        let mut versions = self.versions.write();
-        versions.entry(key).or_insert_with(Vec::new).push(versioned);
+        let mut shard = self.shard_for(&key).write();
+        shard.entry(key).or_insert_with(Vec::new).push(versioned);
     }
 
     pub fn delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp) -> bool {
-        let mut versions = self.versions.write();
-        if let Some(chain) = versions.get_mut(key) {
+        let mut shard = self.shard_for(key).write();
+        if let Some(chain) = shard.get_mut(key) {
             for version in chain.iter_mut().rev() {
                 if version.deleted_by.is_none() {
                     version.deleted_by = Some(txn_id);
@@ -52,8 +67,8 @@ impl VersionStore {
     }
 
     pub fn try_delete(&self, key: &[u8], txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<bool, crate::error::CoreError> {
-        let mut versions = self.versions.write();
-        if let Some(chain) = versions.get_mut(key) {
+        let mut shard = self.shard_for(key).write();
+        if let Some(chain) = shard.get_mut(key) {
             if let Some(latest) = chain.last_mut() {
                 if let Some(deleter) = latest.deleted_by {
                     if deleter != txn_id && active_txns.contains(&deleter) {
@@ -75,8 +90,8 @@ impl VersionStore {
     }
 
     pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
-        let mut versions = self.versions.write();
-        let chain = versions.entry(key).or_insert_with(Vec::new);
+        let mut shard = self.shard_for(&key).write();
+        let chain = shard.entry(key).or_insert_with(Vec::new);
         if let Some(latest) = chain.last() {
             if let Some(deleter) = latest.deleted_by {
                 if deleter != txn_id && active_txns.contains(&deleter) {
@@ -98,8 +113,8 @@ impl VersionStore {
     }
 
     pub fn get_visible(&self, key: &[u8], txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Option<Tuple> {
-        let versions = self.versions.read();
-        if let Some(chain) = versions.get(key) {
+        let shard = self.shard_for(key).read();
+        if let Some(chain) = shard.get(key) {
             for version in chain.iter().rev() {
                 if is_visible(version, txn_id, snapshot_ts, active_txns) {
                     return Some(version.data.clone());
@@ -110,18 +125,18 @@ impl VersionStore {
     }
 
     pub fn get_all_visible(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Vec<(Vec<u8>, Tuple)> {
-        let versions = self.versions.read();
         let mut results = Vec::new();
-
-        for (key, chain) in versions.iter() {
-            for version in chain.iter().rev() {
-                if is_visible(version, txn_id, snapshot_ts, active_txns) {
-                    results.push((key.clone(), version.data.clone()));
-                    break;
+        for shard_lock in &self.shards {
+            let shard = shard_lock.read();
+            for (key, chain) in shard.iter() {
+                for version in chain.iter().rev() {
+                    if is_visible(version, txn_id, snapshot_ts, active_txns) {
+                        results.push((key.clone(), version.data.clone()));
+                        break;
+                    }
                 }
             }
         }
-
         results
     }
 
@@ -134,32 +149,32 @@ impl VersionStore {
         oldest_active_ts: Timestamp,
         aborted_txns: &[TxnId],
     ) -> GcStats {
-        let mut versions = self.versions.write();
         let mut versions_removed: u64 = 0;
         let mut keys_removed: u64 = 0;
-        versions.retain(|_, chain| {
-            let before = chain.len();
-            chain.retain(|v| {
-
-                if aborted_txns.contains(&v.created_by) {
-                    return false;
-                }
-
-                if let Some(deleted_ts) = v.deleted_ts {
-                    if deleted_ts < oldest_active_ts {
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            shard.retain(|_, chain| {
+                let before = chain.len();
+                chain.retain(|v| {
+                    if aborted_txns.contains(&v.created_by) {
                         return false;
                     }
+                    if let Some(deleted_ts) = v.deleted_ts {
+                        if deleted_ts < oldest_active_ts {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                versions_removed += (before - chain.len()) as u64;
+                if chain.is_empty() {
+                    keys_removed += 1;
+                    false
+                } else {
+                    true
                 }
-                true
             });
-            versions_removed += (before - chain.len()) as u64;
-            if chain.is_empty() {
-                keys_removed += 1;
-                false
-            } else {
-                true
-            }
-        });
+        }
         GcStats {
             versions_removed,
             keys_removed,
@@ -167,27 +182,50 @@ impl VersionStore {
     }
 
     pub fn key_count(&self) -> usize {
-        self.versions.read().len()
+        self.shards.iter().map(|s| s.read().len()).sum()
     }
 
     pub fn total_versions(&self) -> usize {
-        self.versions.read().values().map(|c| c.len()).sum()
+        self.shards.iter()
+            .map(|s| s.read().values().map(|c| c.len()).sum::<usize>())
+            .sum()
     }
 
     pub fn live_dead_counts(&self, oldest_active_ts: Timestamp) -> (u64, u64) {
-        let versions = self.versions.read();
         let mut live: u64 = 0;
         let mut dead: u64 = 0;
-        for chain in versions.values() {
-            for v in chain.iter() {
-                let is_dead = match v.deleted_ts {
-                    Some(dts) => dts < oldest_active_ts,
-                    None => false,
-                };
-                if is_dead { dead += 1; } else { live += 1; }
+        for shard_lock in &self.shards {
+            let shard = shard_lock.read();
+            for chain in shard.values() {
+                for v in chain.iter() {
+                    let is_dead = match v.deleted_ts {
+                        Some(dts) => dts < oldest_active_ts,
+                        None => false,
+                    };
+                    if is_dead { dead += 1; } else { live += 1; }
+                }
             }
         }
         (live, dead)
+    }
+
+    pub fn for_each_visible<F>(&self, txn_id: TxnId, snapshot_ts: Timestamp, active_txns: &[TxnId], mut f: F)
+    where
+        F: FnMut(&[u8], &Tuple) -> bool,
+    {
+        for shard_lock in &self.shards {
+            let shard = shard_lock.read();
+            for (key, chain) in shard.iter() {
+                for version in chain.iter().rev() {
+                    if is_visible(version, txn_id, snapshot_ts, active_txns) {
+                        if !f(key, &version.data) {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 

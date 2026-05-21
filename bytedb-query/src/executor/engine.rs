@@ -111,6 +111,36 @@ pub struct TableData {
     pub sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>>,
 }
 
+impl TableData {
+    pub fn read_visible_entries(&self, txn_manager: &TransactionManager, txn_id: Option<TxnId>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(tid) = txn_id {
+            let snapshot = txn_manager.get_snapshot(tid)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let visible = self.version_store.get_all_visible(
+                tid,
+                snapshot.start_ts,
+                &snapshot.active_txns,
+            );
+            Ok(visible.into_iter().map(|(k, t)| (k, t.serialize())).collect())
+        } else {
+            self.index.scan_all()
+                .map_err(|e| QueryError::Execution(e.to_string()))
+        }
+    }
+
+    pub fn read_visible_one(&self, txn_manager: &TransactionManager, txn_id: Option<TxnId>, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(tid) = txn_id {
+            let snapshot = txn_manager.get_snapshot(tid)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            Ok(self.version_store.get_visible(key, tid, snapshot.start_ts, &snapshot.active_txns)
+                .map(|t| t.serialize()))
+        } else {
+            self.index.search(key)
+                .map_err(|e| QueryError::Execution(e.to_string()))
+        }
+    }
+}
+
 impl QueryEngine {
     pub fn new(database: Arc<Database>, txn_manager: Arc<TransactionManager>) -> Self {
         let default_name = database.name().to_string();
@@ -1233,13 +1263,12 @@ impl QueryEngine {
         let table_id = table_data.schema.columns.len() as u32;
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
-            match table_data.index.search(&key) {
-                Ok(Some(data)) => vec![(key, data)],
-                _ => vec![],
+            match table_data.read_visible_one(&self.txn_manager, txn_id, &key)? {
+                Some(data) => vec![(key, data)],
+                None => vec![],
             }
         } else {
-            table_data.index.scan_all()
-                .map_err(|e| QueryError::Execution(e.to_string()))?
+            table_data.read_visible_entries(&self.txn_manager, txn_id)?
         };
 
         let mut count = 0u64;
@@ -1383,13 +1412,12 @@ impl QueryEngine {
         let table_id = table_data.schema.columns.len() as u32;
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
-            match table_data.index.search(&key) {
-                Ok(Some(data)) => vec![(key, data)],
-                _ => vec![],
+            match table_data.read_visible_one(&self.txn_manager, txn_id, &key)? {
+                Some(data) => vec![(key, data)],
+                None => vec![],
             }
         } else {
-            table_data.index.scan_all()
-                .map_err(|e| QueryError::Execution(e.to_string()))?
+            table_data.read_visible_entries(&self.txn_manager, txn_id)?
         };
 
         let mut count = 0u64;
@@ -1753,7 +1781,7 @@ impl QueryEngine {
         Ok(ExecutionResult::Rows { columns: col_names, rows })
     }
 
-    fn exec_scan_top_n(&self, table: &str, filter: Option<&Expr>, _txn_id: Option<TxnId>, order_by: &[OrderByExpr], n: usize) -> Result<ExecutionResult> {
+    fn exec_scan_top_n(&self, table: &str, filter: Option<&Expr>, txn_id: Option<TxnId>, order_by: &[OrderByExpr], n: usize) -> Result<ExecutionResult> {
         let tables = self.tables.read();
         let table_data = tables.get(table)
             .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
@@ -1781,16 +1809,13 @@ impl QueryEngine {
         let mut kept_data: Vec<Vec<u8>> = Vec::with_capacity(n + 1);
         let mut all_int = true;
 
-        table_data.index.for_each(|_key, data| {
-
+        let mut process = |data: &[u8]| -> bool {
             let matches = if let Some((col_idx, _, ref lit_val)) = fast_filter {
                 raw_filter_matches(data, col_idx, op_code, lit_val).unwrap_or(false)
             } else {
                 true
             };
-
             if matches {
-
                 match read_int64_at(data, sort_col_idx) {
                     Some(k) => {
                         let heap_key = if asc { k } else { -k };
@@ -1812,7 +1837,23 @@ impl QueryEngine {
                 }
             }
             true
-        }).map_err(|e| QueryError::Execution(e.to_string()))?;
+        };
+
+        if let Some(tid) = txn_id {
+            let snapshot = self.txn_manager.get_snapshot(tid)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            let mut continue_loop = true;
+            table_data.version_store.for_each_visible(tid, snapshot.start_ts, &snapshot.active_txns, |_k, t| {
+                if !continue_loop { return false; }
+                let data = t.serialize();
+                if !process(&data) { continue_loop = false; }
+                continue_loop
+            });
+        } else {
+            table_data.index.for_each(|_key, data| {
+                process(data)
+            }).map_err(|e| QueryError::Execution(e.to_string()))?;
+        }
 
         if !all_int {
             return Err(QueryError::Execution("Non-int sort column".into()));
