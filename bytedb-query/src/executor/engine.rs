@@ -15,6 +15,7 @@ use bytedb_core::wal::log_manager::LogManager;
 use bytedb_core::wal::log_record::LogRecord;
 
 use bytedb_core::stats::{compute_table_stats, TableStats, DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_MCV_COUNT};
+use bytedb_core::metrics::{LatencyHistogram, Timer};
 
 use crate::error::{QueryError, Result};
 use crate::executor::batch::{SelectionVector, deserialize_batch};
@@ -87,6 +88,19 @@ pub struct QueryEngine {
     stats: Arc<parking_lot::RwLock<HashMap<String, TableStats>>>,
 
     active_ctx: parking_lot::RwLock<Option<Arc<QueryContext>>>,
+
+    query_latency: Arc<LatencyHistogram>,
+    slow_query_threshold_ms: parking_lot::RwLock<Option<u64>>,
+    slow_query_log: parking_lot::RwLock<Vec<SlowQueryEntry>>,
+    slow_query_log_capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlowQueryEntry {
+    pub sql: String,
+    pub duration_micros: u64,
+    pub txn_id: Option<TxnId>,
+    pub timestamp_micros: u64,
 }
 
 pub struct TableData {
@@ -114,6 +128,10 @@ impl QueryEngine {
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             active_ctx: parking_lot::RwLock::new(None),
+            query_latency: Arc::new(LatencyHistogram::default()),
+            slow_query_threshold_ms: parking_lot::RwLock::new(None),
+            slow_query_log: parking_lot::RwLock::new(Vec::new()),
+            slow_query_log_capacity: 256,
         }
     }
 
@@ -133,6 +151,10 @@ impl QueryEngine {
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             active_ctx: parking_lot::RwLock::new(None),
+            query_latency: Arc::new(LatencyHistogram::default()),
+            slow_query_threshold_ms: parking_lot::RwLock::new(None),
+            slow_query_log: parking_lot::RwLock::new(Vec::new()),
+            slow_query_log_capacity: 256,
         }
     }
 
@@ -230,6 +252,7 @@ impl QueryEngine {
     }
 
     pub fn execute_sql(&self, sql: &str, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        let timer = Timer::start();
         let hash = hash_sql(sql);
         let cached = {
             let cache = self.stmt_cache.lock();
@@ -245,7 +268,52 @@ impl QueryEngine {
             cache.insert(hash, s.clone());
             s
         };
-        self.execute(stmt, txn_id)
+        let res = self.execute(stmt, txn_id);
+        let elapsed_us = timer.elapsed_micros();
+        self.query_latency.record_micros(elapsed_us);
+        self.maybe_record_slow_query(sql, elapsed_us, txn_id);
+        res
+    }
+
+    pub fn query_latency(&self) -> Arc<LatencyHistogram> {
+        Arc::clone(&self.query_latency)
+    }
+
+    pub fn set_slow_query_threshold_ms(&self, threshold_ms: Option<u64>) {
+        *self.slow_query_threshold_ms.write() = threshold_ms;
+    }
+
+    pub fn slow_query_log(&self) -> Vec<SlowQueryEntry> {
+        self.slow_query_log.read().clone()
+    }
+
+    pub fn clear_slow_query_log(&self) {
+        self.slow_query_log.write().clear();
+    }
+
+    fn maybe_record_slow_query(&self, sql: &str, elapsed_us: u64, txn_id: Option<TxnId>) {
+        let threshold = match *self.slow_query_threshold_ms.read() {
+            Some(t) => t,
+            None => return,
+        };
+        if elapsed_us / 1000 < threshold {
+            return;
+        }
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let entry = SlowQueryEntry {
+            sql: sql.to_string(),
+            duration_micros: elapsed_us,
+            txn_id,
+            timestamp_micros: now_us,
+        };
+        let mut log = self.slow_query_log.write();
+        if log.len() >= self.slow_query_log_capacity {
+            log.remove(0);
+        }
+        log.push(entry);
     }
 
     pub fn execute_sql_with_ctx(
@@ -484,12 +552,49 @@ impl QueryEngine {
             Statement::Union(left, right, all) => self.exec_union(*left, *right, all, txn_id),
             Statement::Intersect(left, right, all) => self.exec_intersect(*left, *right, all, txn_id),
             Statement::Except(left, right, all) => self.exec_except(*left, *right, all, txn_id),
-            Statement::Explain(inner, _analyze) => {
+            Statement::Explain(inner, analyze) => {
+                use crate::planner::cost::cost_plan;
                 let logical = build_logical_plan(&inner)?;
+                let stats_snapshot = self.stats_snapshot();
+                let physical = optimize_with_stats(logical.clone(), &stats_snapshot)?;
+                let pc = cost_plan(&physical, &stats_snapshot);
+                let estimated_rows = pc.rows.round() as u64;
+                let estimated_cost = pc.total_cost;
                 let plan_text = format!("{:#?}", logical);
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(format!(
+                    "Plan  (estimated_rows={}  estimated_cost={:.2})",
+                    estimated_rows, estimated_cost
+                ));
+                if analyze {
+                    let timer = Timer::start();
+                    let result = self.execute(*inner, txn_id)?;
+                    let elapsed_us = timer.elapsed_micros();
+                    let actual_rows = match &result {
+                        ExecutionResult::Rows { rows, .. } => rows.len() as u64,
+                        ExecutionResult::Modified { count } => *count,
+                        ExecutionResult::Ok(_) => 0,
+                    };
+                    let factor = if estimated_rows > 0 {
+                        actual_rows as f64 / estimated_rows as f64
+                    } else if actual_rows == 0 {
+                        1.0
+                    } else {
+                        f64::INFINITY
+                    };
+                    lines.push(format!(
+                        "Actual  rows={}  time={:.3} ms  est/actual_factor={:.2}",
+                        actual_rows,
+                        elapsed_us as f64 / 1000.0,
+                        factor
+                    ));
+                }
+                for l in plan_text.lines() {
+                    lines.push(l.to_string());
+                }
                 Ok(ExecutionResult::Rows {
                     columns: vec!["QUERY PLAN".into()],
-                    rows: plan_text.lines().map(|l| vec![Value::Text(l.to_string())]).collect(),
+                    rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
                 })
             }
             Statement::Insert(ins) => {

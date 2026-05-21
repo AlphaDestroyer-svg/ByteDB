@@ -1496,6 +1496,65 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_analyze_shows_actual_and_estimated() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE ea (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..50 {
+            engine.execute_sql(&format!("INSERT INTO ea VALUES ({}, {})", i, i % 5), None).unwrap();
+        }
+        engine.execute_sql("ANALYZE", None).unwrap();
+        let r = engine.execute_sql("EXPLAIN ANALYZE SELECT * FROM ea WHERE n = 1", None).unwrap();
+        match r {
+            ExecutionResult::Rows { rows, .. } => {
+                let text: String = rows.iter()
+                    .map(|r| if let Value::Text(s) = &r[0] { s.clone() } else { String::new() })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("estimated_rows="), "missing estimated_rows: {}", text);
+                assert!(text.contains("Actual"), "missing Actual line: {}", text);
+                assert!(text.contains("est/actual_factor="), "missing factor: {}", text);
+            }
+            _ => panic!("Expected Rows from EXPLAIN ANALYZE"),
+        }
+    }
+
+    #[test]
+    fn test_query_latency_histogram_records() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE lat (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..5 {
+            engine.execute_sql(&format!("INSERT INTO lat VALUES ({}, {})", i, i), None).unwrap();
+        }
+        let _ = engine.execute_sql("SELECT * FROM lat", None).unwrap();
+        let snap = engine.query_latency().snapshot();
+        assert!(snap.total_count >= 7);
+    }
+
+    #[test]
+    fn test_slow_query_log_captures_above_threshold() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE sl (id INT PRIMARY KEY, n INT)", None).unwrap();
+        for i in 0..200 {
+            engine.execute_sql(&format!("INSERT INTO sl VALUES ({}, {})", i, i), None).unwrap();
+        }
+        engine.set_slow_query_threshold_ms(Some(0));
+        engine.clear_slow_query_log();
+        engine.execute_sql("SELECT * FROM sl", None).unwrap();
+        let log = engine.slow_query_log();
+        assert!(!log.is_empty());
+        assert!(log.iter().any(|e| e.sql.starts_with("SELECT")));
+    }
+
+    #[test]
+    fn test_slow_query_log_skips_when_threshold_unset() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE sl2 (id INT PRIMARY KEY)", None).unwrap();
+        engine.execute_sql("INSERT INTO sl2 VALUES (1)", None).unwrap();
+        engine.execute_sql("SELECT * FROM sl2", None).unwrap();
+        assert!(engine.slow_query_log().is_empty());
+    }
+
+    #[test]
     fn test_analyze_all_tables() {
         let engine = setup_engine();
         engine.execute_sql("CREATE TABLE a (id INT PRIMARY KEY)", None).unwrap();

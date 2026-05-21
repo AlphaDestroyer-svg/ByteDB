@@ -19,6 +19,12 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 - **Row-level locking** - shared/exclusive locks per `(table, row-key)`, FIFO waiter queue, wait-for graph deadlock detection that aborts the requester with `Deadlock` instead of hanging, configurable lock-wait timeout (`LockTimeout`), and live metrics (acquires, releases, waits, timeouts, deadlocks, total wait micros).
 - **Per-transaction deadlines** - optional default timeout on every `begin`, plus `begin_with_timeout` for one-off overrides; `check_deadline` and `timed_out_txns` let the server abort runaway transactions with `TransactionTimeout`.
 - **Query cancellation & resource governor** - every query can run under a `QueryContext` with a cooperative cancel flag, an absolute deadline, and per-query caps on memory bytes, temp-spill bytes, and scan rows. Hot loops (sequential scans, hash joins, hash aggregates, distinct, sort) poll the context and bail out with `Cancelled`, `QueryTimeout`, or `ResourceLimit` instead of OOM-ing the process. Use `engine.execute_sql_with_ctx(sql, txn, ctx)`.
+- **Observability metrics** - `LatencyHistogram` (p50/p95/p99 + mean/max + ring-buffered samples + QPS), `GcMetrics` (vacuum runs, versions/keys removed, total/last pause micros), `DeadTupleMetrics` (live/dead version counts + ratio). Buffer pool already exposes hits/misses; WAL exposes `fsync_count` and `commits_served`; lock manager exposes acquires/waits/timeouts/deadlocks. `engine.query_latency()` returns the per-query latency histogram.
+- **Slow query log** - `engine.set_slow_query_threshold_ms(Some(ms))` enables auto-capture of any query whose wall time crosses the threshold. `engine.slow_query_log()` returns the captured entries (ring-buffered, capacity 256). Each entry records the SQL text, duration in micros, txn id, and wall-clock timestamp.
+- **`EXPLAIN ANALYZE`** - prints the chosen plan with `estimated_rows` + `estimated_cost`, then runs the statement and prints `actual rows`, wall time in ms, and the est/actual factor so you can spot bad cardinality estimates.
+- **WAL durability mode** - `LogManager::set_durability_mode(DurabilityMode::Strict | Relaxed)`. Strict (default): `commit(lsn)` blocks until the WAL is fsynced and chained — no ack before durability. Relaxed: `commit(lsn)` returns immediately and lets group commit batch the fsync — faster but the last few transactions can be lost on crash. Counters: `fsync_count`, `commits_served`, `relaxed_acks`.
+- **Throttled vacuum** - `MvccVacuum::with_throttle(...)` runs vacuum in batches of N stores with a configurable sleep between batches, recording each run into `GcMetrics` (pause time) and refreshing `DeadTupleMetrics`. Non-blocking on writers — uses the existing per-key write lock for the brief retain pass.
+- **Free-space map** - `storage::fsm::FreeSpaceMap` tracks per-page free byte counts in 16 buckets so `find_with_at_least(n)` returns a reusable page in O(1). Combined with the existing `Page::compact()` reclaiming dead-tuple space, this stops linear bloat under heavy update/delete workloads.
 - **Buffer pool with LRU-K (K=2)** - bounded-memory page cache replacing the previous read-everything-at-startup model.
 - **WAL group commit** - leader/follower fsync batching cuts disk syncs under concurrent writers.
 - **Background workers** - dedicated threads for WAL flushing, dirty-page writeback, periodic checkpoints, and MVCC vacuum/GC.
@@ -44,6 +50,9 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 - ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE/STATS`, `ANALYZE [TABLE]`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
 - ✅ Persistence: snapshot (binary + JSON) + WAL with ARIES-style recovery
 - ✅ Performance: zero-copy filter, fast top-N, fast aggregate, prepared-statement cache
+- ✅ Observability: latency histogram (p50/p95/p99/QPS), GC pause metrics, dead-tuple ratio, slow query log, `EXPLAIN ANALYZE`
+- ✅ Durability: strict / relaxed WAL modes, group commit, fsync metrics
+- ✅ Storage hygiene: throttled MVCC vacuum, free-space map, page compaction
 
 ### Architecture
 
@@ -308,6 +317,12 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 - **Row-level блокировки** - shared/exclusive локи на `(table, row-key)`, FIFO-очередь ожидающих, детекция дедлоков по wait-for графу с прерыванием запросившего ошибкой `Deadlock` вместо вечного ожидания, настраиваемый таймаут ожидания (`LockTimeout`) и живые метрики (acquires, releases, waits, timeouts, deadlocks, total wait micros).
 - **Дедлайны транзакций** - опциональный дефолтный таймаут на каждый `begin`, плюс `begin_with_timeout` для разовых переопределений; `check_deadline` и `timed_out_txns` позволяют серверу прерывать зависшие транзакции ошибкой `TransactionTimeout`.
 - **Отмена запросов и resource governor** - каждый запрос может выполняться под `QueryContext` с cooperative-флагом отмены, абсолютным дедлайном и лимитами на память, временный spill и количество просканированных строк. Горячие циклы (sequential scan, hash join, hash aggregate, distinct, sort) опрашивают контекст и завершаются с `Cancelled`, `QueryTimeout` или `ResourceLimit` вместо OOM. Использовать через `engine.execute_sql_with_ctx(sql, txn, ctx)`.
+- **Метрики наблюдаемости** - `LatencyHistogram` (p50/p95/p99 + mean/max + ring-buffered семплы + QPS), `GcMetrics` (запуски vacuum, удалённые версии/ключи, общая/последняя длительность пауз), `DeadTupleMetrics` (количество живых/мёртвых версий + ratio). Buffer pool уже отдаёт hits/misses; WAL — `fsync_count` и `commits_served`; lock manager — acquires/waits/timeouts/deadlocks. `engine.query_latency()` возвращает гистограмму латентности по запросам.
+- **Slow query log** - `engine.set_slow_query_threshold_ms(Some(ms))` включает автозахват каждого запроса, чьё время превышает порог. `engine.slow_query_log()` возвращает накопленные записи (ring-buffer, ёмкость 256). Каждая запись содержит SQL, длительность в микросекундах, txn id и wall-clock метку времени.
+- **`EXPLAIN ANALYZE`** - печатает выбранный план с `estimated_rows` + `estimated_cost`, затем выполняет запрос и печатает `actual rows`, время в мс и фактор est/actual — чтобы видеть плохие оценки кардинальности.
+- **Режимы durability WAL** - `LogManager::set_durability_mode(DurabilityMode::Strict | Relaxed)`. Strict (по умолчанию): `commit(lsn)` блокируется до тех пор, пока WAL не fsync-нут — никакого ack до durability. Relaxed: `commit(lsn)` возвращается мгновенно и group commit досинхронизует пачку — быстрее, но последние транзакции могут потеряться при крэше. Счётчики: `fsync_count`, `commits_served`, `relaxed_acks`.
+- **Throttled vacuum** - `MvccVacuum::with_throttle(...)` запускает vacuum пачками по N стораджей с настраиваемой паузой между пачками, записывая каждый запуск в `GcMetrics` (длительность паузы) и обновляя `DeadTupleMetrics`. Не блокирует писателей — использует существующий per-key write lock на короткий retain-проход.
+- **Free-space map** - `storage::fsm::FreeSpaceMap` хранит free-bytes по страницам в 16 бакетах, так что `find_with_at_least(n)` возвращает переиспользуемую страницу за O(1). В сочетании с существующим `Page::compact()`, освобождающим место от мёртвых tuple, это останавливает линейный bloat при тяжёлых update/delete-нагрузках.
 - **Buffer pool с LRU-K (K=2)** - кеш страниц с ограниченной памятью вместо «прочитать всё при старте».
 - **WAL group commit** - fsync-батчинг по схеме лидер/последователь снижает число синхронизаций при параллельной записи.
 - **Фоновые воркеры** - отдельные потоки для flush WAL, записи грязных страниц, периодических чекпоинтов и vacuum/GC MVCC.
@@ -333,6 +348,9 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 - ✅ Utility: `SHOW TABLES/COLUMNS/CREATE TABLE/STATS`, `ANALYZE [TABLE]`, `TRUNCATE`, `EXPLAIN [ANALYZE]`, `information_schema.tables`/`columns`
 - ✅ Персистентность: snapshot (binary + JSON) + WAL с восстановлением в стиле ARIES
 - ✅ Производительность: zero-copy фильтр, fast top-N, fast aggregate, кеш подготовленных стейтментов
+- ✅ Наблюдаемость: гистограмма латентности (p50/p95/p99/QPS), метрики GC-пауз, dead-tuple ratio, slow query log, `EXPLAIN ANALYZE`
+- ✅ Durability: режимы strict / relaxed WAL, group commit, метрики fsync
+- ✅ Гигиена хранения: throttled MVCC vacuum, free-space map, page compaction
 
 ### Архитектура
 

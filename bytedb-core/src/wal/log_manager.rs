@@ -12,6 +12,16 @@ const LOG_RECORD_HEADER_SIZE: usize = 16;
 
 const DEFAULT_GROUP_COMMIT_DELAY_US: u64 = 0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    Strict,
+    Relaxed,
+}
+
+impl Default for DurabilityMode {
+    fn default() -> Self { DurabilityMode::Strict }
+}
+
 pub struct LogManager {
     log_path: PathBuf,
     writer: Mutex<BufWriter<File>>,
@@ -24,9 +34,11 @@ pub struct LogManager {
     flushing: AtomicBool,
 
     group_commit_delay_us: AtomicU64,
+    durability_mode: parking_lot::RwLock<DurabilityMode>,
 
     fsyncs: AtomicU64,
     commits_served: AtomicU64,
+    relaxed_acks: AtomicU64,
 }
 
 impl LogManager {
@@ -55,9 +67,34 @@ impl LogManager {
             flush_cv_lock: Mutex::new(()),
             flushing: AtomicBool::new(false),
             group_commit_delay_us: AtomicU64::new(DEFAULT_GROUP_COMMIT_DELAY_US),
+            durability_mode: parking_lot::RwLock::new(DurabilityMode::Strict),
             fsyncs: AtomicU64::new(0),
             commits_served: AtomicU64::new(0),
+            relaxed_acks: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_durability_mode(&self, mode: DurabilityMode) {
+        *self.durability_mode.write() = mode;
+    }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        *self.durability_mode.read()
+    }
+
+    pub fn relaxed_acks(&self) -> u64 {
+        self.relaxed_acks.load(Ordering::Relaxed)
+    }
+
+    pub fn commit(&self, target_lsn: Lsn) -> Result<Lsn> {
+        match self.durability_mode() {
+            DurabilityMode::Strict => self.flush_through(target_lsn),
+            DurabilityMode::Relaxed => {
+                self.relaxed_acks.fetch_add(1, Ordering::Relaxed);
+                self.commits_served.fetch_add(1, Ordering::Relaxed);
+                Ok(self.flushed_lsn.load(Ordering::Acquire))
+            }
+        }
     }
 
     pub fn set_group_commit_delay_us(&self, us: u64) {
@@ -339,6 +376,27 @@ mod group_commit_tests {
         assert_eq!(recs.len(), 5);
         assert_eq!(recs[0].0, 1);
         assert_eq!(recs[4].0, 5);
+    }
+
+    #[test]
+    fn relaxed_mode_acks_without_fsync() {
+        let (_d, lm) = fresh();
+        lm.set_durability_mode(DurabilityMode::Relaxed);
+        let lsn = append_commit(&lm);
+        let f_before = lm.fsync_count();
+        lm.commit(lsn).unwrap();
+        assert_eq!(lm.fsync_count(), f_before, "relaxed mode must not fsync");
+        assert_eq!(lm.relaxed_acks(), 1);
+    }
+
+    #[test]
+    fn strict_mode_fsyncs_on_commit() {
+        let (_d, lm) = fresh();
+        assert_eq!(lm.durability_mode(), DurabilityMode::Strict);
+        let lsn = append_commit(&lm);
+        lm.commit(lsn).unwrap();
+        assert!(lm.fsync_count() >= 1, "strict mode must fsync");
+        assert_eq!(lm.relaxed_acks(), 0);
     }
 
     #[test]

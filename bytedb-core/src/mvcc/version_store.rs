@@ -127,6 +127,22 @@ impl VersionStore {
     pub fn total_versions(&self) -> usize {
         self.versions.read().values().map(|c| c.len()).sum()
     }
+
+    pub fn live_dead_counts(&self, oldest_active_ts: Timestamp) -> (u64, u64) {
+        let versions = self.versions.read();
+        let mut live: u64 = 0;
+        let mut dead: u64 = 0;
+        for chain in versions.values() {
+            for v in chain.iter() {
+                let is_dead = match v.deleted_ts {
+                    Some(dts) => dts < oldest_active_ts,
+                    None => false,
+                };
+                if is_dead { dead += 1; } else { live += 1; }
+            }
+        }
+        (live, dead)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
