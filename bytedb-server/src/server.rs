@@ -16,6 +16,7 @@ use bytedb_core::snapshot::format::{FullSnapshot, SnapshotFormat, TableSnapshot}
 use bytedb_core::snapshot::manager::SnapshotManager;
 use bytedb_core::wal::log_manager::LogManager;
 use bytedb_core::wal::recovery::RecoveryManager;
+use bytedb_core::workers::{wal_flusher, WorkerHandle};
 use bytedb_query::executor::engine::{QueryEngine, TableData};
 use bytedb_query::kv::kv_engine::KvEngine;
 use bytedb_query::document::doc_engine::DocEngine;
@@ -29,6 +30,10 @@ pub struct Server {
     session_manager: Arc<SessionManager>,
     semaphore: Arc<Semaphore>,
     snapshot_manager: Arc<SnapshotManager>,
+    wal: Arc<LogManager>,
+    /// Background workers — kept alive for the server's lifetime; their
+    /// Drop impl shuts them down gracefully.
+    workers: parking_lot::Mutex<Vec<WorkerHandle>>,
 }
 
 impl Server {
@@ -66,7 +71,8 @@ impl Server {
 
         let database = Arc::new(Database::new("bytedb"));
         let txn_manager = Arc::new(TransactionManager::new());
-        let mut engine_owned = QueryEngine::with_wal(database, txn_manager, log_manager);
+        let wal_for_engine = Arc::clone(&log_manager);
+        let mut engine_owned = QueryEngine::with_wal(database, txn_manager, wal_for_engine);
 
         // Disk-backed store rooted at the data directory. Per-database
         // directories live under <data_dir>/databases/<name>/.
@@ -97,6 +103,16 @@ impl Server {
         let session_manager = Arc::new(SessionManager::new());
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
+        // Background workers — for now just the WAL flusher heartbeat.
+        // Page flusher / checkpoint workers will activate when the page-
+        // based storage layer comes online; vacuum activates with stage 5.
+        let workers = vec![
+            wal_flusher::start(
+                Arc::clone(&log_manager),
+                wal_flusher::WalFlusherConfig::default(),
+            ),
+        ];
+
         Server {
             config,
             query_engine,
@@ -106,6 +122,8 @@ impl Server {
             session_manager,
             semaphore,
             snapshot_manager,
+            wal: log_manager,
+            workers: parking_lot::Mutex::new(workers),
         }
     }
 
@@ -237,6 +255,17 @@ impl Server {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down gracefully...");
+                    // Stop background workers before the final snapshot
+                    // so they don't race the writer.
+                    {
+                        let mut ws = self.workers.lock();
+                        for w in ws.iter_mut() {
+                            w.shutdown();
+                        }
+                    }
+                    // Last WAL flush so any committed bytes still in the
+                    // BufWriter become durable.
+                    let _ = self.wal.flush();
                     if !self.config.no_shutdown_snapshot {
                         Self::create_snapshot(&self.query_engine, &self.snapshot_manager);
                         info!("Final snapshot saved. Goodbye.");
