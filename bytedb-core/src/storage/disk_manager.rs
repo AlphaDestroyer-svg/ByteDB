@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::storage::page::{Page, PageId, PAGE_SIZE};
 
 pub struct DiskManager {
@@ -44,14 +44,26 @@ impl DiskManager {
         let mut page = Page::new(page_id);
         file.read_exact(&mut page.data)?;
         page.id = page_id;
+
+        let stored = page.checksum();
+        if stored != 0 {
+            let computed = page.compute_checksum();
+            if stored != computed {
+                return Err(CoreError::ChecksumMismatch(page_id));
+            }
+        }
         Ok(page)
     }
 
     pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         let offset = (page_id as u64) * (PAGE_SIZE as u64);
+        let mut buf = page.clone();
+        buf.set_checksum(0);
+        let cs = buf.compute_checksum();
+        buf.set_checksum(cs);
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&page.data)?;
+        file.write_all(&buf.data)?;
         Ok(())
     }
 
@@ -78,5 +90,53 @@ impl DiskManager {
 
     pub fn path(&self) -> &Path {
         &self.db_path
+    }
+
+    #[doc(hidden)]
+    pub fn corrupt_byte_for_test(&self, page_id: PageId, byte_index: usize) -> Result<()> {
+        let offset = (page_id as u64) * (PAGE_SIZE as u64) + byte_index as u64;
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::Start(offset))?;
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b)?;
+        b[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&b)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_then_read_succeeds_with_checksum() {
+        let d = tempdir().unwrap();
+        let dm = DiskManager::new(d.path().join("db.bin")).unwrap();
+        let pid = dm.allocate_page().unwrap();
+        let mut p = Page::new(pid);
+        p.alloc_slot(b"hello").unwrap();
+        dm.write_page(pid, &p).unwrap();
+        let r = dm.read_page(pid).unwrap();
+        assert_eq!(r.get_slot(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn corrupted_page_is_detected() {
+        let d = tempdir().unwrap();
+        let dm = DiskManager::new(d.path().join("db.bin")).unwrap();
+        let pid = dm.allocate_page().unwrap();
+        let mut p = Page::new(pid);
+        p.alloc_slot(b"hello").unwrap();
+        dm.write_page(pid, &p).unwrap();
+        dm.corrupt_byte_for_test(pid, 100).unwrap();
+        let err = dm.read_page(pid).unwrap_err();
+        match err {
+            CoreError::ChecksumMismatch(p) => assert_eq!(p, pid),
+            other => panic!("expected ChecksumMismatch, got {:?}", other),
+        }
     }
 }

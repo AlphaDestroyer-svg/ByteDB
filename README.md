@@ -2,7 +2,7 @@
 
 A hybrid storage engine in Rust: relational SQL + key-value + document, with MVCC, WAL/ARIES recovery, B+Tree indexes, and a vectorized executor.
 
-**v0.2** — full storage rewrite to 8KB slotted pages, LRU-K buffer pool, WAL group commit, background workers (WAL flusher, page flusher, checkpoint, vacuum), and a real cost-based optimizer driven by table statistics.
+**v0.2** - full storage rewrite to 8KB slotted pages, LRU-K buffer pool, WAL group commit, background workers (WAL flusher, page flusher, checkpoint, vacuum), and a real cost-based optimizer driven by table statistics.
 
 > 📖 Doc language: [English](#english) · [Русский](#русский)
 
@@ -12,14 +12,17 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 
 ### What's new in v0.2
 
-- **Slotted pages (8KB)** — every table file is a sequence of fixed-size pages with a 32-byte header and slot directory.
-- **Buffer pool with LRU-K (K=2)** — bounded-memory page cache replacing the previous read-everything-at-startup model.
-- **WAL group commit** — leader/follower fsync batching cuts disk syncs under concurrent writers.
-- **Background workers** — dedicated threads for WAL flushing, dirty-page writeback, periodic checkpoints, and MVCC vacuum/GC.
-- **MVCC garbage collector** — old versions invisible to all active transactions are reclaimed automatically.
-- **`ANALYZE` statistics** — per-column NDV, MCV (top-K most common values), and equi-depth histograms; query with `SHOW STATS [FOR <table>]`.
-- **Cost-based optimizer** — selectivity estimation from MCV/histograms, join cardinality from NDV, greedy reordering of left-deep INNER join chains by smallest cardinality. Outer joins are conservatively kept in source order.
-- **Clean break** — v0.2 storage format is incompatible with v0.1 (new BSDB magic stamp).
+- **Slotted pages (8KB)** - every table file is a sequence of fixed-size pages with a 32-byte header and slot directory.
+- **Page checksums (CRC32)** - every page is checksummed on write and verified on read. Silent corruption surfaces immediately as `ChecksumMismatch`, not weeks later.
+- **WAL integrity** - strict LSN chaining (each record carries `prev_lsn`), per-record CRC32 covering header+payload, and torn-write detection on recovery. A flipped bit anywhere in the WAL aborts replay with `WalCorrupted` instead of producing wrong data.
+- **Atomic file writes** - table files (`*.tbl`) and the catalog (`catalog.bin`) are written to `*.tmp`, fsynced, then atomically renamed. A crash mid-write leaves either the old file fully intact or the new file fully visible - never a half-written mix. Both formats now carry a CRC32 trailer over the payload.
+- **Buffer pool with LRU-K (K=2)** - bounded-memory page cache replacing the previous read-everything-at-startup model.
+- **WAL group commit** - leader/follower fsync batching cuts disk syncs under concurrent writers.
+- **Background workers** - dedicated threads for WAL flushing, dirty-page writeback, periodic checkpoints, and MVCC vacuum/GC.
+- **MVCC garbage collector** - old versions invisible to all active transactions are reclaimed automatically.
+- **`ANALYZE` statistics** - per-column NDV, MCV (top-K most common values), and equi-depth histograms; query with `SHOW STATS [FOR <table>]`.
+- **Cost-based optimizer** - selectivity estimation from MCV/histograms, join cardinality from NDV, greedy reordering of left-deep INNER join chains by smallest cardinality. Outer joins are conservatively kept in source order.
+- **Clean break** - v0.2 storage format is incompatible with v0.1 (new BSDB magic stamp).
 
 ### Status
 
@@ -166,7 +169,7 @@ SHOW STATS FOR users;      -- per-column row count / null fraction / NDV / MCVs
 SHOW STATS;                -- summary across all tables
 ```
 
-The optimizer consults this catalog for selectivity and join cardinality. Without stats, plans fall back to source order — same behaviour as v0.1.
+The optimizer consults this catalog for selectivity and join cardinality. Without stats, plans fall back to source order - same behaviour as v0.1.
 
 ### Storage modes
 
@@ -200,9 +203,9 @@ ByteDB persists a database as a directory on disk. Pass `--data-dir <path>` to t
     └── snapshot_*.bin
 ```
 
-- **Per-table data files** (`databases/<db>/tables/<table>.tbl`) — every committed `INSERT/UPDATE/DELETE` rewrites the affected table file via atomic rename. **Schema and data are stored separately**: `catalog.bin` holds metadata, `*.tbl` holds rows. No periodic flush is needed — the file on disk is always up to date after each successful mutation.
-- **WAL** (`bytedb.wal`) — durability for in-flight transactions; redo committed / undo uncommitted on restart.
-- **Snapshots** (`snapshots/`) — optional full-state archives. Disabled by default (`--snapshot-write-threshold 0`); time-based snapshots default to every 30 min. To turn them off entirely use `--no-snapshot`. Set `--no-shutdown-snapshot` to skip the final snapshot on Ctrl+C.
+- **Per-table data files** (`databases/<db>/tables/<table>.tbl`) - every committed `INSERT/UPDATE/DELETE` rewrites the affected table file via atomic rename. **Schema and data are stored separately**: `catalog.bin` holds metadata, `*.tbl` holds rows. No periodic flush is needed - the file on disk is always up to date after each successful mutation.
+- **WAL** (`bytedb.wal`) - durability for in-flight transactions; redo committed / undo uncommitted on restart.
+- **Snapshots** (`snapshots/`) - optional full-state archives. Disabled by default (`--snapshot-write-threshold 0`); time-based snapshots default to every 30 min. To turn them off entirely use `--no-snapshot`. Set `--no-shutdown-snapshot` to skip the final snapshot on Ctrl+C.
 
 #### Tuning snapshots
 
@@ -295,14 +298,17 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 
 ### Что нового в v0.2
 
-- **Slotted pages (8KB)** — файл каждой таблицы — последовательность страниц фиксированного размера с 32-байтным заголовком и слот-директорией.
-- **Buffer pool с LRU-K (K=2)** — кеш страниц с ограниченной памятью вместо «прочитать всё при старте».
-- **WAL group commit** — fsync-батчинг по схеме лидер/последователь снижает число синхронизаций при параллельной записи.
-- **Фоновые воркеры** — отдельные потоки для flush WAL, записи грязных страниц, периодических чекпоинтов и vacuum/GC MVCC.
-- **Сборщик мусора MVCC** — старые версии, невидимые ни одной активной транзакции, освобождаются автоматически.
-- **Статистика `ANALYZE`** — NDV, MCV (top-K самых частых значений) и equi-depth гистограммы по колонкам; смотреть через `SHOW STATS [FOR <table>]`.
-- **Cost-based оптимизатор** — оценка селективности по MCV/гистограммам, кардинальность join по NDV, жадная переупорядочка left-deep INNER-join цепочек по наименьшей кардинальности. Внешние джойны консервативно остаются в исходном порядке.
-- **Чистый break** — формат хранения v0.2 несовместим с v0.1 (новый magic stamp BSDB).
+- **Slotted pages (8KB)** - файл каждой таблицы - последовательность страниц фиксированного размера с 32-байтным заголовком и слот-директорией.
+- **Контрольные суммы страниц (CRC32)** - каждая страница вычисляет checksum при записи и сверяет его при чтении. Тихая порча данных всплывает сразу как `ChecksumMismatch`, а не через недели.
+- **Целостность WAL** - строгая цепочка LSN (каждая запись хранит `prev_lsn`), CRC32 на каждую запись (заголовок + payload), детекция torn-write при восстановлении. Любой битый бит в WAL прерывает replay с `WalCorrupted` вместо тихой выдачи неверных данных.
+- **Атомарная запись файлов** - файлы таблиц (`*.tbl`) и каталог (`catalog.bin`) пишутся через `*.tmp` → `fsync` → `rename`. Падение посреди записи оставляет либо старый файл целиком, либо новый файл целиком - никаких полузаписанных смесей. Оба формата теперь хранят CRC32-trailer по payload.
+- **Buffer pool с LRU-K (K=2)** - кеш страниц с ограниченной памятью вместо «прочитать всё при старте».
+- **WAL group commit** - fsync-батчинг по схеме лидер/последователь снижает число синхронизаций при параллельной записи.
+- **Фоновые воркеры** - отдельные потоки для flush WAL, записи грязных страниц, периодических чекпоинтов и vacuum/GC MVCC.
+- **Сборщик мусора MVCC** - старые версии, невидимые ни одной активной транзакции, освобождаются автоматически.
+- **Статистика `ANALYZE`** - NDV, MCV (top-K самых частых значений) и equi-depth гистограммы по колонкам; смотреть через `SHOW STATS [FOR <table>]`.
+- **Cost-based оптимизатор** - оценка селективности по MCV/гистограммам, кардинальность join по NDV, жадная переупорядочка left-deep INNER-join цепочек по наименьшей кардинальности. Внешние джойны консервативно остаются в исходном порядке.
+- **Чистый break** - формат хранения v0.2 несовместим с v0.1 (новый magic stamp BSDB).
 
 ### Состояние
 
@@ -408,7 +414,7 @@ DROP DATABASE analytics;         -- удалить БД (нельзя удали
 
 #### Встроенные функции даты/времени
 
-`NOW()`, `CURRENT_TIMESTAMP` → нативный `Timestamp` (микросекунды от эпохи). `CURRENT_DATE()` → нативный `Date`. Используйте в `INSERT` / `WHERE` — executor сохранит типизированное значение, а не строку.
+`NOW()`, `CURRENT_TIMESTAMP` → нативный `Timestamp` (микросекунды от эпохи). `CURRENT_DATE()` → нативный `Date`. Используйте в `INSERT` / `WHERE` - executor сохранит типизированное значение, а не строку.
 
 #### Транзакции
 
@@ -447,7 +453,7 @@ SHOW STATS FOR users;      -- по колонкам: row count / null fraction /
 SHOW STATS;                -- сводка по всем таблицам
 ```
 
-Оптимизатор использует этот каталог для оценки селективности и кардинальности джойнов. Без статистики планы возвращаются к исходному порядку — поведение совпадает с v0.1.
+Оптимизатор использует этот каталог для оценки селективности и кардинальности джойнов. Без статистики планы возвращаются к исходному порядку - поведение совпадает с v0.1.
 
 ### Режимы хранения
 
@@ -481,9 +487,9 @@ ByteDB сохраняет базу как директорию на диске. 
     └── snapshot_*.bin
 ```
 
-- **Файлы таблиц** (`databases/<db>/tables/<table>.tbl`) — каждый зафиксированный `INSERT/UPDATE/DELETE` атомарно перезаписывает файл соответствующей таблицы (через `rename`). **Схема и данные хранятся раздельно**: `catalog.bin` для метаданных, `*.tbl` для строк. Никаких периодических флашей не нужно — файл на диске всегда актуален после успешной мутации.
-- **WAL** (`bytedb.wal`) — durability для in-flight транзакций; на рестарте REDO/UNDO.
-- **Snapshots** (`snapshots/`) — опциональные архивы полного состояния. По умолчанию write-threshold отключён (`--snapshot-write-threshold 0`); по времени снапшоты пишутся раз в 30 минут. Чтобы выключить полностью — `--no-snapshot`. Чтобы пропустить финальный снапшот при Ctrl+C — `--no-shutdown-snapshot`.
+- **Файлы таблиц** (`databases/<db>/tables/<table>.tbl`) - каждый зафиксированный `INSERT/UPDATE/DELETE` атомарно перезаписывает файл соответствующей таблицы (через `rename`). **Схема и данные хранятся раздельно**: `catalog.bin` для метаданных, `*.tbl` для строк. Никаких периодических флашей не нужно - файл на диске всегда актуален после успешной мутации.
+- **WAL** (`bytedb.wal`) - durability для in-flight транзакций; на рестарте REDO/UNDO.
+- **Snapshots** (`snapshots/`) - опциональные архивы полного состояния. По умолчанию write-threshold отключён (`--snapshot-write-threshold 0`); по времени снапшоты пишутся раз в 30 минут. Чтобы выключить полностью - `--no-snapshot`. Чтобы пропустить финальный снапшот при Ctrl+C - `--no-shutdown-snapshot`.
 
 #### Настройка снапшотов
 

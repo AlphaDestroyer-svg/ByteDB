@@ -8,7 +8,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::error::{CoreError, Result};
 use super::log_record::{LogRecord, Lsn};
 
-const LOG_RECORD_HEADER_SIZE: usize = 8;
+const LOG_RECORD_HEADER_SIZE: usize = 16;
 
 const DEFAULT_GROUP_COMMIT_DELAY_US: u64 = 0;
 
@@ -78,13 +78,19 @@ impl LogManager {
 
     pub fn append(&self, record: LogRecord) -> Result<Lsn> {
         let lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+        let prev_lsn = lsn.saturating_sub(1);
         let data = record.serialize();
         let len = data.len() as u32;
 
+        let mut chained = Vec::with_capacity(8 + data.len());
+        chained.extend_from_slice(&prev_lsn.to_le_bytes());
+        chained.extend_from_slice(&data);
+        let checksum = crc32fast::hash(&chained);
+
         let mut writer = self.writer.lock();
         writer.write_all(&len.to_le_bytes())?;
-        let checksum = crc32fast::hash(&data);
         writer.write_all(&checksum.to_le_bytes())?;
+        writer.write_all(&prev_lsn.to_le_bytes())?;
         writer.write_all(&data)?;
 
         Ok(lsn)
@@ -164,6 +170,7 @@ impl LogManager {
         let mut file = File::open(&self.log_path)?;
         let mut records = Vec::new();
         let mut lsn: Lsn = 0;
+        let mut expected_prev: Lsn = 0;
 
         loop {
             let mut header = [0u8; LOG_RECORD_HEADER_SIZE];
@@ -175,16 +182,32 @@ impl LogManager {
 
             let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
             let expected_checksum = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            let prev_lsn = u64::from_le_bytes([
+                header[8], header[9], header[10], header[11],
+                header[12], header[13], header[14], header[15],
+            ]);
 
             let mut data = vec![0u8; len];
-            file.read_exact(&mut data)?;
+            if let Err(e) = file.read_exact(&mut data) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(CoreError::WalCorrupted(lsn + 1));
+                }
+                return Err(CoreError::Io(e));
+            }
 
-            let actual_checksum = crc32fast::hash(&data);
+            let mut chained = Vec::with_capacity(8 + data.len());
+            chained.extend_from_slice(&prev_lsn.to_le_bytes());
+            chained.extend_from_slice(&data);
+            let actual_checksum = crc32fast::hash(&chained);
             if actual_checksum != expected_checksum {
-                return Err(CoreError::WalCorrupted(lsn));
+                return Err(CoreError::WalCorrupted(lsn + 1));
+            }
+            if prev_lsn != expected_prev {
+                return Err(CoreError::WalCorrupted(lsn + 1));
             }
 
             lsn += 1;
+            expected_prev = lsn;
             if let Some(record) = LogRecord::deserialize(&data) {
                 records.push((lsn, record));
             } else {
@@ -213,6 +236,11 @@ impl LogManager {
         }
 
         Ok(count)
+    }
+
+    pub fn verify_chain(&self) -> Result<()> {
+        let _ = self.read_all_records()?;
+        Ok(())
     }
 
     pub fn truncate(&self) -> Result<()> {
@@ -298,5 +326,40 @@ mod group_commit_tests {
 
         lm.flush_through(l1).unwrap();
         assert_eq!(lm.fsync_count(), fsyncs_before);
+    }
+
+    #[test]
+    fn lsn_chain_validates_on_read() {
+        let (_d, lm) = fresh();
+        for _ in 0..5 {
+            append_commit(&lm);
+        }
+        lm.flush().unwrap();
+        let recs = lm.read_all_records().unwrap();
+        assert_eq!(recs.len(), 5);
+        assert_eq!(recs[0].0, 1);
+        assert_eq!(recs[4].0, 5);
+    }
+
+    #[test]
+    fn corrupted_wal_record_detected() {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("wal.log");
+        let lm = Arc::new(LogManager::new(&p).unwrap());
+        append_commit(&lm);
+        append_commit(&lm);
+        lm.flush().unwrap();
+        drop(lm);
+
+        let mut f = OpenOptions::new().write(true).read(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(20)).unwrap();
+        f.write_all(&[0xFF]).unwrap();
+        drop(f);
+
+        let lm2 = LogManager::new(&p).unwrap();
+        let res = lm2.read_all_records();
+        assert!(matches!(res, Err(crate::error::CoreError::WalCorrupted(_))));
     }
 }
