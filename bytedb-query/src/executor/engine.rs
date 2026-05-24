@@ -850,6 +850,9 @@ impl QueryEngine {
                 let default_val = self.eval_expr_simple(default_expr);
                 col = col.with_default(default_val);
             }
+            if let Some(len) = c.max_length {
+                col = col.with_max_length(len);
+            }
             col
         }).collect();
 
@@ -947,6 +950,9 @@ impl QueryEngine {
                 }
                 if col_def.primary_key {
                     col = col.primary_key();
+                }
+                if let Some(len) = col_def.max_length {
+                    col = col.with_max_length(len);
                 }
 
                 let mut columns = table_data.schema.columns.clone();
@@ -1119,13 +1125,13 @@ impl QueryEngine {
                     if let Some(ref indices) = col_indices {
                         for (i, e) in row_exprs.iter().enumerate() {
                             if i < indices.len() {
-                                row_values[indices[i]] = self.eval_expr_simple(e);
+                                row_values[indices[i]] = self.eval_insert_value(e, &table_data.schema, indices[i]);
                             }
                         }
                     } else {
                         for (i, e) in row_exprs.iter().enumerate() {
                             if i < num_cols {
-                                row_values[i] = self.eval_expr_simple(e);
+                                row_values[i] = self.eval_insert_value(e, &table_data.schema, i);
                             }
                         }
                     }
@@ -1176,6 +1182,13 @@ impl QueryEngine {
                 }
 
                 if !row_values[i].is_null() {
+                    if let Some(max_len) = table_data.schema.columns[i].max_length {
+                        if let Value::Text(s) = &row_values[i] {
+                            if s.len() > max_len {
+                                row_values[i] = Value::Text(s[..max_len].to_string());
+                            }
+                        }
+                    }
                     if let Value::Text(s) = &row_values[i] {
                         match col.data_type {
                             DataType::Date => {
@@ -1679,6 +1692,7 @@ impl QueryEngine {
                 unique: false,
                 auto_increment: false,
                 default: None,
+                max_length: None,
             }
         }).collect();
 
@@ -3034,7 +3048,8 @@ impl QueryEngine {
                 expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
                 data_type: *data_type,
             },
-            _ => expr.clone(),
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::WindowFunction { .. } | Expr::Default | Expr::Interval(_) => expr.clone(),
+            Expr::Literal(_) | Expr::Column(_) | Expr::JsonPath { .. } => expr.clone(),
         }
     }
 
@@ -3384,6 +3399,22 @@ impl QueryEngine {
         }
     }
 
+    fn eval_insert_value(&self, expr: &Expr, schema: &Schema, col_idx: usize) -> Value {
+        match expr {
+            Expr::Literal(LiteralValue::Integer(n)) => Value::Int64(*n),
+            Expr::Literal(LiteralValue::Float(f)) => Value::Float64(*f),
+            Expr::Literal(LiteralValue::String(s)) => Value::Text(s.clone()),
+            Expr::Literal(LiteralValue::Bool(b)) => Value::Bool(*b),
+            Expr::Literal(LiteralValue::Null) => Value::Null,
+            Expr::Default => {
+                schema.columns.get(col_idx)
+                    .and_then(|c| c.default.clone())
+                    .unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        }
+    }
+
     fn eval_expr_simple(&self, expr: &Expr) -> Value {
         match expr {
             Expr::Literal(LiteralValue::Integer(n)) => Value::Int64(*n),
@@ -3472,6 +3503,7 @@ impl QueryEngine {
                 LiteralValue::Bool(b) => Value::Bool(*b),
                 LiteralValue::Null => Value::Null,
             },
+            Expr::Interval(s) => Value::Interval(parse_interval(s).unwrap_or(0)),
             Expr::BinaryOp { left, op, right } => {
                 let lval = self.eval_value(left, tuple, schema);
                 let rval = self.eval_value(right, tuple, schema);
@@ -3482,6 +3514,11 @@ impl QueryEngine {
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
                         (Value::Text(a), Value::Text(b)) => Value::Text(format!("{}{}", a, b)),
+                        (Value::Timestamp(t), Value::Interval(i)) => Value::Timestamp(*t + i),
+                        (Value::Interval(i), Value::Timestamp(t)) => Value::Timestamp(*t + i),
+                        (Value::Date(d), Value::Interval(i)) => Value::Date(*d + *i as i32),
+                        (Value::Interval(i), Value::Date(d)) => Value::Date(*d + *i as i32),
+                        (Value::Interval(a), Value::Interval(b)) => Value::Interval(*a + *b),
                         _ => Value::Null,
                     },
                     BinOp::Minus => match (&lval, &rval) {
@@ -3489,6 +3526,9 @@ impl QueryEngine {
                         (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
+                        (Value::Timestamp(t), Value::Interval(i)) => Value::Timestamp(*t - i),
+                        (Value::Date(d), Value::Interval(i)) => Value::Date(*d - *i as i32),
+                        (Value::Interval(a), Value::Interval(b)) => Value::Interval(*a - *b),
                         _ => Value::Null,
                     },
                     BinOp::Mul => match (&lval, &rval) {
@@ -3496,6 +3536,8 @@ impl QueryEngine {
                         (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
+                        (Value::Interval(i), Value::Int64(n)) => Value::Interval(*i * n),
+                        (Value::Int64(n), Value::Interval(i)) => Value::Interval(*i * n),
                         _ => Value::Null,
                     },
                     BinOp::Div => match (&lval, &rval) {
@@ -3503,6 +3545,7 @@ impl QueryEngine {
                         (Value::Float64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(a / b),
                         (Value::Int64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(*a as f64 / b),
                         (Value::Float64(a), Value::Int64(b)) if *b != 0 => Value::Float64(a / *b as f64),
+                        (Value::Interval(i), Value::Int64(n)) if *n != 0 => Value::Interval(*i / n),
                         _ => Value::Null,
                     },
                     BinOp::Mod => match (&lval, &rval) {
@@ -4056,7 +4099,7 @@ impl QueryEngine {
                     _ => Value::Bool(false),
                 }
             }
-            Expr::JsonPath { .. } | Expr::WindowFunction { .. } => Value::Null,
+            Expr::JsonPath { .. } | Expr::WindowFunction { .. } | Expr::Default => Value::Null,
         }
     }
 
@@ -4333,6 +4376,7 @@ fn cast_value(val: Value, target: DataType) -> Value {
             Value::Date(d) => Value::Text(bytedb_core::tuple::value::format_date(d)),
             Value::Decimal(m, s) => Value::Text(bytedb_core::tuple::value::format_decimal(m, s)),
             Value::Uuid(b) => Value::Text(bytedb_core::tuple::value::format_uuid(&b)),
+            Value::Interval(us) => Value::Text(format!("{} microseconds", us)),
             Value::Null => Value::Null,
             _ => Value::Text(format!("{:?}", val)),
         },
@@ -4363,6 +4407,11 @@ fn cast_value(val: Value, target: DataType) -> Value {
             Value::Text(s) => bytedb_core::tuple::value::parse_decimal(&s).map(|(m, s)| Value::Decimal(m, s)).unwrap_or(Value::Null),
             _ => Value::Null,
         },
+        DataType::Interval => match val {
+            Value::Interval(_) => val,
+            Value::Text(s) => parse_interval(&s).map(Value::Interval).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
         _ => val,
     }
 }
@@ -4382,6 +4431,33 @@ fn now_micros() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+fn parse_interval(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let s_lower = s.to_lowercase();
+
+    let us_per_unit: i64 = if s_lower.ends_with("microsecond") || s_lower.ends_with("microseconds") {
+        1
+    } else if s_lower.ends_with("millisecond") || s_lower.ends_with("milliseconds") {
+        1000
+    } else if s_lower.ends_with("second") || s_lower.ends_with("seconds") {
+        1_000_000
+    } else if s_lower.ends_with("minute") || s_lower.ends_with("minutes") {
+        60_000_000
+    } else if s_lower.ends_with("hour") || s_lower.ends_with("hours") {
+        3_600_000_000
+    } else if s_lower.ends_with("day") || s_lower.ends_with("days") {
+        86_400_000_000
+    } else if s_lower.ends_with("week") || s_lower.ends_with("weeks") {
+        604_800_000_000
+    } else {
+        return None;
+    };
+
+    let num_str = s.trim_end_matches(|c: char| !c.is_ascii_digit()).trim();
+    let n: i64 = num_str.parse().ok()?;
+    Some(n.saturating_mul(us_per_unit))
 }
 
 fn today_days() -> i32 {

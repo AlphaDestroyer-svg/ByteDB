@@ -1055,6 +1055,116 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_default_keyword_explicit() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE items (id INT PRIMARY KEY, name TEXT DEFAULT 'unnamed', qty INT DEFAULT 0)", None).unwrap();
+        engine.execute_sql("INSERT INTO items (id, name, qty) VALUES (1, DEFAULT, DEFAULT)", None).unwrap();
+
+        let result = engine.execute_sql("SELECT name, qty FROM items WHERE id = 1", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Text("unnamed".into()));
+                assert_eq!(rows[0][1], Value::Int64(0));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_varchar_length_truncation() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE msgs (id INT PRIMARY KEY, body VARCHAR(5))", None).unwrap();
+        engine.execute_sql("INSERT INTO msgs VALUES (1, 'hello')", None).unwrap();
+        engine.execute_sql("INSERT INTO msgs VALUES (2, 'toolongname')", None).unwrap();
+
+        let result = engine.execute_sql("SELECT body FROM msgs ORDER BY id", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Text("hello".into()));
+                assert_eq!(rows[1][0], Value::Text("toolo".into()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_date_literal_in_insert() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE events (id INT PRIMARY KEY, dt DATE)", None).unwrap();
+        engine.execute_sql("INSERT INTO events VALUES (1, '2024-06-15')", None).unwrap();
+        engine.execute_sql("INSERT INTO events VALUES (2, '2024-12-25')", None).unwrap();
+
+        let result = engine.execute_sql("SELECT id, dt FROM events ORDER BY id", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][1], Value::Date(_)));
+                assert!(matches!(rows[1][1], Value::Date(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_greatest_least() {
+        let engine = setup_engine();
+        engine.execute_sql("CREATE TABLE nums (id INT PRIMARY KEY, a INT, b INT)", None).unwrap();
+        engine.execute_sql("INSERT INTO nums VALUES (1, 10, 3)", None).unwrap();
+
+        let result = engine.execute_sql("SELECT GREATEST(a, b), LEAST(a, b) FROM nums", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int64(10));
+                assert_eq!(rows[0][1], Value::Int64(3));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        let result = engine.execute_sql("SELECT GREATEST(a, b, 15) FROM nums", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Int64(15));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_interval_arithmetic() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE one_row (id INT)", None).unwrap();
+        engine.execute_sql("INSERT INTO one_row VALUES (1)", None).unwrap();
+
+        let result = engine.execute_sql("SELECT INTERVAL '2 hours' + INTERVAL '30 minutes' FROM one_row", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Interval(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        let result = engine.execute_sql("SELECT INTERVAL '3 days' - INTERVAL '1 day' FROM one_row", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Interval(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        let result = engine.execute_sql("SELECT INTERVAL '1 week' / 2 FROM one_row", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Interval(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
     fn test_count_distinct() {
         let engine = setup_engine();
 

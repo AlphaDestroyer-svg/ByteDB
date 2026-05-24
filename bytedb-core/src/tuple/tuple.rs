@@ -129,6 +129,7 @@ const TAG_TIMESTAMP: u8 = 7;
 const TAG_DATE: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
 const TAG_UUID: u8 = 10;
+const TAG_INTERVAL: u8 = 11;
 
 fn encode_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
@@ -179,6 +180,10 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
         Value::Uuid(b) => {
             buf.push(TAG_UUID);
             buf.extend_from_slice(b);
+        }
+        Value::Interval(us) => {
+            buf.push(TAG_INTERVAL);
+            buf.extend_from_slice(&us.to_le_bytes());
         }
     }
 }
@@ -253,6 +258,11 @@ fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
             b.copy_from_slice(&data[p..p+16]);
             Some((Value::Uuid(b), p + 16))
         }
+        TAG_INTERVAL => {
+            if p + 8 > data.len() { return None; }
+            let us = i64::from_le_bytes(data[p..p+8].try_into().ok()?);
+            Some((Value::Interval(us), p + 8))
+        }
         _ => None,
     }
 }
@@ -270,6 +280,7 @@ fn skip_value(data: &[u8], pos: usize) -> Option<usize> {
         TAG_DATE => Some(p + 4),
         TAG_UUID => Some(p + 16),
         TAG_DECIMAL => Some(p + 17),
+        TAG_INTERVAL => Some(p + 8),
         TAG_TEXT | TAG_BYTES | TAG_JSON => {
             if p + 4 > data.len() { return None; }
             let len = u32::from_le_bytes(data[p..p+4].try_into().ok()?) as usize;

@@ -120,6 +120,7 @@ pub enum Token {
     Serial,
     Uuid,
     Date,
+    Interval,
 
     IntLit(i64),
     FloatLit(f64),
@@ -278,6 +279,7 @@ impl Token {
             "SERIAL" => Some(Token::Serial),
             "UUID" => Some(Token::Uuid),
             "DATE" => Some(Token::Date),
+            "INTERVAL" => Some(Token::Interval),
             "TRUE" => Some(Token::BoolLit(true)),
             "FALSE" => Some(Token::BoolLit(false)),
             _ => None,

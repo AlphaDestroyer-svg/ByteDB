@@ -617,7 +617,7 @@ impl Parser {
             }
 
             let col_name = self.expect_ident()?;
-            let data_type = self.parse_data_type()?;
+            let (data_type, max_length) = self.parse_data_type()?;
 
             let mut nullable = true;
             let mut primary_key = false;
@@ -689,6 +689,7 @@ impl Parser {
             columns.push(ColumnDef {
                 name: col_name,
                 data_type,
+                max_length,
                 nullable,
                 primary_key,
                 unique,
@@ -774,7 +775,7 @@ impl Parser {
                     self.advance();
                 }
                 let col_name = self.expect_ident()?;
-                let data_type = self.parse_data_type()?;
+                let (data_type, max_length) = self.parse_data_type()?;
                 let mut nullable = true;
                 let mut primary_key = false;
                 while matches!(self.current(), Token::Not | Token::Primary | Token::Unique) {
@@ -796,6 +797,7 @@ impl Parser {
                 AlterTableAction::AddColumn(ColumnDef {
                     name: col_name,
                     data_type,
+                    max_length,
                     nullable,
                     primary_key,
                     unique: false,
@@ -1285,6 +1287,15 @@ impl Parser {
                 self.advance();
                 Expr::Literal(LiteralValue::Null)
             }
+            Token::Interval => {
+                self.advance();
+                if let Token::StringLit(s) = self.current().clone() {
+                    self.advance();
+                    Expr::Interval(s)
+                } else {
+                    return Err(QueryError::Parse("Expected string literal after INTERVAL".into()));
+                }
+            }
             Token::DollarDot => {
                 self.advance();
                 let path = self.expect_ident()?;
@@ -1319,7 +1330,7 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let expr = self.parse_expr()?;
                 self.expect(Token::As)?;
-                let data_type = self.parse_data_type()?;
+                let (data_type, _) = self.parse_data_type()?;
                 self.expect(Token::RParen)?;
                 Expr::Cast { expr: Box::new(expr), data_type }
             }
@@ -1405,12 +1416,16 @@ impl Parser {
                     e
                 }
             }
+            Token::Default => {
+                self.advance();
+                Expr::Default
+            }
             _ => return Err(QueryError::Parse(format!("Unexpected token in expression: {:?}", self.current()))),
         };
 
         while self.current() == &Token::DoubleColon {
             self.advance();
-            let data_type = self.parse_data_type()?;
+            let (data_type, _) = self.parse_data_type()?;
             expr = Expr::Cast { expr: Box::new(expr), data_type };
         }
 
@@ -1441,7 +1456,7 @@ impl Parser {
         Ok(idents)
     }
 
-    fn parse_data_type(&mut self) -> Result<DataType> {
+    fn parse_data_type(&mut self) -> Result<(DataType, Option<usize>)> {
         self.last_data_type_serial = matches!(self.current(), Token::Serial);
         let dt = match self.current() {
             Token::Int => DataType::Int64,
@@ -1461,6 +1476,7 @@ impl Parser {
             Token::Timestamp => DataType::Timestamp,
             Token::Date => DataType::Date,
             Token::Uuid => DataType::Uuid,
+            Token::Interval => DataType::Interval,
             _ => return Err(QueryError::Parse(format!("Expected data type, got {:?}", self.current()))),
         };
         self.advance();
@@ -1473,16 +1489,20 @@ impl Parser {
             }
         }
 
+        let mut max_len: Option<usize> = None;
         if self.current() == &Token::LParen {
             self.advance();
-            let _ = self.expect_integer()?;
+            let n = self.expect_integer()? as usize;
             if self.current() == &Token::Comma {
                 self.advance();
                 let _ = self.expect_integer()?;
             }
             self.expect(Token::RParen)?;
+            if matches!(dt, DataType::Text) {
+                max_len = Some(n);
+            }
         }
-        Ok(dt)
+        Ok((dt, max_len))
     }
 
     fn current(&self) -> &Token {

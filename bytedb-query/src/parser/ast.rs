@@ -82,6 +82,7 @@ pub struct CreateTableStmt {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    pub max_length: Option<usize>,
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
@@ -296,6 +297,8 @@ pub enum Expr {
         partition_by: Vec<Expr>,
         order_by: Vec<OrderByExpr>,
     },
+    Default,
+    Interval(String),
 }
 
 #[derive(Debug, Clone)]

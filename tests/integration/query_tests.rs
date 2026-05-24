@@ -248,4 +248,40 @@ mod tests {
             _ => panic!("Expected Rows"),
         }
     }
+
+    #[test]
+    fn test_default_keyword() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE t (id INT, name TEXT DEFAULT 'unnamed')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t (id) VALUES (1)").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT name FROM t WHERE id = 1").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Text("unnamed".to_string()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_varchar_length() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE t (id INT, name VARCHAR(5))").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t VALUES (1, 'hello')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t VALUES (2, 'toolongname')").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT name FROM t").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Value::Text("hello".to_string()));
+                assert_eq!(rows[1][0], Value::Text("toolo".to_string()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
 }

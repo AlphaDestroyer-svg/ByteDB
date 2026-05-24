@@ -95,5 +95,6 @@ fn format_value(val: &Value) -> String {
         Value::Date(d) => bytedb_core::tuple::value::format_date(*d),
         Value::Decimal(m, s) => bytedb_core::tuple::value::format_decimal(*m, *s),
         Value::Uuid(b) => bytedb_core::tuple::value::format_uuid(b),
+        Value::Interval(us) => format!("interval:{}", us),
     }
 }

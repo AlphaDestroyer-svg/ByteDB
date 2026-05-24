@@ -192,6 +192,10 @@ fn canonical_key(v: &Value) -> Vec<u8> {
             out.push(0x0A);
             out.extend_from_slice(u);
         }
+        Value::Interval(us) => {
+            out.push(0x0B);
+            out.extend_from_slice(&us.to_be_bytes());
+        }
     }
     out
 }

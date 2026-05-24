@@ -12,6 +12,8 @@ pub struct Column {
     pub unique: bool,
     pub auto_increment: bool,
     pub default: Option<Value>,
+    #[serde(default)]
+    pub max_length: Option<usize>,
 }
 
 impl Column {
@@ -24,6 +26,7 @@ impl Column {
             unique: false,
             auto_increment: false,
             default: None,
+            max_length: None,
         }
     }
 
@@ -50,6 +53,11 @@ impl Column {
 
     pub fn with_default(mut self, value: Value) -> Self {
         self.default = Some(value);
+        self
+    }
+
+    pub fn with_max_length(mut self, len: usize) -> Self {
+        self.max_length = Some(len);
         self
     }
 }

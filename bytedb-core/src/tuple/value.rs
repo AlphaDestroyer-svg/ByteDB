@@ -14,6 +14,7 @@ pub enum DataType {
     Date,
     Decimal,
     Uuid,
+    Interval,
 }
 
 impl fmt::Display for DataType {
@@ -29,6 +30,7 @@ impl fmt::Display for DataType {
             DataType::Date => write!(f, "DATE"),
             DataType::Decimal => write!(f, "DECIMAL"),
             DataType::Uuid => write!(f, "UUID"),
+            DataType::Interval => write!(f, "INTERVAL"),
         }
     }
 }
@@ -50,6 +52,8 @@ pub enum Value {
     Decimal(i128, u8),
 
     Uuid([u8; 16]),
+
+    Interval(i64),
 }
 
 impl Value {
@@ -66,6 +70,7 @@ impl Value {
             Value::Date(_) => Some(DataType::Date),
             Value::Decimal(_, _) => Some(DataType::Decimal),
             Value::Uuid(_) => Some(DataType::Uuid),
+            Value::Interval(_) => Some(DataType::Interval),
         }
     }
 
@@ -165,6 +170,7 @@ impl Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+            (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
             (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
                 let (na, nb) = decimal_align(*a, *sa, *b, *sb);
                 na.cmp(&nb)
@@ -313,6 +319,7 @@ impl fmt::Display for Value {
             Value::Date(v) => write!(f, "{}", format_date(*v)),
             Value::Decimal(m, s) => write!(f, "{}", format_decimal(*m, *s)),
             Value::Uuid(b) => write!(f, "{}", format_uuid(b)),
+            Value::Interval(us) => write!(f, "interval:{}", us),
         }
     }
 }
