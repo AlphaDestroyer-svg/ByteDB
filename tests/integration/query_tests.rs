@@ -146,4 +146,106 @@ mod tests {
             _ => panic!("Expected Ok"),
         }
     }
+
+    #[test]
+    fn test_scalar_subquery() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE outer_t (id INT, val INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("CREATE TABLE inner_t (id INT, x INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO outer_t VALUES (1, 10)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO outer_t VALUES (2, 20)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO inner_t VALUES (1, 100)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO inner_t VALUES (2, 200)").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT id, (SELECT x FROM inner_t WHERE id = outer_t.id) FROM outer_t").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, columns } => {
+                assert_eq!(columns.len(), 2);
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_exists() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE t1 (id INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("CREATE TABLE t2 (id INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t1 VALUES (1)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t1 VALUES (2)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO t2 VALUES (1)").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.id)").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_in_subquery() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE orders (customer_id INT, amount INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("CREATE TABLE customers (id INT, name TEXT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO customers VALUES (1, 'Alice')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO customers VALUES (2, 'Bob')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO orders VALUES (1, 100)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO orders VALUES (1, 200)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO orders VALUES (2, 50)").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 150)").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, columns } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(columns[0], "name");
+                assert_eq!(rows[0][0], Value::Text("Alice".to_string()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_distinct() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE items (id INT, tag TEXT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO items VALUES (1, 'a')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO items VALUES (2, 'b')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO items VALUES (3, 'a')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO items VALUES (4, 'b')").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO items VALUES (5, 'a')").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT DISTINCT tag FROM items").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, columns } => {
+                assert_eq!(columns, vec!["tag"]);
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_case_when() {
+        let engine = setup_engine();
+        engine.execute(Parser::new("CREATE TABLE products (id INT, name TEXT, price INT)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO products VALUES (1, 'Apple', 50)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO products VALUES (2, 'Pear', 150)").unwrap().parse(), None).unwrap();
+        engine.execute(Parser::new("INSERT INTO products VALUES (3, 'Banana', 250)").unwrap().parse(), None).unwrap();
+
+        let mut p = Parser::new("SELECT name, CASE WHEN price < 100 THEN 'cheap' WHEN price < 200 THEN 'medium' ELSE 'expensive' END AS category FROM products").unwrap();
+        let result = engine.execute(p.parse().unwrap(), None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
 }

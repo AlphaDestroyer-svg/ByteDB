@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 use std::cmp::Ordering;
+use std::thread_local;
 
 use bytedb_core::catalog::database::Database;
 use bytedb_core::catalog::table::TableMeta;
@@ -25,6 +26,14 @@ use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
 use crate::planner::optimizer::{optimize_with_stats};
 use crate::planner::physical_plan::PhysicalPlan;
+
+thread_local! {
+    static CURRENT_TXN_ID: std::cell::Cell<Option<TxnId>> = std::cell::Cell::new(None);
+}
+
+fn current_txn_id() -> Option<TxnId> {
+    CURRENT_TXN_ID.with(|c| c.get())
+}
 
 const STMT_CACHE_SIZE: usize = 256;
 
@@ -458,6 +467,14 @@ impl QueryEngine {
     }
 
     pub fn execute(&self, stmt: Statement, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
+        struct TxnGuard;
+        impl Drop for TxnGuard {
+            fn drop(&mut self) {
+                CURRENT_TXN_ID.with(|c| c.set(None));
+            }
+        }
+        CURRENT_TXN_ID.with(|c| c.set(txn_id));
+        let _guard = TxnGuard;
         match stmt {
             Statement::Begin(isolation) => {
                 let iso = isolation.unwrap_or(IsolationLevel::ReadCommitted);
@@ -4005,7 +4022,41 @@ impl QueryEngine {
                 let le_high = matches!(val.compare(&high_val), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
                 Value::Bool(ge_low && le_high)
             }
-            Expr::JsonPath { .. } | Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::WindowFunction { .. } => Value::Null,
+            Expr::Subquery(subquery) => {
+                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                match result {
+                    Ok(ExecutionResult::Rows { rows, .. }) => {
+                        if rows.len() == 1 && !rows[0].is_empty() {
+                            rows[0][0].clone()
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                }
+            }
+            Expr::Exists(subquery) => {
+                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                match result {
+                    Ok(ExecutionResult::Rows { rows, .. }) => Value::Bool(!rows.is_empty()),
+                    _ => Value::Bool(false),
+                }
+            }
+            Expr::InSubquery { expr, subquery } => {
+                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                let val = self.eval_value(expr, tuple, schema);
+                match result {
+                    Ok(ExecutionResult::Rows { rows, .. }) => {
+                        let found = rows.iter().any(|row| {
+                            if row.is_empty() { return false; }
+                            val.compare(&row[0]) == Some(std::cmp::Ordering::Equal)
+                        });
+                        Value::Bool(found)
+                    }
+                    _ => Value::Bool(false),
+                }
+            }
+            Expr::JsonPath { .. } | Expr::WindowFunction { .. } => Value::Null,
         }
     }
 
