@@ -1196,6 +1196,11 @@ impl QueryEngine {
                                     row_values[i] = Value::Date(d);
                                 }
                             }
+                            DataType::Timestamp => {
+                                if let Some(ts) = bytedb_core::tuple::value::parse_timestamp(s) {
+                                    row_values[i] = Value::Timestamp(ts);
+                                }
+                            }
                             DataType::Uuid => {
                                 if let Some(b) = bytedb_core::tuple::value::parse_uuid(s) {
                                     row_values[i] = Value::Uuid(b);
@@ -4376,6 +4381,7 @@ fn cast_value(val: Value, target: DataType) -> Value {
             Value::Date(d) => Value::Text(bytedb_core::tuple::value::format_date(d)),
             Value::Decimal(m, s) => Value::Text(bytedb_core::tuple::value::format_decimal(m, s)),
             Value::Uuid(b) => Value::Text(bytedb_core::tuple::value::format_uuid(&b)),
+            Value::Timestamp(ts) => Value::Text(bytedb_core::tuple::value::format_timestamp(ts)),
             Value::Interval(us) => Value::Text(format!("{} microseconds", us)),
             Value::Null => Value::Null,
             _ => Value::Text(format!("{:?}", val)),
@@ -4393,6 +4399,12 @@ fn cast_value(val: Value, target: DataType) -> Value {
         DataType::Date => match val {
             Value::Date(_) => val,
             Value::Text(s) => bytedb_core::tuple::value::parse_date(&s).map(Value::Date).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        DataType::Timestamp => match val {
+            Value::Timestamp(_) => val,
+            Value::Text(s) => bytedb_core::tuple::value::parse_timestamp(&s).map(Value::Timestamp).unwrap_or(Value::Null),
+            Value::Int64(n) => Value::Timestamp(n),
             _ => Value::Null,
         },
         DataType::Uuid => match val {

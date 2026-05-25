@@ -888,6 +888,26 @@ mod tests {
             }
             _ => panic!("Expected Rows"),
         }
+
+        let result = engine.execute_sql("SELECT * FROM nulls_test ORDER BY val DESC NULLS FIRST", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][1], Value::Null);
+                assert_eq!(rows[1][1], Value::Int64(30));
+                assert_eq!(rows[2][1], Value::Int64(10));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        let result = engine.execute_sql("SELECT * FROM nulls_test ORDER BY val DESC NULLS LAST", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][1], Value::Int64(30));
+                assert_eq!(rows[1][1], Value::Int64(10));
+                assert_eq!(rows[2][1], Value::Null);
+            }
+            _ => panic!("Expected Rows"),
+        }
     }
 
     #[test]
@@ -1159,6 +1179,24 @@ mod tests {
         match result {
             ExecutionResult::Rows { rows, .. } => {
                 assert!(matches!(rows[0][0], Value::Interval(_)));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_timestamp_literal() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE ts_events (id INT PRIMARY KEY, ts TIMESTAMP)", None).unwrap();
+        engine.execute_sql("INSERT INTO ts_events VALUES (1, '2024-06-15 10:30:00')", None).unwrap();
+        engine.execute_sql("INSERT INTO ts_events VALUES (2, '2024-12-25T14:45:00')", None).unwrap();
+
+        let result = engine.execute_sql("SELECT id, ts FROM ts_events ORDER BY id", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][1], Value::Timestamp(_)));
+                assert!(matches!(rows[1][1], Value::Timestamp(_)));
             }
             _ => panic!("Expected Rows"),
         }

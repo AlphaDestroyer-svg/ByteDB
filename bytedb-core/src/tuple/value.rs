@@ -241,6 +241,45 @@ pub fn format_date(days: i32) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
+pub fn parse_timestamp(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date_part, time_part) = if let Some(pos) = s.find(' ') {
+        (&s[..pos], Some(&s[pos+1..]))
+    } else if let Some(pos) = s.find('T') {
+        (&s[..pos], Some(&s[pos+1..]))
+    } else {
+        return None;
+    };
+
+    let days = parse_date(date_part)?;
+
+    let micros = match time_part {
+        Some(t) => {
+            let t = t.trim_end_matches('Z');
+            let parts: Vec<&str> = t.split(':').collect();
+            if parts.len() < 2 { return None; }
+            let h: u32 = parts[0].parse().ok()?;
+            let m: u32 = parts[1].parse().ok()?;
+            let s: u32 = if parts.len() > 2 { parts[2].parse().ok()? } else { 0 };
+            if h > 23 || m > 59 || s > 59 { return None; }
+            ((h as i64 * 3600) + (m as i64 * 60) + s as i64) * 1_000_000
+        }
+        None => 0,
+    };
+
+    Some((days as i64 * 86400 * 1_000_000) + micros)
+}
+
+pub fn format_timestamp(us: i64) -> String {
+    let days = us / (86400 * 1_000_000);
+    let rem = us % (86400 * 1_000_000);
+    let (y, m, d) = civil_from_days(days as i32);
+    let h = rem / (3600 * 1_000_000);
+    let min = (rem % (3600 * 1_000_000)) / (60 * 1_000_000);
+    let sec = (rem % (60 * 1_000_000)) / 1_000_000;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, min, sec)
+}
+
 fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     let y = y - if m <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
