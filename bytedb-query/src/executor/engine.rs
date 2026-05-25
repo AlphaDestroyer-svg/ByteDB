@@ -2184,6 +2184,7 @@ impl QueryEngine {
             LiteralValue::String(s) => Value::Text(s.clone()),
             LiteralValue::Bool(b) => Value::Bool(*b),
             LiteralValue::Null => Value::Null,
+            LiteralValue::HexBlob(bytes) => Value::Bytes(bytes.clone()),
         };
         let tuple = Tuple::new(vec![value]);
         tuple.key_bytes(&[0])
@@ -3411,6 +3412,7 @@ impl QueryEngine {
             Expr::Literal(LiteralValue::String(s)) => Value::Text(s.clone()),
             Expr::Literal(LiteralValue::Bool(b)) => Value::Bool(*b),
             Expr::Literal(LiteralValue::Null) => Value::Null,
+            Expr::Literal(LiteralValue::HexBlob(bytes)) => Value::Bytes(bytes.clone()),
             Expr::Default => {
                 schema.columns.get(col_idx)
                     .and_then(|c| c.default.clone())
@@ -3507,6 +3509,7 @@ impl QueryEngine {
                 LiteralValue::String(s) => Value::Text(s.clone()),
                 LiteralValue::Bool(b) => Value::Bool(*b),
                 LiteralValue::Null => Value::Null,
+                LiteralValue::HexBlob(bytes) => Value::Bytes(bytes.clone()),
             },
             Expr::Interval(s) => Value::Interval(parse_interval(s).unwrap_or(0)),
             Expr::BinaryOp { left, op, right } => {
@@ -3680,10 +3683,29 @@ impl QueryEngine {
                             }
                         } else { Value::Null }
                     }
-                    "LENGTH" => {
+                    "BLOB_SIZE" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Bytes(b) => Value::Int64(b.len() as i64),
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "BLOB" => {
+                        if let Some(arg) = args.first() {
+                            match self.eval_value(arg, tuple, schema) {
+                                Value::Text(s) => Value::Bytes(s.into_bytes()),
+                                Value::Bytes(b) => Value::Bytes(b),
+                                Value::Null => Value::Null,
+                                _ => Value::Null,
+                            }
+                        } else { Value::Null }
+                    }
+                    "LENGTH" | "OCTET_LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
                         if let Some(arg) = args.first() {
                             match self.eval_value(arg, tuple, schema) {
                                 Value::Text(s) => Value::Int64(s.len() as i64),
+                                Value::Bytes(b) => Value::Int64(b.len() as i64),
                                 _ => Value::Null,
                             }
                         } else { Value::Null }
@@ -3796,6 +3818,14 @@ impl QueryEngine {
                                         _ => s.chars().skip(start).collect(),
                                     };
                                     Value::Text(result)
+                                }
+                                (Value::Bytes(b), Value::Int64(start)) => {
+                                    let start = (start.max(1) - 1) as usize;
+                                    let result: Vec<u8> = match len {
+                                        Some(Value::Int64(l)) => b.into_iter().skip(start).take(l.max(0) as usize).collect(),
+                                        _ => b.into_iter().skip(start).collect(),
+                                    };
+                                    Value::Bytes(result)
                                 }
                                 _ => Value::Null,
                             }
@@ -4422,6 +4452,12 @@ fn cast_value(val: Value, target: DataType) -> Value {
         DataType::Interval => match val {
             Value::Interval(_) => val,
             Value::Text(s) => parse_interval(&s).map(Value::Interval).unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        DataType::Bytes => match val {
+            Value::Bytes(_) => val,
+            Value::Text(s) => Value::Bytes(s.into_bytes()),
+            Value::Null => Value::Null,
             _ => Value::Null,
         },
         _ => val,

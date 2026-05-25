@@ -1,6 +1,28 @@
 use super::token::Token;
 use crate::error::{QueryError, Result};
 
+fn decode_hex(hex: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars().peekable();
+    while let Some(h) = chars.next() {
+        let h = h.to_ascii_lowercase();
+        let l = chars.next().unwrap_or('0').to_ascii_lowercase();
+        let high = hex_char_to_nibble(h);
+        let low = hex_char_to_nibble(l);
+        bytes.push((high << 4) | low);
+    }
+    bytes
+}
+
+fn hex_char_to_nibble(c: char) -> u8 {
+    match c {
+        '0'..='9' => c as u8 - b'0',
+        'a'..='f' => c as u8 - b'a' + 10,
+        'A'..='F' => c as u8 - b'A' + 10,
+        _ => 0,
+    }
+}
+
 pub struct Lexer {
     input: Vec<char>,
     pos: usize,
@@ -113,7 +135,24 @@ impl Lexer {
             }
             '"' | '\'' => self.read_string(ch),
             c if c.is_ascii_digit() => self.read_number(),
-            c if c.is_alphabetic() || c == '_' => self.read_identifier(),
+            c if c.is_alphabetic() || c == '_' => {
+                let start = self.pos;
+                let first = self.input[self.pos];
+                if (first.eq_ignore_ascii_case(&'x') || first.eq_ignore_ascii_case(&'X'))
+                    && self.peek_next() == Some('\'')
+                {
+                    return self.read_hex_blob();
+                }
+                while self.pos < self.input.len() && (self.input[self.pos].is_alphanumeric() || self.input[self.pos] == '_') {
+                    self.pos += 1;
+                }
+                let ident: String = self.input[start..self.pos].iter().collect();
+                if let Some(keyword) = Token::is_keyword(&ident) {
+                    Ok(keyword)
+                } else {
+                    Ok(Token::Ident(ident))
+                }
+            }
             _ => {
                 self.pos += 1;
                 Err(QueryError::Parse(format!("Unexpected character: '{}'", ch)))
@@ -161,6 +200,12 @@ impl Lexer {
             self.pos += 1;
         }
 
+        if start < self.pos && self.input[start] == '0' && self.pos == start + 1 {
+            if self.peek_next() == Some('\'') {
+                return self.read_hex_blob();
+            }
+        }
+
         let num_str: String = self.input[start..self.pos].iter().collect();
         if is_float {
             let val: f64 = num_str.parse()
@@ -170,20 +215,6 @@ impl Lexer {
             let val: i64 = num_str.parse()
                 .map_err(|_| QueryError::Parse(format!("Invalid integer: {}", num_str)))?;
             Ok(Token::IntLit(val))
-        }
-    }
-
-    fn read_identifier(&mut self) -> Result<Token> {
-        let start = self.pos;
-        while self.pos < self.input.len() && (self.input[self.pos].is_alphanumeric() || self.input[self.pos] == '_') {
-            self.pos += 1;
-        }
-        let ident: String = self.input[start..self.pos].iter().collect();
-
-        if let Some(keyword) = Token::is_keyword(&ident) {
-            Ok(keyword)
-        } else {
-            Ok(Token::Ident(ident))
         }
     }
 
@@ -197,6 +228,37 @@ impl Lexer {
         while self.pos < self.input.len() && self.input[self.pos] != '\n' {
             self.pos += 1;
         }
+    }
+
+    fn read_hex_blob(&mut self) -> Result<Token> {
+        self.pos += 1;
+        if self.pos >= self.input.len() || self.input[self.pos] != '\'' {
+            return Err(QueryError::Parse("Expected '\'' after x".into()));
+        }
+        self.pos += 1;
+        let mut hex = String::new();
+        while self.pos < self.input.len() && self.input[self.pos] != '\'' {
+            let c = self.input[self.pos];
+            if c.is_ascii_hexdigit() {
+                hex.push(c);
+            } else if !c.is_whitespace() {
+                return Err(QueryError::Parse(format!(
+                    "Invalid hex character '{}' in blob literal", c
+                )));
+            }
+            self.pos += 1;
+        }
+        if self.pos >= self.input.len() {
+            return Err(QueryError::Parse("Unterminated blob literal".into()));
+        }
+        self.pos += 1;
+        if hex.len() % 2 != 0 {
+            return Err(QueryError::Parse(
+                "Blob literal must have even number of hex digits".into()
+            ));
+        }
+        let bytes = decode_hex(&hex);
+        Ok(Token::HexBlob(bytes))
     }
 
     fn peek_next(&self) -> Option<char> {

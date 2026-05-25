@@ -121,6 +121,9 @@ pub enum Token {
     Uuid,
     Date,
     Interval,
+    Blob,
+
+    HexBlob(Vec<u8>),
 
     IntLit(i64),
     FloatLit(f64),
@@ -280,6 +283,7 @@ impl Token {
             "UUID" => Some(Token::Uuid),
             "DATE" => Some(Token::Date),
             "INTERVAL" => Some(Token::Interval),
+            "BLOB" => Some(Token::Blob),
             "TRUE" => Some(Token::BoolLit(true)),
             "FALSE" => Some(Token::BoolLit(false)),
             _ => None,

@@ -308,6 +308,7 @@ pub enum LiteralValue {
     String(String),
     Bool(bool),
     Null,
+    HexBlob(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

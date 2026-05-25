@@ -12,6 +12,9 @@ crossbeam = "0.8"
 crc32fast = "1"
 bytes = "1"
 ahash = "0.8"
+lz4_flex = "0.11"
+zstd = "0.13"
+uuid.workspace = true
 
 [features]
 default = []

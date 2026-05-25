@@ -1203,6 +1203,53 @@ mod tests {
     }
 
     #[test]
+    fn test_blob_hex_literal() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE files (id INT PRIMARY KEY, data BYTES)", None).unwrap();
+        engine.execute_sql("INSERT INTO files VALUES (1, x'474961')", None).unwrap();
+        engine.execute_sql("INSERT INTO files VALUES (2, X'deadbeef')", None).unwrap();
+
+        let result = engine.execute_sql("SELECT id, data FROM files ORDER BY id", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                let db = &rows[0][1];
+                if let Value::Bytes(b) = db {
+                    assert_eq!(b.len(), 3);
+                    assert_eq!(b, b"GIa");
+                } else {
+                    panic!("expected Bytes, got {:?}", db);
+                }
+                let db = &rows[1][1];
+                if let Value::Bytes(b) = db {
+                    assert_eq!(b.len(), 4);
+                    assert_eq!(b[0], 0xde);
+                    assert_eq!(b[3], 0xef);
+                } else {
+                    panic!("expected Bytes, got {:?}", db);
+                }
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_blob_type_alias() {
+        let engine = setup_engine();
+
+        engine.execute_sql("CREATE TABLE blobs (id INT PRIMARY KEY, payload BLOB)", None).unwrap();
+        engine.execute_sql("INSERT INTO blobs VALUES (1, x'01020304')", None).unwrap();
+
+        let result = engine.execute_sql("SELECT payload FROM blobs", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert!(matches!(rows[0][0], Value::Bytes(ref b) if b.len() == 4));
+            }
+            _ => panic!("Expected Rows"),
+        }
+    }
+
+    #[test]
     fn test_count_distinct() {
         let engine = setup_engine();
 

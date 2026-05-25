@@ -13,6 +13,8 @@ pub mod metrics;
 pub mod backup;
 pub mod migration;
 pub mod chaos;
+pub mod compress;
+pub mod blob;
 pub mod error;
 
 #[cfg(test)]
@@ -250,5 +252,43 @@ mod tests {
         assert_eq!(Value::Int64(1).compare(&Value::Int64(2)), Some(std::cmp::Ordering::Less));
         assert_eq!(Value::Text("a".into()).compare(&Value::Text("b".into())), Some(std::cmp::Ordering::Less));
         assert_eq!(Value::Null.compare(&Value::Int64(1)), Some(std::cmp::Ordering::Less));
+    }
+
+    #[test]
+    fn test_compress_round_trip() {
+        use crate::compress;
+        let data: Vec<u8> = (0..2000).map(|i| (i % 256) as u8).collect();
+        let (encoded, _) = compress::compress(&data).unwrap();
+        let decoded = compress::decompress(&encoded).unwrap();
+        assert_eq!(decoded, data);
+        let ratio = encoded.len() as f64 / data.len() as f64;
+        assert!(ratio < 0.5, "compressed size {} vs original {} (ratio {})", encoded.len(), data.len(), ratio);
+    }
+
+    #[test]
+    fn test_tuple_bytes_compression() {
+        let data: Vec<u8> = (0..2000).map(|i| (i % 256) as u8).collect();
+        let tuple = Tuple::new(vec![Value::Int64(1), Value::Bytes(data.clone())]);
+        let ser = tuple.serialize();
+        let deser = Tuple::deserialize(&ser).expect("deserialize returned None");
+        if let Value::Bytes(d) = &deser.values[1] {
+            assert_eq!(d, &data);
+        } else {
+            panic!("expected Bytes, got {:?}", deser.values[1]);
+        }
+    }
+
+    #[test]
+    fn test_blob_max_length_validation() {
+        use crate::error::CoreError;
+        use crate::tuple::schema::Column;
+        let col = Column::new("data", DataType::Bytes).with_max_length(5);
+        let schema = Schema::new("t", vec![col]);
+
+        let ok = Tuple::new(vec![Value::Bytes(vec![1, 2, 3])]);
+        assert!(ok.validate(&schema).is_ok());
+
+        let big = Tuple::new(vec![Value::Bytes(vec![1, 2, 3, 4, 5, 6])]);
+        assert!(matches!(big.validate(&schema), Err(CoreError::ValueTooLarge(_))));
     }
 }

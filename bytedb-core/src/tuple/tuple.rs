@@ -2,6 +2,7 @@ use serde::{Serialize, Deserialize};
 use super::value::Value;
 use super::schema::Schema;
 use crate::error::{CoreError, Result};
+use crate::compress;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tuple {
@@ -52,6 +53,12 @@ impl Tuple {
                         expected: col.data_type.to_string(),
                         got: vtype.to_string(),
                     });
+                }
+            }
+
+            if let (Some(max_len), Value::Bytes(b)) = (col.max_length, value) {
+                if b.len() > max_len {
+                    return Err(CoreError::ValueTooLarge(b.len()));
                 }
             }
         }
@@ -153,9 +160,13 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(bytes);
         }
         Value::Bytes(b) => {
-            buf.push(TAG_BYTES);
-            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            buf.extend_from_slice(b);
+            if let Some((compressed, _)) = compress::compress(b) {
+                buf.extend_from_slice(&compressed);
+            } else {
+                buf.push(TAG_BYTES);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
         }
         Value::Json(j) => {
             buf.push(TAG_JSON);
@@ -227,6 +238,14 @@ fn decode_value(data: &[u8], pos: usize) -> Option<(Value, usize)> {
             let b = data[p..p+len].to_vec();
             Some((Value::Bytes(b), p + len))
         }
+        12 | 13 => {
+            if p + 13 > data.len() { return None; }
+            let comp_size = u32::from_le_bytes(data[p+8..p+12].try_into().ok()?) as usize;
+            let end = pos + 13 + comp_size;
+            if end > data.len() { return None; }
+            let b = compress::decompress(&data[pos..end])?;
+            Some((Value::Bytes(b), end))
+        }
         TAG_JSON => {
             if p + 4 > data.len() { return None; }
             let len = u32::from_le_bytes(data[p..p+4].try_into().ok()?) as usize;
@@ -281,6 +300,11 @@ fn skip_value(data: &[u8], pos: usize) -> Option<usize> {
         TAG_UUID => Some(p + 16),
         TAG_DECIMAL => Some(p + 17),
         TAG_INTERVAL => Some(p + 8),
+        12 | 13 => {
+            if p + 12 > data.len() { return None; }
+            let comp_size = u32::from_le_bytes(data[p+8..p+12].try_into().ok()?) as usize;
+            Some(p + 13 + comp_size)
+        }
         TAG_TEXT | TAG_BYTES | TAG_JSON => {
             if p + 4 > data.len() { return None; }
             let len = u32::from_le_bytes(data[p..p+4].try_into().ok()?) as usize;

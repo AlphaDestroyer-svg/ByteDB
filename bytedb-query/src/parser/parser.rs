@@ -1287,6 +1287,10 @@ impl Parser {
                 self.advance();
                 Expr::Literal(LiteralValue::Null)
             }
+            Token::HexBlob(bytes) => {
+                self.advance();
+                Expr::Literal(LiteralValue::HexBlob(bytes.clone()))
+            }
             Token::Interval => {
                 self.advance();
                 if let Token::StringLit(s) = self.current().clone() {
@@ -1472,6 +1476,7 @@ impl Parser {
             Token::Varchar => DataType::Text,
             Token::Bool => DataType::Bool,
             Token::Bytes => DataType::Bytes,
+            Token::Blob => DataType::Bytes,
             Token::Json => DataType::Json,
             Token::Timestamp => DataType::Timestamp,
             Token::Date => DataType::Date,
@@ -1498,7 +1503,7 @@ impl Parser {
                 let _ = self.expect_integer()?;
             }
             self.expect(Token::RParen)?;
-            if matches!(dt, DataType::Text) {
+            if matches!(dt, DataType::Text | DataType::Bytes) {
                 max_len = Some(n);
             }
         }
