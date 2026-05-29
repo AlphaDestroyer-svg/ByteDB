@@ -3460,7 +3460,7 @@ impl QueryEngine {
                                 _ => false,
                             },
                             BinOp::Ilike => match (&lval, &rval) {
-                                (Value::Text(s), Value::Text(pattern)) => like_match(&s.to_lowercase(), &pattern.to_lowercase()),
+                                (Value::Text(s), Value::Text(pattern)) => ilike_match(s, pattern),
                                 _ => false,
                             },
                             _ => false,
@@ -3587,7 +3587,7 @@ impl QueryEngine {
                     },
                     BinOp::Ilike => match (&lval, &rval) {
                         (Value::Text(s), Value::Text(pattern)) => {
-                            Value::Bool(like_match(&s.to_lowercase(), &pattern.to_lowercase()))
+                            Value::Bool(ilike_match(s, pattern))
                         }
                         _ => Value::Null,
                     },
@@ -4560,26 +4560,79 @@ fn extract_from_timestamp(field: &str, val: &Value) -> Value {
 }
 
 fn like_match(s: &str, pattern: &str) -> bool {
+    if pattern.is_ascii() && s.is_ascii() {
+        return like_match_ascii(s.as_bytes(), pattern.as_bytes(), false);
+    }
     let s_chars: Vec<char> = s.chars().collect();
     let p_chars: Vec<char> = pattern.chars().collect();
-    like_match_inner(&s_chars, &p_chars)
+    like_match_inner(&s_chars, &p_chars, false)
 }
 
-fn like_match_inner(s: &[char], p: &[char]) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
+fn ilike_match(s: &str, pattern: &str) -> bool {
+    if pattern.is_ascii() && s.is_ascii() {
+        return like_match_ascii(s.as_bytes(), pattern.as_bytes(), true);
     }
-    match p[0] {
-        '%' => {
-            like_match_inner(s, &p[1..]) || (!s.is_empty() && like_match_inner(&s[1..], p))
-        }
-        '_' => {
-            !s.is_empty() && like_match_inner(&s[1..], &p[1..])
-        }
-        c => {
-            !s.is_empty() && s[0] == c && like_match_inner(&s[1..], &p[1..])
+    let s_chars: Vec<char> = s.chars().flat_map(|c| c.to_lowercase()).collect();
+    let p_chars: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
+    like_match_inner(&s_chars, &p_chars, false)
+}
+
+fn ascii_eq(a: u8, b: u8, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
+fn like_match_ascii(s: &[u8], p: &[u8], case_insensitive: bool) -> bool {
+    let mut si = 0usize;
+    let mut pi = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'_' || ascii_eq(p[pi], s[si], case_insensitive)) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == b'%' {
+            star = Some((pi, si));
+            pi += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp + 1;
+            si = ss + 1;
+            star = Some((sp, si));
+        } else {
+            return false;
         }
     }
+    while pi < p.len() && p[pi] == b'%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn like_match_inner(s: &[char], p: &[char], _case_insensitive: bool) -> bool {
+    let mut si = 0usize;
+    let mut pi = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi, si));
+            pi += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp + 1;
+            si = ss + 1;
+            star = Some((sp, si));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn ast_fk_action_to_core(a: crate::parser::ast::FkAction) -> bytedb_core::tuple::schema::FkAction {

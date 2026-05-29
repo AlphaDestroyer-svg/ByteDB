@@ -83,10 +83,20 @@ pub struct LockMetrics {
     pub total_wait_micros: u64,
 }
 
+#[derive(Default)]
+struct LockMetricsAtomic {
+    acquires: AtomicU64,
+    releases: AtomicU64,
+    waits: AtomicU64,
+    timeouts: AtomicU64,
+    deadlocks: AtomicU64,
+    total_wait_micros: AtomicU64,
+}
+
 pub struct LockManager {
     locks: Mutex<HashMap<LockKey, LockState>>,
     cv: Condvar,
-    metrics: Mutex<LockMetrics>,
+    metrics: LockMetricsAtomic,
     default_timeout: Mutex<Duration>,
     deadlock_check_interval: AtomicU64,
 }
@@ -96,7 +106,7 @@ impl LockManager {
         LockManager {
             locks: Mutex::new(HashMap::new()),
             cv: Condvar::new(),
-            metrics: Mutex::new(LockMetrics::default()),
+            metrics: LockMetricsAtomic::default(),
             default_timeout: Mutex::new(Duration::from_secs(5)),
             deadlock_check_interval: AtomicU64::new(50),
         }
@@ -115,7 +125,14 @@ impl LockManager {
     }
 
     pub fn metrics(&self) -> LockMetrics {
-        self.metrics.lock().clone()
+        LockMetrics {
+            acquires: self.metrics.acquires.load(Ordering::Relaxed),
+            releases: self.metrics.releases.load(Ordering::Relaxed),
+            waits: self.metrics.waits.load(Ordering::Relaxed),
+            timeouts: self.metrics.timeouts.load(Ordering::Relaxed),
+            deadlocks: self.metrics.deadlocks.load(Ordering::Relaxed),
+            total_wait_micros: self.metrics.total_wait_micros.load(Ordering::Relaxed),
+        }
     }
 
     pub fn acquire(&self, txn: TxnId, key: LockKey, mode: LockMode) -> Result<()> {
@@ -146,10 +163,10 @@ impl LockManager {
                 }
             };
             if granted {
-                self.metrics.lock().acquires += 1;
-                let waited = start.elapsed();
-                if waited > Duration::from_micros(0) {
-                    self.metrics.lock().total_wait_micros += waited.as_micros() as u64;
+                self.metrics.acquires.fetch_add(1, Ordering::Relaxed);
+                let waited = start.elapsed().as_micros() as u64;
+                if waited > 0 {
+                    self.metrics.total_wait_micros.fetch_add(waited, Ordering::Relaxed);
                 }
                 return Ok(());
             }
@@ -158,21 +175,21 @@ impl LockManager {
                 let state = guard.get_mut(&key).expect("entry just inserted");
                 if !state.waiters.iter().any(|w| w.txn == txn) {
                     state.waiters.push_back(WaitEntry { txn, mode });
-                    self.metrics.lock().waits += 1;
+                    self.metrics.waits.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
             if self.detect_deadlock(&guard, txn) {
                 self.remove_waiter_locked(&mut guard, &key, txn);
-                self.metrics.lock().deadlocks += 1;
+                self.metrics.deadlocks.fetch_add(1, Ordering::Relaxed);
                 return Err(CoreError::Deadlock);
             }
 
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 self.remove_waiter_locked(&mut guard, &key, txn);
-                self.metrics.lock().timeouts += 1;
-                self.metrics.lock().total_wait_micros += elapsed.as_micros() as u64;
+                self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+                self.metrics.total_wait_micros.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
                 return Err(CoreError::LockTimeout(txn));
             }
             let remaining = timeout - elapsed;
@@ -197,7 +214,7 @@ impl LockManager {
         let mut empty = false;
         if let Some(state) = guard.get_mut(key) {
             if state.remove_holder(txn) {
-                self.metrics.lock().releases += 1;
+                self.metrics.releases.fetch_add(1, Ordering::Relaxed);
             }
             self.grant_pending(state);
             empty = state.holders.is_empty() && state.waiters.is_empty();
@@ -213,7 +230,7 @@ impl LockManager {
         let mut to_drop: Vec<LockKey> = Vec::new();
         for (k, state) in guard.iter_mut() {
             if state.remove_holder(txn) {
-                self.metrics.lock().releases += 1;
+                self.metrics.releases.fetch_add(1, Ordering::Relaxed);
             }
             state.waiters.retain(|w| w.txn != txn);
             self.grant_pending(state);

@@ -136,6 +136,12 @@ impl Page {
         crc32fast::hash(&self.data[20..])
     }
 
+    pub fn checksum_offset() -> usize { 16 }
+
+    pub fn compute_checksum_bytes(buf: &[u8; PAGE_SIZE]) -> u32 {
+        crc32fast::hash(&buf[20..])
+    }
+
     pub fn slot_count(&self) -> u16 {
         u16::from_le_bytes([self.data[20], self.data[21]])
     }

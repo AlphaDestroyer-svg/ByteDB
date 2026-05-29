@@ -1,5 +1,4 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
@@ -7,9 +6,15 @@ use parking_lot::Mutex;
 use crate::error::{CoreError, Result};
 use crate::storage::page::{Page, PageId, PAGE_SIZE};
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
 pub struct DiskManager {
     db_path: PathBuf,
-    file: Mutex<File>,
+    file: File,
+    write_lock: Mutex<()>,
     next_page_id: AtomicU32,
 }
 
@@ -31,18 +36,52 @@ impl DiskManager {
 
         Ok(DiskManager {
             db_path,
-            file: Mutex::new(file),
+            file,
+            write_lock: Mutex::new(()),
             next_page_id: AtomicU32::new(num_pages),
         })
     }
 
+    #[cfg(unix)]
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    #[cfg(unix)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        self.file.write_all_at(buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let n = self.file.seek_read(&mut buf[pos..], offset + pos as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+            }
+            pos += n;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let n = self.file.seek_write(&buf[pos..], offset + pos as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write zero"));
+            }
+            pos += n;
+        }
+        Ok(())
+    }
+
     pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         let offset = (page_id as u64) * (PAGE_SIZE as u64);
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(offset))?;
-
         let mut page = Page::new(page_id);
-        file.read_exact(&mut page.data)?;
+        self.read_at(&mut page.data, offset)?;
         page.id = page_id;
 
         let stored = page.checksum();
@@ -57,17 +96,18 @@ impl DiskManager {
 
     pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<()> {
         let offset = (page_id as u64) * (PAGE_SIZE as u64);
-        let mut buf = page.clone();
-        buf.set_checksum(0);
-        let cs = buf.compute_checksum();
-        buf.set_checksum(cs);
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&buf.data)?;
+        let mut buf = [0u8; PAGE_SIZE];
+        buf.copy_from_slice(&page.data);
+        let cs_offset = Page::checksum_offset();
+        buf[cs_offset..cs_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        let cs = Page::compute_checksum_bytes(&buf);
+        buf[cs_offset..cs_offset + 4].copy_from_slice(&cs.to_le_bytes());
+        self.write_at(&buf, offset)?;
         Ok(())
     }
 
     pub fn allocate_page(&self) -> Result<PageId> {
+        let _g = self.write_lock.lock();
         let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
         let page = Page::new(page_id);
         self.write_page(page_id, &page)?;
@@ -79,8 +119,7 @@ impl DiskManager {
     }
 
     pub fn fsync(&self) -> Result<()> {
-        let file = self.file.lock();
-        file.sync_all()?;
+        self.file.sync_all()?;
         Ok(())
     }
 
@@ -95,14 +134,11 @@ impl DiskManager {
     #[doc(hidden)]
     pub fn corrupt_byte_for_test(&self, page_id: PageId, byte_index: usize) -> Result<()> {
         let offset = (page_id as u64) * (PAGE_SIZE as u64) + byte_index as u64;
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(offset))?;
         let mut b = [0u8; 1];
-        file.read_exact(&mut b)?;
+        self.read_at(&mut b, offset)?;
         b[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&b)?;
-        file.sync_all()?;
+        self.write_at(&b, offset)?;
+        self.file.sync_all()?;
         Ok(())
     }
 }
