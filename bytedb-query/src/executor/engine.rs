@@ -1309,7 +1309,7 @@ impl QueryEngine {
                             table_data.index.insert(key, new_data)
                                 .map_err(|e| QueryError::Execution(e.to_string()))?;
                             if returning.is_some() {
-                                returned_rows.push(existing_tuple.values.to_vec());
+                                returned_rows.push(existing_tuple.to_vec());
                             }
                             count += 1;
                             continue;
@@ -1488,7 +1488,7 @@ impl QueryEngine {
                         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
                     if returning.is_some() {
-                        returned_rows.push(tuple.values.to_vec());
+                        returned_rows.push(tuple.to_vec());
                     }
                     count += 1;
                 }
@@ -1609,7 +1609,7 @@ impl QueryEngine {
                         });
                     }
                     if returning.is_some() {
-                        returned_rows.push(tuple.values.to_vec());
+                        returned_rows.push(tuple.to_vec());
                     }
                     keys_to_delete.push(key);
                     count += 1;
@@ -1786,7 +1786,7 @@ impl QueryEngine {
                 if let Some(data) = table_data.read_visible_one(&self.txn_manager, Some(tid), &key)? {
                     if let Some(tuple) = Tuple::deserialize(&data) {
                         self.account_scan_row()?;
-                        rows.push(tuple.values);
+                        rows.push((*tuple.values_ref()).clone());
                     }
                 }
             } else if let Some((lo, hi)) = self.try_pk_range(filter, &table_data.schema) {
@@ -1813,7 +1813,7 @@ impl QueryEngine {
                         if let Some(f) = filter {
                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                         }
-                        rows.push(tuple.values);
+                        rows.push((*tuple.values_ref()).clone());
                         if let Some(lim) = limit {
                             if rows.len() >= lim { break; }
                         }
@@ -1829,7 +1829,7 @@ impl QueryEngine {
                                         if let Some(f) = filter {
                                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                                         }
-                                        rows.push(tuple.values);
+                                        rows.push((*tuple.values_ref()).clone());
                                     }
                                 }
                             }
@@ -1849,7 +1849,7 @@ impl QueryEngine {
                             Some(true) => {
                                 if let Some(tuple) = Tuple::deserialize(data) {
                                     self.account_scan_row()?;
-                                    rows.push(tuple.values);
+                                    rows.push((*tuple.values_ref()).clone());
                                     if let Some(lim) = limit {
                                         if rows.len() >= lim { break; }
                                     }
@@ -1868,7 +1868,7 @@ impl QueryEngine {
                             true
                         };
                         if matches {
-                            rows.push(tuple.values);
+                            rows.push((*tuple.values_ref()).clone());
                             if let Some(lim) = limit {
                                 if rows.len() >= lim { break; }
                             }
@@ -1879,7 +1879,7 @@ impl QueryEngine {
         } else if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
             if let Ok(Some(data)) = table_data.index.search(&key) {
                 if let Some(tuple) = Tuple::deserialize(&data) {
-                    rows.push(tuple.values);
+                    rows.push((*tuple.values_ref()).clone());
                 }
             }
         } else {
@@ -1905,7 +1905,7 @@ impl QueryEngine {
                     match raw_filter_matches(data, col_idx, op_code, lit_val) {
                         Some(true) => {
                             if let Some(tuple) = Tuple::deserialize(data) {
-                                rows.push(tuple.values);
+                                rows.push((*tuple.values_ref()).clone());
                                 if let Some(lim) = scan_limit {
                                     if rows.len() >= lim { return false; }
                                 }
@@ -1923,7 +1923,7 @@ impl QueryEngine {
                         return false;
                     }
                     if let Some(tuple) = Tuple::deserialize(data) {
-                        rows.push(tuple.values);
+                        rows.push((*tuple.values_ref()).clone());
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1945,7 +1945,7 @@ impl QueryEngine {
                             true
                         };
                         if matches {
-                            rows.push(tuple.values);
+                            rows.push((*tuple.values_ref()).clone());
                             if let Some(lim) = scan_limit {
                                 if rows.len() >= lim { return false; }
                             }
@@ -2065,11 +2065,11 @@ impl QueryEngine {
                 let data = &kept_data[idx];
                 if data.is_empty() { return None; }
                 let tuple = Tuple::deserialize(data)?;
-                let k = match tuple.values.get(sort_col_idx) {
+                let k = match tuple.get(sort_col_idx) {
                     Some(Value::Int64(v)) => *v,
                     _ => i64::MIN,
                 };
-                Some((k, tuple.values))
+                Some((k, tuple.to_vec()))
             })
             .collect();
 
@@ -3140,14 +3140,16 @@ impl QueryEngine {
             } else { None }
         }).collect();
 
-        let mut groups: HashMap<Vec<Vec<u8>>, Vec<usize>> = HashMap::with_capacity(rows.len().min(1024));
+        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(rows.len().min(1024));
         for (row_idx, row) in rows.iter().enumerate() {
             self.poll_ctx()?;
-            let key: Vec<Vec<u8>> = group_indices.iter().map(|&i| {
-                self.hash_key(row.get(i).unwrap_or(&Value::Null))
-            }).collect();
-            let key_bytes: u64 = key.iter().map(|k| k.len() as u64).sum::<u64>() + 24;
-            self.account_memory(key_bytes)?;
+            let mut key = Vec::with_capacity(group_indices.len() * 16);
+            for &i in &group_indices {
+                let part = self.hash_key(row.get(i).unwrap_or(&Value::Null));
+                key.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                key.extend_from_slice(&part);
+            }
+            self.account_memory(key.len() as u64 + 24)?;
             groups.entry(key).or_default().push(row_idx);
         }
 
@@ -3494,13 +3496,15 @@ impl QueryEngine {
                 }
             }
             Expr::QualifiedColumn(table, col) => {
-                let qualified = format!("{}.{}", table, col);
-                if let Some(idx) = schema.column_index(&qualified) {
-                    tuple.get(idx).cloned().unwrap_or(Value::Null)
-                } else if let Some(idx) = schema.column_index(col) {
+                if let Some(idx) = schema.column_index(col) {
                     tuple.get(idx).cloned().unwrap_or(Value::Null)
                 } else {
-                    Value::Null
+                    let qualified = format!("{}.{}", table, col);
+                    if let Some(idx) = schema.column_index(&qualified) {
+                        tuple.get(idx).cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
                 }
             }
             Expr::Literal(lit) => match lit {
@@ -3701,10 +3705,10 @@ impl QueryEngine {
                             }
                         } else { Value::Null }
                     }
-                    "LENGTH" | "OCTET_LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+                    "LENGTH" => {
                         if let Some(arg) = args.first() {
                             match self.eval_value(arg, tuple, schema) {
-                                Value::Text(s) => Value::Int64(s.len() as i64),
+                                Value::Text(s) => Value::Int64(s.chars().count() as i64),
                                 Value::Bytes(b) => Value::Int64(b.len() as i64),
                                 _ => Value::Null,
                             }
@@ -4033,6 +4037,7 @@ impl QueryEngine {
                         if let Some(arg) = args.first() {
                             match self.eval_value(arg, tuple, schema) {
                                 Value::Text(s) => Value::Int64(s.len() as i64),
+                                Value::Bytes(b) => Value::Int64(b.len() as i64),
                                 _ => Value::Null,
                             }
                         } else { Value::Null }
@@ -4160,7 +4165,7 @@ impl QueryEngine {
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(entries.len());
         for (_, data) in entries {
             if let Some(t) = Tuple::deserialize(&data) {
-                rows.push(t.values.to_vec());
+                rows.push(t.to_vec());
             }
         }
         Ok((col_names, rows))

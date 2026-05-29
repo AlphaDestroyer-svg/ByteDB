@@ -196,6 +196,17 @@ impl TransactionManager {
         self.active_txns.read().keys().copied().collect()
     }
 
+    pub fn gc_committed(&self, oldest_active_ts: Timestamp) -> usize {
+        let mut committed = self.committed_txns.write();
+        let before = committed.len();
+        committed.retain(|_, &mut ts| ts >= oldest_active_ts);
+        before - committed.len()
+    }
+
+    pub fn committed_count(&self) -> usize {
+        self.committed_txns.read().len()
+    }
+
     pub fn is_aborted(&self, txn_id: TxnId) -> bool {
 
         !self.is_active(txn_id) && !self.is_committed(txn_id)

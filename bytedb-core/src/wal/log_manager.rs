@@ -12,6 +12,8 @@ const LOG_RECORD_HEADER_SIZE: usize = 16;
 
 const DEFAULT_GROUP_COMMIT_DELAY_US: u64 = 0;
 
+const MAX_LOG_RECORD_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
     Strict,
@@ -44,19 +46,19 @@ pub struct LogManager {
 impl LogManager {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let log_path = path.as_ref().to_path_buf();
+
+        let initial_lsn = if log_path.exists() && std::fs::metadata(&log_path)?.len() > 0 {
+            Self::scan_and_repair(&log_path)?
+        } else {
+            0
+        };
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
             .open(&log_path)?;
-
-        let file_len = file.metadata()?.len();
-        let initial_lsn = if file_len > 0 {
-            Self::count_records(&log_path)?
-        } else {
-            0
-        };
 
         Ok(LogManager {
             log_path,
@@ -72,6 +74,57 @@ impl LogManager {
             commits_served: AtomicU64::new(0),
             relaxed_acks: AtomicU64::new(0),
         })
+    }
+
+    fn scan_and_repair(path: &Path) -> Result<u64> {
+        let mut file = File::open(path)?;
+        let total_len = file.metadata()?.len();
+        let mut lsn: u64 = 0;
+        let mut expected_prev: u64 = 0;
+        let mut last_good_offset: u64 = 0;
+
+        loop {
+            let mut header = [0u8; LOG_RECORD_HEADER_SIZE];
+            match file.read_exact(&mut header) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(CoreError::Io(e)),
+            }
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let expected_checksum = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            let prev_lsn = u64::from_le_bytes([
+                header[8], header[9], header[10], header[11],
+                header[12], header[13], header[14], header[15],
+            ]);
+            let frame_end = last_good_offset + LOG_RECORD_HEADER_SIZE as u64 + len as u64;
+
+            if len > MAX_LOG_RECORD_SIZE || frame_end > total_len {
+                Self::truncate_to(path, last_good_offset)?;
+                break;
+            }
+            let mut data = vec![0u8; len];
+            if file.read_exact(&mut data).is_err() {
+                Self::truncate_to(path, last_good_offset)?;
+                break;
+            }
+            let mut chained = Vec::with_capacity(8 + data.len());
+            chained.extend_from_slice(&prev_lsn.to_le_bytes());
+            chained.extend_from_slice(&data);
+            let bad = crc32fast::hash(&chained) != expected_checksum
+                || prev_lsn != expected_prev
+                || LogRecord::deserialize(&data).is_none();
+            if bad {
+                if frame_end >= total_len {
+                    Self::truncate_to(path, last_good_offset)?;
+                    break;
+                }
+                return Err(CoreError::WalCorrupted(lsn + 1));
+            }
+            lsn += 1;
+            expected_prev = lsn;
+            last_good_offset = frame_end;
+        }
+        Ok(lsn)
     }
 
     pub fn set_durability_mode(&self, mode: DurabilityMode) {
@@ -115,6 +168,11 @@ impl LogManager {
 
     pub fn append(&self, record: LogRecord) -> Result<Lsn> {
         let data = record.serialize();
+        if data.len() > MAX_LOG_RECORD_SIZE {
+            return Err(CoreError::Internal(format!(
+                "log record too large: {} > {}", data.len(), MAX_LOG_RECORD_SIZE
+            )));
+        }
         let len = data.len() as u32;
 
         let mut writer = self.writer.lock();
@@ -231,6 +289,11 @@ impl LogManager {
                 header[12], header[13], header[14], header[15],
             ]);
 
+            if len > MAX_LOG_RECORD_SIZE {
+                Self::truncate_to(&self.log_path, last_good_offset)?;
+                break;
+            }
+
             let cur_offset = last_good_offset;
             let frame_end = cur_offset + LOG_RECORD_HEADER_SIZE as u64 + len as u64;
 
@@ -288,26 +351,6 @@ impl LogManager {
         f.set_len(offset)?;
         f.sync_all()?;
         Ok(())
-    }
-
-    fn count_records(path: &Path) -> Result<u64> {
-        let mut file = File::open(path)?;
-        let mut count: u64 = 0;
-
-        loop {
-            let mut header = [0u8; LOG_RECORD_HEADER_SIZE];
-            match file.read_exact(&mut header) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(CoreError::Io(e)),
-            }
-
-            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-            file.seek(SeekFrom::Current(len as i64))?;
-            count += 1;
-        }
-
-        Ok(count)
     }
 
     pub fn verify_chain(&self) -> Result<()> {
@@ -473,8 +516,7 @@ mod group_commit_tests {
         f.write_all(&[0xFF]).unwrap();
         drop(f);
 
-        let lm2 = LogManager::new(&p).unwrap();
-        let res = lm2.read_all_records();
+        let res = LogManager::new(&p);
         assert!(matches!(res, Err(crate::error::CoreError::WalCorrupted(_))));
     }
 }

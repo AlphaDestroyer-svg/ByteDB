@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use ahash::RandomState;
@@ -20,7 +18,7 @@ pub struct VersionedTuple {
 }
 
 pub struct VersionStore {
-    shards: Vec<RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>>>,
+    shards: Vec<RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>, RandomState>>>,
     approx_keys: AtomicUsize,
 }
 
@@ -28,7 +26,7 @@ impl VersionStore {
     pub fn new() -> Self {
         let mut shards = Vec::with_capacity(SHARD_COUNT);
         for _ in 0..SHARD_COUNT {
-            shards.push(RwLock::new(HashMap::new()));
+            shards.push(RwLock::new(HashMap::with_hasher(RandomState::new())));
         }
         VersionStore { shards, approx_keys: AtomicUsize::new(0) }
     }
@@ -38,12 +36,15 @@ impl VersionStore {
     }
 
     fn shard_index(key: &[u8]) -> usize {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        (h.finish() as usize) % SHARD_COUNT
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in key {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (h as usize) & (SHARD_COUNT - 1)
     }
 
-    fn shard_for(&self, key: &[u8]) -> &RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>>> {
+    fn shard_for(&self, key: &[u8]) -> &RwLock<HashMap<Vec<u8>, Vec<VersionedTuple>, RandomState>> {
         &self.shards[Self::shard_index(key)]
     }
 

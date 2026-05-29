@@ -271,10 +271,10 @@ mod tests {
         let tuple = Tuple::new(vec![Value::Int64(1), Value::Bytes(data.clone())]);
         let ser = tuple.serialize();
         let deser = Tuple::deserialize(&ser).expect("deserialize returned None");
-        if let Value::Bytes(d) = &deser.values[1] {
+        if let Value::Bytes(d) = deser.get(1).unwrap() {
             assert_eq!(d, &data);
         } else {
-            panic!("expected Bytes, got {:?}", deser.values[1]);
+            panic!("expected Bytes, got {:?}", deser.get(1));
         }
     }
 

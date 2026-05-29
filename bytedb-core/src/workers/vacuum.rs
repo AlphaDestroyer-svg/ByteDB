@@ -143,6 +143,8 @@ impl MvccVacuum {
             }
         }
 
+        self.txn_manager.gc_committed(oldest);
+
         self.versions_removed.fetch_add(total_v, Ordering::Relaxed);
         self.keys_removed.fetch_add(total_k, Ordering::Relaxed);
         self.runs.fetch_add(1, Ordering::Relaxed);

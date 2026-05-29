@@ -121,13 +121,7 @@ impl BPlusTree {
                         break;
                     }
                     BTreeNode::Internal(internal) => {
-                        let mut idx = internal.keys.len();
-                        for (i, k) in internal.keys.iter().enumerate() {
-                            if key.as_slice() < k.as_slice() {
-                                idx = i;
-                                break;
-                            }
-                        }
+                        let idx = internal.keys.partition_point(|k| k.as_slice() <= key.as_slice());
                         let next = Arc::clone(&internal.children[idx]);
                         path.push(Arc::clone(&current));
                         drop(node);
@@ -190,13 +184,7 @@ impl BPlusTree {
                     }
                     match &*node {
                         BTreeNode::Internal(internal) => {
-                            let mut idx = internal.keys.len();
-                            for (i, k) in internal.keys.iter().enumerate() {
-                                if split.0.as_slice() < k.as_slice() {
-                                    idx = i;
-                                    break;
-                                }
-                            }
+                            let idx = internal.keys.partition_point(|k| k.as_slice() <= split.0.as_slice());
                             let next = Arc::clone(&internal.children[idx]);
                             drop(node);
                             current = next;
@@ -227,13 +215,13 @@ impl BPlusTree {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Option<(Vec<u8>, Arc<RwLock<BTreeNode>>)> {
-        let pos = leaf.keys.iter().position(|k| k.as_slice() >= key.as_slice())
-            .unwrap_or(leaf.keys.len());
-
-        if pos < leaf.keys.len() && leaf.keys[pos] == key {
-            leaf.values[pos] = value;
-            return None;
-        }
+        let pos = match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key.as_slice())) {
+            Ok(i) => {
+                leaf.values[i] = value;
+                return None;
+            }
+            Err(i) => i,
+        };
 
         leaf.keys.insert(pos, key);
         leaf.values.insert(pos, value);
@@ -269,13 +257,7 @@ impl BPlusTree {
         split_key: Vec<u8>,
         new_child: Arc<RwLock<BTreeNode>>,
     ) -> Option<(Vec<u8>, Arc<RwLock<BTreeNode>>)> {
-        let mut idx = internal.keys.len();
-        for (i, k) in internal.keys.iter().enumerate() {
-            if split_key.as_slice() < k.as_slice() {
-                idx = i;
-                break;
-            }
-        }
+        let idx = internal.keys.partition_point(|k| k.as_slice() <= split_key.as_slice());
         internal.keys.insert(idx, split_key);
         internal.children.insert(idx + 1, new_child);
 
@@ -311,12 +293,10 @@ impl BPlusTree {
         let node = leaf_arc.read();
         match &*node {
             BTreeNode::Leaf(leaf) => {
-                for (i, k) in leaf.keys.iter().enumerate() {
-                    if k.as_slice() == key {
-                        return Ok(Some(leaf.values[i].clone()));
-                    }
+                match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+                    Ok(i) => Ok(Some(leaf.values[i].clone())),
+                    Err(_) => Ok(None),
                 }
-                Ok(None)
             }
             _ => Ok(None),
         }
@@ -327,12 +307,13 @@ impl BPlusTree {
         let mut node_w = leaf_arc.write();
         match &mut *node_w {
             BTreeNode::Leaf(leaf) => {
-                if let Some(pos) = leaf.keys.iter().position(|k| k.as_slice() == key) {
-                    leaf.keys.remove(pos);
-                    leaf.values.remove(pos);
-                    Ok(true)
-                } else {
-                    Ok(false)
+                match leaf.keys.binary_search_by(|k| k.as_slice().cmp(key)) {
+                    Ok(pos) => {
+                        leaf.keys.remove(pos);
+                        leaf.values.remove(pos);
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),
                 }
             }
             _ => Ok(false),
@@ -350,13 +331,7 @@ impl BPlusTree {
                     return current;
                 }
                 BTreeNode::Internal(internal) => {
-                    let mut idx = internal.keys.len();
-                    for (i, k) in internal.keys.iter().enumerate() {
-                        if key < k.as_slice() {
-                            idx = i;
-                            break;
-                        }
-                    }
+                    let idx = internal.keys.partition_point(|k| k.as_slice() <= key);
                     let next = Arc::clone(&internal.children[idx]);
                     drop(node);
                     current = next;
@@ -392,16 +367,26 @@ impl BPlusTree {
         let leaf_node = self.find_leaf_read(start);
         let mut current = Some(leaf_node);
 
+        let mut first = true;
         'outer: while let Some(node_arc) = current {
             let node = node_arc.read();
             match &*node {
                 BTreeNode::Leaf(leaf) => {
-                    for (i, k) in leaf.keys.iter().enumerate() {
-                        if k.as_slice() >= start && k.as_slice() <= end {
-                            results.push((k.clone(), leaf.values[i].clone()));
-                        } else if k.as_slice() > end {
+                    let start_idx = if first {
+                        first = false;
+                        match leaf.keys.binary_search_by(|k| k.as_slice().cmp(start)) {
+                            Ok(i) => i,
+                            Err(i) => i,
+                        }
+                    } else {
+                        0
+                    };
+                    for i in start_idx..leaf.keys.len() {
+                        let k = &leaf.keys[i];
+                        if k.as_slice() > end {
                             break 'outer;
                         }
+                        results.push((k.clone(), leaf.values[i].clone()));
                     }
                     current = leaf.right_link.clone();
                 }

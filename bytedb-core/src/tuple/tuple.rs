@@ -1,17 +1,48 @@
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use serde::de::{SeqAccess, Visitor};
+use std::sync::Arc;
+use std::fmt;
+use std::marker::PhantomData;
 use super::value::Value;
 use super::schema::Schema;
 use crate::error::{CoreError, Result};
 use crate::compress;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Tuple {
-    pub values: Vec<Value>,
+    values: Arc<Vec<Value>>,
+}
+
+impl Serialize for Tuple {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.values.serialize(s)
+    }
+}
+
+struct TupleVisitor(PhantomData<Vec<Value>>);
+impl<'de> Visitor<'de> for TupleVisitor {
+    type Value = Tuple;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a sequence of values")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Tuple, A::Error> {
+        let mut values = Vec::new();
+        while let Some(v) = seq.next_element()? {
+            values.push(v);
+        }
+        Ok(Tuple { values: Arc::new(values) })
+    }
+}
+
+impl<'de> Deserialize<'de> for Tuple {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Tuple, D::Error> {
+        d.deserialize_seq(TupleVisitor(PhantomData))
+    }
 }
 
 impl Tuple {
     pub fn new(values: Vec<Value>) -> Self {
-        Tuple { values }
+        Tuple { values: Arc::new(values) }
     }
 
     pub fn get(&self, index: usize) -> Option<&Value> {
@@ -20,12 +51,21 @@ impl Tuple {
 
     pub fn set(&mut self, index: usize, value: Value) {
         if index < self.values.len() {
-            self.values[index] = value;
+            Arc::make_mut(&mut self.values)[index] = value;
         }
     }
 
-    pub fn num_fields(&self) -> usize {
-        self.values.len()
+    pub fn len(&self) -> usize { self.values.len() }
+    pub fn is_empty(&self) -> bool { self.values.is_empty() }
+    pub fn iter(&self) -> std::slice::Iter<'_, Value> { self.values.iter() }
+    pub fn num_fields(&self) -> usize { self.values.len() }
+
+    pub fn to_vec(&self) -> Vec<Value> {
+        (*self.values).clone()
+    }
+
+    pub fn values_ref(&self) -> &Vec<Value> {
+        &self.values
     }
 
     pub fn validate(&self, schema: &Schema) -> Result<()> {
@@ -69,7 +109,7 @@ impl Tuple {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         buf.push(self.values.len() as u8);
-        for val in &self.values {
+        for val in &*self.values {
             encode_value(val, &mut buf);
         }
         buf
@@ -88,7 +128,7 @@ impl Tuple {
             values.push(val);
             pos = new_pos;
         }
-        Some(Tuple { values })
+        Some(Tuple { values: values.into() })
     }
 
     pub fn deserialize_columns(data: &[u8], needed: &[usize]) -> Option<Self> {
@@ -111,7 +151,7 @@ impl Tuple {
                 pos = skip_value(data, pos)?;
             }
         }
-        Some(Tuple { values })
+        Some(Tuple { values: values.into() })
     }
 
     pub fn key_bytes(&self, key_columns: &[usize]) -> Vec<u8> {

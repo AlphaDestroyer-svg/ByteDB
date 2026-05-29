@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize, Deserializer};
 use super::value::{DataType, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +81,7 @@ pub struct ForeignKey {
     pub on_update: FkAction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Schema {
     pub columns: Vec<Column>,
     pub table_name: String,
@@ -91,6 +91,30 @@ pub struct Schema {
     pub foreign_keys: Vec<ForeignKey>,
     #[serde(skip)]
     column_map: HashMap<String, usize>,
+}
+
+#[derive(Deserialize)]
+struct SchemaSerde {
+    columns: Vec<Column>,
+    table_name: String,
+    #[serde(default)]
+    check_constraints: Vec<String>,
+    #[serde(default)]
+    foreign_keys: Vec<ForeignKey>,
+}
+
+impl<'de> Deserialize<'de> for Schema {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = SchemaSerde::deserialize(d)?;
+        let column_map = s.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect();
+        Ok(Schema {
+            columns: s.columns,
+            table_name: s.table_name,
+            check_constraints: s.check_constraints,
+            foreign_keys: s.foreign_keys,
+            column_map,
+        })
+    }
 }
 
 impl Schema {

@@ -38,24 +38,34 @@ impl BufferPool {
     }
 
     pub fn fetch_page(&self, page_id: PageId) -> Result<Arc<BufferFrame>> {
-        let page_table = self.page_table.lock();
-        if let Some(&frame_id) = page_table.get(&page_id) {
-            let frame = &self.pool[frame_id];
-            frame.pin();
-            self.replacer.set_evictable(frame_id, false);
-            self.replacer.record_access(frame_id);
-            return Ok(Arc::clone(frame));
+        {
+            let page_table = self.page_table.lock();
+            if let Some(&frame_id) = page_table.get(&page_id) {
+                let frame = &self.pool[frame_id];
+                frame.pin();
+                self.replacer.set_evictable(frame_id, false);
+                self.replacer.record_access(frame_id);
+                return Ok(Arc::clone(frame));
+            }
         }
-        drop(page_table);
 
-        let frame_id = self.get_free_frame()?;
         let page = self.disk_manager.read_page(page_id)?;
+        let frame_id = self.get_free_frame()?;
         let frame = &self.pool[frame_id];
         frame.reset(page);
 
+        let mut page_table = self.page_table.lock();
+        if let Some(&existing_frame_id) = page_table.get(&page_id) {
+            self.free_list.lock().push(frame_id);
+            let existing = &self.pool[existing_frame_id];
+            existing.pin();
+            self.replacer.set_evictable(existing_frame_id, false);
+            self.replacer.record_access(existing_frame_id);
+            return Ok(Arc::clone(existing));
+        }
         self.replacer.record_access(frame_id);
         self.replacer.set_evictable(frame_id, false);
-        self.page_table.lock().insert(page_id, frame_id);
+        page_table.insert(page_id, frame_id);
 
         Ok(Arc::clone(frame))
     }

@@ -249,6 +249,7 @@ impl Server {
             tokio::select! {
                 accept_result = listener.accept() => {
                     let (stream, peer_addr) = accept_result?;
+                    let _ = stream.set_nodelay(true);
                     info!("New connection from {}", peer_addr);
 
                     let permit = match self.semaphore.clone().try_acquire_owned() {
