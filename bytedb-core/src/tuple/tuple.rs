@@ -64,6 +64,13 @@ impl Tuple {
         (*self.values).clone()
     }
 
+    pub fn into_vec(self) -> Vec<Value> {
+        match Arc::try_unwrap(self.values) {
+            Ok(v) => v,
+            Err(arc) => (*arc).clone(),
+        }
+    }
+
     pub fn values_ref(&self) -> &Vec<Value> {
         &self.values
     }

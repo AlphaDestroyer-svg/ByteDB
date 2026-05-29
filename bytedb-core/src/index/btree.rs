@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 
 use crate::error::{CoreError, Result};
@@ -7,6 +8,7 @@ pub struct BPlusTree {
     root: RwLock<Arc<RwLock<BTreeNode>>>,
     order: usize,
     name: String,
+    len: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -61,7 +63,12 @@ impl BPlusTree {
             root: RwLock::new(Arc::new(RwLock::new(leaf))),
             order,
             name: name.into(),
+            len: AtomicUsize::new(0),
         }
+    }
+
+    pub fn approx_len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
     }
 
     pub fn name(&self) -> &str {
@@ -225,6 +232,7 @@ impl BPlusTree {
 
         leaf.keys.insert(pos, key);
         leaf.values.insert(pos, value);
+        self.len.fetch_add(1, Ordering::Relaxed);
 
         if leaf.keys.len() < self.order {
             return None;
@@ -311,6 +319,7 @@ impl BPlusTree {
                     Ok(pos) => {
                         leaf.keys.remove(pos);
                         leaf.values.remove(pos);
+                        self.len.fetch_sub(1, Ordering::Relaxed);
                         Ok(true)
                     }
                     Err(_) => Ok(false),

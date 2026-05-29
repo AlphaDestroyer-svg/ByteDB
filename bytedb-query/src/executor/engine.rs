@@ -1786,7 +1786,7 @@ impl QueryEngine {
                 if let Some(data) = table_data.read_visible_one(&self.txn_manager, Some(tid), &key)? {
                     if let Some(tuple) = Tuple::deserialize(&data) {
                         self.account_scan_row()?;
-                        rows.push((*tuple.values_ref()).clone());
+                        rows.push(tuple.into_vec());
                     }
                 }
             } else if let Some((lo, hi)) = self.try_pk_range(filter, &table_data.schema) {
@@ -1813,7 +1813,7 @@ impl QueryEngine {
                         if let Some(f) = filter {
                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                         }
-                        rows.push((*tuple.values_ref()).clone());
+                        rows.push(tuple.into_vec());
                         if let Some(lim) = limit {
                             if rows.len() >= lim { break; }
                         }
@@ -1829,7 +1829,7 @@ impl QueryEngine {
                                         if let Some(f) = filter {
                                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                                         }
-                                        rows.push((*tuple.values_ref()).clone());
+                                        rows.push(tuple.into_vec());
                                     }
                                 }
                             }
@@ -1849,7 +1849,7 @@ impl QueryEngine {
                             Some(true) => {
                                 if let Some(tuple) = Tuple::deserialize(data) {
                                     self.account_scan_row()?;
-                                    rows.push((*tuple.values_ref()).clone());
+                                    rows.push(tuple.into_vec());
                                     if let Some(lim) = limit {
                                         if rows.len() >= lim { break; }
                                     }
@@ -1868,7 +1868,7 @@ impl QueryEngine {
                             true
                         };
                         if matches {
-                            rows.push((*tuple.values_ref()).clone());
+                            rows.push(tuple.into_vec());
                             if let Some(lim) = limit {
                                 if rows.len() >= lim { break; }
                             }
@@ -1879,7 +1879,7 @@ impl QueryEngine {
         } else if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
             if let Ok(Some(data)) = table_data.index.search(&key) {
                 if let Some(tuple) = Tuple::deserialize(&data) {
-                    rows.push((*tuple.values_ref()).clone());
+                    rows.push(tuple.into_vec());
                 }
             }
         } else {
@@ -1905,7 +1905,7 @@ impl QueryEngine {
                     match raw_filter_matches(data, col_idx, op_code, lit_val) {
                         Some(true) => {
                             if let Some(tuple) = Tuple::deserialize(data) {
-                                rows.push((*tuple.values_ref()).clone());
+                                rows.push(tuple.into_vec());
                                 if let Some(lim) = scan_limit {
                                     if rows.len() >= lim { return false; }
                                 }
@@ -1917,13 +1917,14 @@ impl QueryEngine {
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
+                rows.reserve(table_data.index.approx_len());
                 table_data.index.for_each(|_key, data| {
                     if let Err(e) = self.account_scan_row() {
                         *scan_err.borrow_mut() = Some(e);
                         return false;
                     }
                     if let Some(tuple) = Tuple::deserialize(data) {
-                        rows.push((*tuple.values_ref()).clone());
+                        rows.push(tuple.into_vec());
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1945,7 +1946,7 @@ impl QueryEngine {
                             true
                         };
                         if matches {
-                            rows.push((*tuple.values_ref()).clone());
+                            rows.push(tuple.into_vec());
                             if let Some(lim) = scan_limit {
                                 if rows.len() >= lim { return false; }
                             }
@@ -2234,42 +2235,67 @@ impl QueryEngine {
                     }
                 }
 
-                let new_rows: Vec<Vec<Value>> = rows.into_iter().map(|row| {
-                    let tuple = Tuple::new(row.clone());
-                    columns.iter().flat_map(|col| {
-                        match col {
-                            SelectColumn::Star => row.clone(),
-                            SelectColumn::Expr(Expr::Column(name), _) => {
-                                let idx = col_names.iter().position(|c| c == name || c.ends_with(&format!(".{}", name))).unwrap_or(0);
-                                vec![row.get(idx).cloned().unwrap_or(Value::Null)]
-                            }
-                            SelectColumn::Expr(Expr::QualifiedColumn(table, col_name), _) => {
-                                let qualified = format!("{}.{}", table, col_name);
-                                let idx = col_names.iter().position(|c| c == &qualified)
-                                    .or_else(|| col_names.iter().position(|c| c == col_name || c.ends_with(&format!(".{}", col_name))))
-                                    .unwrap_or(0);
-                                vec![row.get(idx).cloned().unwrap_or(Value::Null)]
-                            }
-                            SelectColumn::Expr(Expr::Function { name: fname, args }, _) => {
-                                let arg_name = if args.is_empty() { "*".to_string() } else {
-                                    match &args[0] {
-                                        Expr::Column(c) => c.clone(),
-                                        _ => "*".to_string(),
-                                    }
-                                };
-                                let func_col = format!("{}({})", fname.to_lowercase(), arg_name);
-                                if let Some(idx) = col_names.iter().position(|c| c == &func_col) {
-                                    vec![row.get(idx).cloned().unwrap_or(Value::Null)]
-                                } else {
-                                    let expr = Expr::Function { name: fname.clone(), args: args.clone() };
-                                    vec![self.eval_value(&expr, &tuple, &schema)]
-                                }
-                            }
-                            SelectColumn::Expr(expr, _) => {
-                                vec![self.eval_value(expr, &tuple, &schema)]
+                enum ProjStep<'a> {
+                    StarAll,
+                    Idx(usize),
+                    Eval(&'a Expr),
+                }
+                let find_col_idx = |name: &str| -> Option<usize> {
+                    col_names.iter().position(|c| c == name)
+                        .or_else(|| {
+                            let suffix = format!(".{}", name);
+                            col_names.iter().position(|c| c.ends_with(&suffix))
+                        })
+                };
+                let mut plan: Vec<ProjStep> = Vec::with_capacity(columns.len());
+                for col in columns {
+                    match col {
+                        SelectColumn::Star => plan.push(ProjStep::StarAll),
+                        SelectColumn::Expr(Expr::Column(name), _) => {
+                            let idx = find_col_idx(name).unwrap_or(0);
+                            plan.push(ProjStep::Idx(idx));
+                        }
+                        SelectColumn::Expr(Expr::QualifiedColumn(table, col_name), _) => {
+                            let qualified = format!("{}.{}", table, col_name);
+                            let idx = col_names.iter().position(|c| c == &qualified)
+                                .or_else(|| find_col_idx(col_name))
+                                .unwrap_or(0);
+                            plan.push(ProjStep::Idx(idx));
+                        }
+                        SelectColumn::Expr(expr @ Expr::Function { name: fname, args }, _) => {
+                            let arg_name = if args.is_empty() { "*".to_string() } else {
+                                match &args[0] { Expr::Column(c) => c.clone(), _ => "*".to_string() }
+                            };
+                            let func_col = format!("{}({})", fname.to_lowercase(), arg_name);
+                            if let Some(idx) = col_names.iter().position(|c| c == &func_col) {
+                                plan.push(ProjStep::Idx(idx));
+                            } else {
+                                plan.push(ProjStep::Eval(expr));
                             }
                         }
-                    }).collect()
+                        SelectColumn::Expr(expr, _) => plan.push(ProjStep::Eval(expr)),
+                    }
+                }
+
+                let out_width: usize = plan.iter().map(|s| match s {
+                    ProjStep::StarAll => col_names.len(),
+                    _ => 1,
+                }).sum();
+
+                let new_rows: Vec<Vec<Value>> = rows.into_iter().map(|row| {
+                    let mut out = Vec::with_capacity(out_width);
+                    let mut tuple_cache: Option<Tuple> = None;
+                    for step in &plan {
+                        match step {
+                            ProjStep::StarAll => out.extend(row.iter().cloned()),
+                            ProjStep::Idx(i) => out.push(row.get(*i).cloned().unwrap_or(Value::Null)),
+                            ProjStep::Eval(expr) => {
+                                let t = tuple_cache.get_or_insert_with(|| Tuple::new(row.clone()));
+                                out.push(self.eval_value(expr, t, &schema));
+                            }
+                        }
+                    }
+                    out
                 }).collect();
 
                 Ok(ExecutionResult::Rows { columns: new_col_names, rows: new_rows })
@@ -2533,10 +2559,13 @@ impl QueryEngine {
         match result {
             ExecutionResult::Rows { columns, rows } => {
                 let schema = Schema::new("", columns.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
-                let filtered: Vec<Vec<Value>> = rows.into_iter().filter(|row| {
-                    let tuple = Tuple::new(row.clone());
-                    self.eval_predicate(predicate, &tuple, &schema)
-                }).collect();
+                let mut filtered: Vec<Vec<Value>> = Vec::with_capacity(rows.len() / 2);
+                for row in rows.into_iter() {
+                    let tuple = Tuple::new(row);
+                    if self.eval_predicate(predicate, &tuple, &schema) {
+                        filtered.push(tuple.into_vec());
+                    }
+                }
                 Ok(ExecutionResult::Rows { columns, rows: filtered })
             }
             other => Ok(other),
@@ -2837,7 +2866,8 @@ impl QueryEngine {
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
 
         if left_all_int {
-            let mut hash_table: HashMap<i64, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+            let mut hash_table: HashMap<i64, Vec<usize>, ahash::RandomState> =
+                HashMap::with_capacity_and_hasher(right_rows.len(), ahash::RandomState::new());
             self.account_memory((right_rows.len() as u64) * 24)?;
             for (i, row) in right_rows.iter().enumerate() {
                 if i % 1024 == 0 { self.poll_ctx()?; }
@@ -2881,7 +2911,8 @@ impl QueryEngine {
                     }
                 }
                 JoinType::Right => {
-                    let mut left_hash: HashMap<i64, Vec<usize>> = HashMap::with_capacity(left_rows.len());
+                    let mut left_hash: HashMap<i64, Vec<usize>, ahash::RandomState> =
+                        HashMap::with_capacity_and_hasher(left_rows.len(), ahash::RandomState::new());
                     for (i, row) in left_rows.iter().enumerate() {
                         if let Some(Value::Int64(k)) = row.get(left_key_idx) {
                             left_hash.entry(*k).or_default().push(i);
@@ -2906,7 +2937,8 @@ impl QueryEngine {
                 }
             }
         } else {
-            let mut hash_table: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+            let mut hash_table: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
+                HashMap::with_capacity_and_hasher(right_rows.len(), ahash::RandomState::new());
             for (i, row) in right_rows.iter().enumerate() {
                 if i % 1024 == 0 { self.poll_ctx()?; }
                 let key = self.hash_key(&row[right_key_idx]);
@@ -2947,7 +2979,8 @@ impl QueryEngine {
                     }
                 }
                 JoinType::Right => {
-                    let mut left_hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(left_rows.len());
+                    let mut left_hash: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
+                        HashMap::with_capacity_and_hasher(left_rows.len(), ahash::RandomState::new());
                     for (i, row) in left_rows.iter().enumerate() {
                         let key = self.hash_key(&row[left_key_idx]);
                         left_hash.entry(key).or_default().push(i);
@@ -3140,7 +3173,8 @@ impl QueryEngine {
             } else { None }
         }).collect();
 
-        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(rows.len().min(1024));
+        let mut groups: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
+            HashMap::with_capacity_and_hasher(rows.len().min(1024), ahash::RandomState::new());
         for (row_idx, row) in rows.iter().enumerate() {
             self.poll_ctx()?;
             let mut key = Vec::with_capacity(group_indices.len() * 16);
