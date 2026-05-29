@@ -1918,16 +1918,37 @@ impl QueryEngine {
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
                 rows.reserve(table_data.index.approx_len());
+                let ctx = self.active_ctx.read().as_ref().map(Arc::clone);
+                let has_scan_limit = ctx.as_ref().map(|c| c.limits().max_scan_rows.is_some()).unwrap_or(false);
+                let mut since_check: u32 = 0;
                 table_data.index.for_each(|_key, data| {
-                    if let Err(e) = self.account_scan_row() {
-                        *scan_err.borrow_mut() = Some(e);
-                        return false;
+                    if let Some(c) = &ctx {
+                        if has_scan_limit {
+                            if let Err(e) = c.account_scan_row() {
+                                *scan_err.borrow_mut() = Some(e);
+                                return false;
+                            }
+                        } else {
+                            since_check += 1;
+                            if since_check >= 1024 {
+                                since_check = 0;
+                                if let Err(e) = c.check() {
+                                    *scan_err.borrow_mut() = Some(e);
+                                    return false;
+                                }
+                            }
+                        }
                     }
-                    if let Some(tuple) = Tuple::deserialize(data) {
-                        rows.push(tuple.into_vec());
+                    if let Some(values) = Tuple::deserialize_to_vec(data) {
+                        rows.push(values);
                     }
                     true
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
+                if let Some(c) = &ctx {
+                    if !has_scan_limit {
+                        let _ = c.account_scan_rows(rows.len() as u64);
+                    }
+                }
             } else {
                 table_data.index.for_each(|_key, data| {
                     if let Err(e) = self.account_scan_row() {

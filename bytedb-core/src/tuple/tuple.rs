@@ -123,6 +123,11 @@ impl Tuple {
     }
 
     pub fn deserialize(data: &[u8]) -> Option<Self> {
+        let values = Self::deserialize_to_vec(data)?;
+        Some(Tuple { values: values.into() })
+    }
+
+    pub fn deserialize_to_vec(data: &[u8]) -> Option<Vec<Value>> {
         if data.is_empty() {
             return None;
         }
@@ -135,7 +140,7 @@ impl Tuple {
             values.push(val);
             pos = new_pos;
         }
-        Some(Tuple { values: values.into() })
+        Some(values)
     }
 
     pub fn deserialize_columns(data: &[u8], needed: &[usize]) -> Option<Self> {
