@@ -407,6 +407,48 @@ impl BPlusTree {
         Ok(results)
     }
 
+    pub fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut results = Vec::new();
+        if prefix.is_empty() {
+            return self.scan_all();
+        }
+        let leaf_node = self.find_leaf_read(prefix);
+        let mut current = Some(leaf_node);
+
+        let mut first = true;
+        'outer: while let Some(node_arc) = current {
+            let node = node_arc.read();
+            match &*node {
+                BTreeNode::Leaf(leaf) => {
+                    let start_idx = if first {
+                        first = false;
+                        match leaf.keys.binary_search_by(|k| k.as_slice().cmp(prefix)) {
+                            Ok(i) => i,
+                            Err(i) => i,
+                        }
+                    } else {
+                        0
+                    };
+                    for i in start_idx..leaf.keys.len() {
+                        let k = &leaf.keys[i];
+                        if !k.starts_with(prefix) {
+                            if k.as_slice() > prefix {
+                                break 'outer;
+                            }
+                            continue;
+                        }
+                        results.push((k.clone(), leaf.values[i].clone()));
+                    }
+                    current = leaf.right_link.clone();
+                }
+                _ => break,
+            }
+            drop(node);
+        }
+
+        Ok(results)
+    }
+
     pub fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
         let leaf_node = self.find_leftmost_leaf();

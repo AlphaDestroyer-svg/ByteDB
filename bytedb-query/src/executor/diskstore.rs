@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use bytedb_core::dbstore::{DbCatalog, DatabaseRegistry, TableCatalog, TableFile};
+use bytedb_core::dbstore::{DbCatalog, DatabaseRegistry, IndexDef, TableCatalog, TableFile};
 use bytedb_core::tuple::schema::Schema;
 use bytedb_core::error::Result as CoreResult;
 
@@ -62,15 +62,31 @@ impl DiskStore {
         schema: &Schema,
         sequences: Vec<(String, i64)>,
     ) -> CoreResult<()> {
+        let mut cat = self.catalog.write();
+        let indexes = cat
+            .tables
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.indexes.clone())
+            .unwrap_or_default();
         let entry = TableCatalog {
             name: name.to_string(),
             table_id,
             schema: schema.clone(),
             sequences,
+            indexes,
         };
-        let mut cat = self.catalog.write();
         cat.upsert(entry);
         cat.save(&self.db_dir())?;
+        Ok(())
+    }
+
+    pub fn upsert_table_indexes(&self, table: &str, indexes: Vec<IndexDef>) -> CoreResult<()> {
+        let mut cat = self.catalog.write();
+        if let Some(t) = cat.tables.iter_mut().find(|t| t.name == table) {
+            t.indexes = indexes;
+            cat.save(&self.db_dir())?;
+        }
         Ok(())
     }
 

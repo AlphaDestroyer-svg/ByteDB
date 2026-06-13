@@ -188,6 +188,7 @@ impl Server {
                 version_store: Arc::new(VersionStore::new()),
                 check_exprs: Vec::new(),
                 sequences,
+                secondary_indexes: Vec::new(),
             }));
         }
     }

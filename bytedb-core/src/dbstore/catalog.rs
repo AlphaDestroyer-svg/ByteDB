@@ -12,6 +12,13 @@ const CATALOG_VERSION: u32 = 2;
 const CATALOG_VERSION_LEGACY: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableCatalog {
     pub name: String,
     pub table_id: u32,
@@ -19,6 +26,9 @@ pub struct TableCatalog {
 
     #[serde(default)]
     pub sequences: Vec<(String, i64)>,
+
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

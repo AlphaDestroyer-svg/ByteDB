@@ -7,6 +7,7 @@ use std::thread_local;
 use bytedb_core::catalog::database::Database;
 use bytedb_core::catalog::table::TableMeta;
 use bytedb_core::index::btree::BPlusTree;
+use bytedb_core::index::secondary::SecondaryIndex;
 use bytedb_core::mvcc::transaction::{IsolationLevel, TransactionManager, TxnId};
 use bytedb_core::mvcc::version_store::VersionStore;
 use bytedb_core::tuple::schema::{Column, Schema};
@@ -24,7 +25,7 @@ use crate::executor::context::QueryContext;
 use crate::parser::ast::*;
 use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
-use crate::planner::optimizer::{optimize_with_stats};
+use crate::planner::optimizer::{optimize_with_catalog, IndexCatalog, IndexInfo};
 use crate::planner::physical_plan::PhysicalPlan;
 
 thread_local! {
@@ -118,6 +119,7 @@ pub struct TableData {
     pub version_store: Arc<VersionStore>,
     pub check_exprs: Vec<Expr>,
     pub sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>>,
+    pub secondary_indexes: Vec<Arc<SecondaryIndex>>,
 }
 
 impl TableData {
@@ -258,6 +260,9 @@ impl QueryEngine {
                 }
             }
 
+            let secondary_indexes = Self::build_secondary_indexes(&tcat.schema, &index, &tcat.indexes)
+                .map_err(|e| QueryError::Execution(e.to_string()))?;
+
             let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
             let _ = self.database.create_table(meta);
             tables.insert(tcat.name.clone(), Arc::new(TableData {
@@ -266,9 +271,41 @@ impl QueryEngine {
                 version_store: Arc::new(VersionStore::new()),
                 check_exprs: Vec::new(),
                 sequences,
+                secondary_indexes,
             }));
         }
         Ok(())
+    }
+
+    fn build_secondary_indexes(
+        schema: &Schema,
+        pk_index: &Arc<BPlusTree>,
+        defs: &[bytedb_core::dbstore::IndexDef],
+    ) -> std::result::Result<Vec<Arc<SecondaryIndex>>, bytedb_core::error::CoreError> {
+        if defs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = pk_index.scan_all()?;
+        let mut out = Vec::with_capacity(defs.len());
+        for def in defs {
+            let col_idxs: Vec<usize> = def
+                .columns
+                .iter()
+                .filter_map(|c| schema.column_index(c))
+                .collect();
+            if col_idxs.len() != def.columns.len() {
+                continue;
+            }
+            let sec = Arc::new(SecondaryIndex::new(def.name.clone(), col_idxs.clone(), def.unique));
+            for (pk, data) in &rows {
+                if let Some(values) = Tuple::deserialize_to_vec(data) {
+                    let key_vals: Vec<&Value> = col_idxs.iter().map(|&i| &values[i]).collect();
+                    sec.insert(&key_vals, pk)?;
+                }
+            }
+            out.push(sec);
+        }
+        Ok(out)
     }
 
     fn switch_to_database(&self, name: &str) -> Result<()> {
@@ -561,6 +598,23 @@ impl QueryEngine {
                             .map_err(|e| QueryError::Execution(e.to_string()))?;
                     }
                 }
+                let td = self.tables.read().get(&name).cloned();
+                if let Some(td) = td {
+                    if !td.secondary_indexes.is_empty() {
+                        let fresh: Vec<Arc<SecondaryIndex>> = td.secondary_indexes.iter()
+                            .map(|s| Arc::new(SecondaryIndex::new(s.name.clone(), s.columns.clone(), s.unique)))
+                            .collect();
+                        let new_td = TableData {
+                            schema: td.schema.clone(),
+                            index: Arc::clone(&td.index),
+                            version_store: Arc::clone(&td.version_store),
+                            check_exprs: td.check_exprs.clone(),
+                            sequences: td.sequences.clone(),
+                            secondary_indexes: fresh,
+                        };
+                        self.tables.write().insert(name.clone(), Arc::new(new_td));
+                    }
+                }
                 self.flush_table_to_disk(&name);
                 Ok(ExecutionResult::Ok(format!("TRUNCATE TABLE")))
             }
@@ -634,11 +688,11 @@ impl QueryEngine {
                 use crate::planner::cost::cost_plan;
                 let logical = build_logical_plan(&inner)?;
                 let stats_snapshot = self.stats_snapshot();
-                let physical = optimize_with_stats(logical.clone(), &stats_snapshot)?;
+                let physical = optimize_with_catalog(logical.clone(), &stats_snapshot, &self.index_snapshot())?;
                 let pc = cost_plan(&physical, &stats_snapshot);
                 let estimated_rows = pc.rows.round() as u64;
                 let estimated_cost = pc.total_cost;
-                let plan_text = format!("{:#?}", logical);
+                let plan_text = format!("{:#?}", physical);
                 let mut lines: Vec<String> = Vec::new();
                 lines.push(format!(
                     "Plan  (estimated_rows={}  estimated_cost={:.2})",
@@ -732,7 +786,7 @@ impl QueryEngine {
                 let stmt = Self::rewrite_aliases(stmt);
                 let logical = build_logical_plan(&stmt)?;
                 let stats_snapshot = self.stats_snapshot();
-                let physical = optimize_with_stats(logical, &stats_snapshot)?;
+                let physical = optimize_with_catalog(logical, &stats_snapshot, &self.index_snapshot())?;
                 self.execute_physical(physical, txn_id)
             }
         }
@@ -743,10 +797,7 @@ impl QueryEngine {
             PhysicalPlan::CreateTable(ct) => self.exec_create_table(ct),
             PhysicalPlan::DropTable(dt) => self.exec_drop_table(dt),
             PhysicalPlan::CreateIndex(ci) => self.exec_create_index(ci),
-            PhysicalPlan::DropIndex(name) => {
-                self.tables.write().remove(&name);
-                Ok(ExecutionResult::Ok(format!("Index {} dropped", name)))
-            }
+            PhysicalPlan::DropIndex(name) => self.exec_drop_index(&name),
             PhysicalPlan::Insert { table, columns, source } => {
                 self.exec_insert(&table, columns, source, None, None, txn_id)
             }
@@ -821,8 +872,8 @@ impl QueryEngine {
                 }
                 self.exec_hash_aggregate(*input, group_by, aggregates, having, txn_id)
             }
-            PhysicalPlan::IndexScan { table, index_name: _, key_expr } => {
-                self.exec_seq_scan(&table, Some(&key_expr), txn_id, None, None)
+            PhysicalPlan::IndexScan { table, index_name, column, op, value, filter, limit } => {
+                self.exec_index_scan(&table, &index_name, &column, op, &value, filter.as_ref(), limit, txn_id)
             }
             PhysicalPlan::Distinct { input } => {
                 let result = self.execute_physical(*input, txn_id)?;
@@ -899,6 +950,7 @@ impl QueryEngine {
             version_store: Arc::new(VersionStore::new()),
             check_exprs: ct.check_constraints.clone(),
             sequences: sequences.clone(),
+            secondary_indexes: Vec::new(),
         };
         self.tables.write().insert(ct.name.clone(), Arc::new(table_data));
 
@@ -934,7 +986,131 @@ impl QueryEngine {
     }
 
     fn exec_create_index(&self, ci: CreateIndexStmt) -> Result<ExecutionResult> {
+        let td = {
+            let tables = self.tables.read();
+            Arc::clone(tables.get(&ci.table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", ci.table)))?)
+        };
+
+        if td.secondary_indexes.iter().any(|s| s.name == ci.name) {
+            return Err(QueryError::Execution(format!("Index '{}' already exists", ci.name)));
+        }
+
+        let col_idxs: Vec<usize> = ci.columns.iter()
+            .map(|c| td.schema.column_index(c))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| QueryError::Execution("indexed column not found".into()))?;
+
+        let sec = Arc::new(SecondaryIndex::new(ci.name.clone(), col_idxs.clone(), ci.unique));
+        let rows = td.index.scan_all().map_err(|e| QueryError::Execution(e.to_string()))?;
+        for (pk, data) in &rows {
+            if let Some(values) = Tuple::deserialize_to_vec(data) {
+                let key_vals: Vec<&Value> = col_idxs.iter().filter_map(|&i| values.get(i)).collect();
+                if key_vals.len() == col_idxs.len() {
+                    sec.insert(&key_vals, pk).map_err(|e| QueryError::Execution(e.to_string()))?;
+                }
+            }
+        }
+
+        let mut new_secs = td.secondary_indexes.clone();
+        new_secs.push(sec);
+        let new_td = TableData {
+            schema: td.schema.clone(),
+            index: Arc::clone(&td.index),
+            version_store: Arc::clone(&td.version_store),
+            check_exprs: td.check_exprs.clone(),
+            sequences: td.sequences.clone(),
+            secondary_indexes: new_secs.clone(),
+        };
+        self.tables.write().insert(ci.table.clone(), Arc::new(new_td));
+
+        if let Some(ds) = &self.disk_store {
+            let defs = Self::index_defs_for(&td.schema, &new_secs);
+            let _ = ds.upsert_table_indexes(&ci.table, defs);
+        }
+
         Ok(ExecutionResult::Ok(format!("Index {} created on {}", ci.name, ci.table)))
+    }
+
+    fn exec_drop_index(&self, name: &str) -> Result<ExecutionResult> {
+        let target = {
+            let tables = self.tables.read();
+            tables.iter()
+                .find(|(_, td)| td.secondary_indexes.iter().any(|s| s.name == name))
+                .map(|(t, _)| t.clone())
+        };
+        let Some(tname) = target else {
+            return Ok(ExecutionResult::Ok(format!("Index {} not found", name)));
+        };
+        let td = {
+            let tables = self.tables.read();
+            Arc::clone(tables.get(&tname).unwrap())
+        };
+        let new_secs: Vec<Arc<SecondaryIndex>> = td.secondary_indexes.iter()
+            .filter(|s| s.name != name)
+            .cloned()
+            .collect();
+        let new_td = TableData {
+            schema: td.schema.clone(),
+            index: Arc::clone(&td.index),
+            version_store: Arc::clone(&td.version_store),
+            check_exprs: td.check_exprs.clone(),
+            sequences: td.sequences.clone(),
+            secondary_indexes: new_secs.clone(),
+        };
+        self.tables.write().insert(tname.clone(), Arc::new(new_td));
+
+        if let Some(ds) = &self.disk_store {
+            let defs = Self::index_defs_for(&td.schema, &new_secs);
+            let _ = ds.upsert_table_indexes(&tname, defs);
+        }
+
+        Ok(ExecutionResult::Ok(format!("Index {} dropped", name)))
+    }
+
+    fn index_defs_for(schema: &Schema, secs: &[Arc<SecondaryIndex>]) -> Vec<bytedb_core::dbstore::IndexDef> {
+        secs.iter().map(|s| bytedb_core::dbstore::IndexDef {
+            name: s.name.clone(),
+            columns: s.columns.iter()
+                .filter_map(|&i| schema.columns.get(i).map(|c| c.name.clone()))
+                .collect(),
+            unique: s.unique,
+        }).collect()
+    }
+
+    fn update_secondary_indexes_insert(td: &TableData, values: &[Value], pk: &[u8]) -> Result<()> {
+        for sec in &td.secondary_indexes {
+            let key_vals: Vec<&Value> = sec.columns.iter().filter_map(|&i| values.get(i)).collect();
+            if key_vals.len() == sec.columns.len() {
+                sec.insert(&key_vals, pk).map_err(|e| QueryError::Execution(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn update_secondary_indexes_delete(td: &TableData, values: &[Value], pk: &[u8]) {
+        for sec in &td.secondary_indexes {
+            let key_vals: Vec<&Value> = sec.columns.iter().filter_map(|&i| values.get(i)).collect();
+            if key_vals.len() == sec.columns.len() {
+                let _ = sec.remove(&key_vals, pk);
+            }
+        }
+    }
+
+    fn update_secondary_indexes_update(td: &TableData, old_values: &[Value], new_values: &[Value], pk: &[u8]) -> Result<()> {
+        for sec in &td.secondary_indexes {
+            let old_vals: Vec<&Value> = sec.columns.iter().filter_map(|&i| old_values.get(i)).collect();
+            let new_vals: Vec<&Value> = sec.columns.iter().filter_map(|&i| new_values.get(i)).collect();
+            if old_vals.len() != sec.columns.len() || new_vals.len() != sec.columns.len() {
+                continue;
+            }
+            if old_vals == new_vals {
+                continue;
+            }
+            let _ = sec.remove(&old_vals, pk);
+            sec.insert(&new_vals, pk).map_err(|e| QueryError::Execution(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn exec_alter_table(&self, alter: AlterTableStmt) -> Result<ExecutionResult> {
@@ -963,6 +1139,7 @@ impl QueryEngine {
                     version_store: Arc::clone(&table_data.version_store),
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
+                    secondary_indexes: table_data.secondary_indexes.clone(),
                 };
                 *table_data = Arc::new(new_td);
 
@@ -985,8 +1162,12 @@ impl QueryEngine {
                     version_store: Arc::clone(&table_data.version_store),
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
+                    secondary_indexes: Vec::new(),
                 };
                 *table_data = Arc::new(new_td);
+                if let Some(ds) = &self.disk_store {
+                    let _ = ds.upsert_table_indexes(&alter.table, Vec::new());
+                }
 
                 Ok(ExecutionResult::Ok(format!("Column '{}' dropped", col_name)))
             }
@@ -1002,8 +1183,12 @@ impl QueryEngine {
                     version_store: Arc::clone(&table_data.version_store),
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
+                    secondary_indexes: Vec::new(),
                 };
                 *table_data = Arc::new(new_td);
+                if let Some(ds) = &self.disk_store {
+                    let _ = ds.upsert_table_indexes(&alter.table, Vec::new());
+                }
 
                 Ok(ExecutionResult::Ok(format!("Column '{}' renamed to '{}'", old_name, new_name)))
             }
@@ -1298,6 +1483,7 @@ impl QueryEngine {
                     match &oc.action {
                         ConflictAction::DoNothing => continue,
                         ConflictAction::DoUpdate(assignments) => {
+                            let old_values = Tuple::deserialize_to_vec(existing.as_ref().unwrap());
                             let mut existing_tuple = Tuple::deserialize(existing.as_ref().unwrap()).unwrap();
                             for (col_name, expr) in assignments {
                                 if let Some(idx) = table_data.schema.column_index(col_name) {
@@ -1306,6 +1492,9 @@ impl QueryEngine {
                                 }
                             }
                             let new_data = existing_tuple.serialize();
+                            if let Some(ov) = &old_values {
+                                Self::update_secondary_indexes_update(&table_data, ov, &existing_tuple.to_vec(), &key)?;
+                            }
                             table_data.index.insert(key, new_data)
                                 .map_err(|e| QueryError::Execution(e.to_string()))?;
                             if returning.is_some() {
@@ -1330,6 +1519,8 @@ impl QueryEngine {
                     .map_err(|e| QueryError::Execution(e.to_string()))?;
                 table_data.version_store.insert(key.clone(), tuple.clone(), tid, snapshot.start_ts);
             }
+
+            Self::update_secondary_indexes_insert(&table_data, &row_values, &key)?;
 
             table_data.index.insert(key, data)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1380,6 +1571,7 @@ impl QueryEngine {
 
                 if matches {
                     let old_data = data.clone();
+                    let old_row_values = tuple.to_vec();
                     for (col_name, expr) in &assignments {
                         if let Some(idx) = table_data.schema.column_index(col_name) {
                             let new_val = self.eval_value(expr, &tuple, &table_data.schema);
@@ -1484,6 +1676,8 @@ impl QueryEngine {
                         });
                     }
 
+                    Self::update_secondary_indexes_update(&table_data, &old_row_values, &tuple.to_vec(), &key)?;
+
                     table_data.index.insert(key, new_data)
                         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -1580,14 +1774,23 @@ impl QueryEngine {
                         let ctd = tables.get(cname).unwrap();
                         match action {
                             bytedb_core::tuple::schema::FkAction::Cascade => {
+                                if !ctd.secondary_indexes.is_empty() {
+                                    if let Some(d) = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))? {
+                                        if let Some(cvals) = Tuple::deserialize_to_vec(&d) {
+                                            Self::update_secondary_indexes_delete(ctd, &cvals, ck);
+                                        }
+                                    }
+                                }
                                 ctd.index.delete(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
                             }
                             bytedb_core::tuple::schema::FkAction::SetNull => {
                                 if let Some(d) = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))? {
                                     if let Some(mut ct) = Tuple::deserialize(&d) {
+                                        let old_vals = ct.to_vec();
                                         for ci in child_idxs {
                                             ct.set(*ci, Value::Null);
                                         }
+                                        Self::update_secondary_indexes_update(ctd, &old_vals, &ct.to_vec(), ck)?;
                                         ctd.index.insert(ck.clone(), ct.serialize())
                                             .map_err(|e| QueryError::Execution(e.to_string()))?;
                                     }
@@ -1611,6 +1814,7 @@ impl QueryEngine {
                     if returning.is_some() {
                         returned_rows.push(tuple.to_vec());
                     }
+                    Self::update_secondary_indexes_delete(&table_data, &tuple.to_vec(), &key);
                     keys_to_delete.push(key);
                     count += 1;
                 }
@@ -1704,7 +1908,7 @@ impl QueryEngine {
         let schema = Schema::new(name, col_schemas);
         let index = Arc::new(BPlusTree::new(name, 64));
         let version_store = Arc::new(VersionStore::new());
-        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new() };
+        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new(), secondary_indexes: Vec::new() };
 
         for (i, row) in rows.into_iter().enumerate() {
             let tuple = Tuple::new(row);
@@ -1758,6 +1962,80 @@ impl QueryEngine {
         }
 
         Ok(ExecutionResult::Rows { columns: out_col_names, rows: out_rows })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_index_scan(
+        &self,
+        table: &str,
+        index_name: &str,
+        column: &str,
+        op: BinOp,
+        value: &Expr,
+        filter: Option<&Expr>,
+        limit: Option<usize>,
+        txn_id: Option<TxnId>,
+    ) -> Result<ExecutionResult> {
+        let table_data = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
+                .clone()
+        };
+
+        let sec = table_data.secondary_indexes.iter().find(|s| s.name == index_name).cloned();
+        let safe = txn_id.is_none() || table_data.version_store.key_count() == 0;
+        let sec = match (sec, safe) {
+            (Some(s), true) => s,
+            _ => return self.exec_seq_scan(table, filter, txn_id, limit, None),
+        };
+
+        let Some(col_idx) = table_data.schema.column_index(column) else {
+            return self.exec_seq_scan(table, filter, txn_id, limit, None);
+        };
+        let col_type = table_data.schema.columns[col_idx].data_type;
+        if matches!(col_type, DataType::Decimal | DataType::Json) {
+            return self.exec_seq_scan(table, filter, txn_id, limit, None);
+        }
+        let probe = cast_value(self.eval_expr_simple(value), col_type);
+        if probe.is_null() {
+            return self.exec_seq_scan(table, filter, txn_id, limit, None);
+        }
+
+        let pks = match op {
+            BinOp::Eq => sec.lookup_eq(&[&probe]),
+            BinOp::Lt | BinOp::Lte => sec.lookup_range(None, Some(&probe)),
+            BinOp::Gt | BinOp::Gte => sec.lookup_range(Some(&probe), None),
+            _ => return self.exec_seq_scan(table, filter, txn_id, limit, None),
+        }.map_err(|e| QueryError::Execution(e.to_string()))?;
+
+        let col_names: Vec<String> = table_data.schema.columns.iter().map(|c| c.name.clone()).collect();
+        let mut rows = Vec::new();
+        for pk in pks {
+            let data_opt = if let Some(tid) = txn_id {
+                table_data.read_visible_one(&self.txn_manager, Some(tid), &pk)?
+            } else {
+                table_data.index.search(&pk).map_err(|e| QueryError::Execution(e.to_string()))?
+            };
+            if let Some(data) = data_opt {
+                if let Some(tuple) = Tuple::deserialize(&data) {
+                    self.account_scan_row()?;
+                    if let Some(f) = filter {
+                        if !self.eval_predicate(f, &tuple, &table_data.schema) {
+                            continue;
+                        }
+                    }
+                    rows.push(tuple.into_vec());
+                    if let Some(lim) = limit {
+                        if rows.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ExecutionResult::Rows { columns: col_names, rows })
     }
 
     fn exec_seq_scan(&self, table: &str, filter: Option<&Expr>, txn_id: Option<TxnId>, limit: Option<usize>, needed_columns: Option<&[usize]>) -> Result<ExecutionResult> {
@@ -4208,6 +4486,24 @@ impl QueryEngine {
 
     fn stats_snapshot(&self) -> StatsCatalog {
         self.stats.read().clone()
+    }
+
+    fn index_snapshot(&self) -> IndexCatalog {
+        let mut cat = IndexCatalog::new();
+        for (tname, td) in self.tables.read().iter() {
+            if td.secondary_indexes.is_empty() {
+                continue;
+            }
+            let infos: Vec<IndexInfo> = td.secondary_indexes.iter().map(|s| IndexInfo {
+                name: s.name.clone(),
+                columns: s.columns.iter()
+                    .filter_map(|&i| td.schema.columns.get(i).map(|c| c.name.clone()))
+                    .collect(),
+                unique: s.unique,
+            }).collect();
+            cat.insert(tname.clone(), infos);
+        }
+        cat
     }
 
     fn collect_table_rows(&self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {

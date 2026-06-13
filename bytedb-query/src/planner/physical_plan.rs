@@ -11,7 +11,11 @@ pub enum PhysicalPlan {
     IndexScan {
         table: String,
         index_name: String,
-        key_expr: Expr,
+        column: String,
+        op: BinOp,
+        value: Expr,
+        filter: Option<Expr>,
+        limit: Option<usize>,
     },
     Filter {
         input: Box<PhysicalPlan>,

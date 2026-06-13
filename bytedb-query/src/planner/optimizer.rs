@@ -1,16 +1,160 @@
+use std::collections::HashMap;
+
 use super::cost::{cost_plan, StatsCatalog};
 use super::logical_plan::LogicalPlan;
 use super::physical_plan::PhysicalPlan;
 use crate::error::Result;
 use crate::parser::ast::*;
 
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+pub type IndexCatalog = HashMap<String, Vec<IndexInfo>>;
+
 pub fn optimize(logical: LogicalPlan) -> Result<PhysicalPlan> {
     optimize_with_stats(logical, &StatsCatalog::new())
 }
 
 pub fn optimize_with_stats(logical: LogicalPlan, stats: &StatsCatalog) -> Result<PhysicalPlan> {
+    optimize_with_catalog(logical, stats, &IndexCatalog::new())
+}
+
+pub fn optimize_with_catalog(
+    logical: LogicalPlan,
+    stats: &StatsCatalog,
+    indexes: &IndexCatalog,
+) -> Result<PhysicalPlan> {
     let physical = convert_to_physical(logical, stats)?;
-    Ok(push_limit_down(physical))
+    let physical = push_limit_down(physical);
+    Ok(select_indexes(physical, indexes))
+}
+
+fn select_indexes(plan: PhysicalPlan, indexes: &IndexCatalog) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::SeqScan { table, filter: Some(pred), limit, needed_columns } => {
+            if let Some(idxs) = indexes.get(&table) {
+                if let Some((index_name, column, op, value)) = find_index_predicate(&pred, idxs) {
+                    return PhysicalPlan::IndexScan {
+                        table,
+                        index_name,
+                        column,
+                        op,
+                        value,
+                        filter: Some(pred),
+                        limit,
+                    };
+                }
+            }
+            PhysicalPlan::SeqScan { table, filter: Some(pred), limit, needed_columns }
+        }
+        PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
+            input: Box::new(select_indexes(*input, indexes)),
+            predicate,
+        },
+        PhysicalPlan::Project { input, columns } => PhysicalPlan::Project {
+            input: Box::new(select_indexes(*input, indexes)),
+            columns,
+        },
+        PhysicalPlan::HashJoin { left, right, condition, join_type } => PhysicalPlan::HashJoin {
+            left: Box::new(select_indexes(*left, indexes)),
+            right: Box::new(select_indexes(*right, indexes)),
+            condition,
+            join_type,
+        },
+        PhysicalPlan::NestedLoopJoin { left, right, condition, join_type } => PhysicalPlan::NestedLoopJoin {
+            left: Box::new(select_indexes(*left, indexes)),
+            right: Box::new(select_indexes(*right, indexes)),
+            condition,
+            join_type,
+        },
+        PhysicalPlan::HashAggregate { input, group_by, aggregates, having } => PhysicalPlan::HashAggregate {
+            input: Box::new(select_indexes(*input, indexes)),
+            group_by,
+            aggregates,
+            having,
+        },
+        PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
+            input: Box::new(select_indexes(*input, indexes)),
+            order_by,
+        },
+        PhysicalPlan::Limit { input, count, offset } => PhysicalPlan::Limit {
+            input: Box::new(select_indexes(*input, indexes)),
+            count,
+            offset,
+        },
+        PhysicalPlan::Distinct { input } => PhysicalPlan::Distinct {
+            input: Box::new(select_indexes(*input, indexes)),
+        },
+        other => other,
+    }
+}
+
+fn find_index_predicate(
+    pred: &Expr,
+    idxs: &[IndexInfo],
+) -> Option<(String, String, BinOp, Expr)> {
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(pred, &mut conjuncts);
+
+    let mut range_match: Option<(String, String, BinOp, Expr)> = None;
+    for c in &conjuncts {
+        if let Some((col, op, val)) = as_col_op_literal(c) {
+            if let Some(ix) = idxs.iter().find(|i| i.columns.first().map(|s| s.as_str()) == Some(col.as_str())) {
+                match op {
+                    BinOp::Eq => return Some((ix.name.clone(), col, op, val)),
+                    BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
+                        if range_match.is_none() {
+                            range_match = Some((ix.name.clone(), col, op, val));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    range_match
+}
+
+fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp { left, op: BinOp::And, right } => {
+            collect_conjuncts(left, out);
+            collect_conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn as_col_op_literal(expr: &Expr) -> Option<(String, BinOp, Expr)> {
+    let Expr::BinaryOp { left, op, right } = expr else { return None };
+    if !matches!(op, BinOp::Eq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte) {
+        return None;
+    }
+    let col_name = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Column(n) => Some(n.clone()),
+            Expr::QualifiedColumn(_, n) => Some(n.clone()),
+            _ => None,
+        }
+    };
+    if let (Some(c), Expr::Literal(_)) = (col_name(left), right.as_ref()) {
+        return Some((c, *op, (**right).clone()));
+    }
+    if let (Expr::Literal(_), Some(c)) = (left.as_ref(), col_name(right)) {
+        let flipped = match op {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::Lte => BinOp::Gte,
+            BinOp::Gte => BinOp::Lte,
+            other => *other,
+        };
+        return Some((c, flipped, (**left).clone()));
+    }
+    None
 }
 
 fn convert_to_physical(plan: LogicalPlan, stats: &StatsCatalog) -> Result<PhysicalPlan> {
