@@ -206,6 +206,20 @@ impl Lexer {
             }
         }
 
+        if self.pos < self.input.len() && (self.input[self.pos] == 'e' || self.input[self.pos] == 'E') {
+            let mut look = self.pos + 1;
+            if look < self.input.len() && (self.input[look] == '+' || self.input[look] == '-') {
+                look += 1;
+            }
+            if look < self.input.len() && self.input[look].is_ascii_digit() {
+                is_float = true;
+                self.pos = look;
+                while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+            }
+        }
+
         let num_str: String = self.input[start..self.pos].iter().collect();
         if is_float {
             let val: f64 = num_str.parse()
