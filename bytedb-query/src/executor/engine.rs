@@ -1542,6 +1542,23 @@ impl QueryEngine {
                     }
                     if let Value::Text(s) = &row_values[i] {
                         match col.data_type {
+                            DataType::Int64 => {
+                                if let Ok(n) = s.trim().parse::<i64>() {
+                                    row_values[i] = Value::Int64(n);
+                                }
+                            }
+                            DataType::Float64 => {
+                                if let Ok(f) = s.trim().parse::<f64>() {
+                                    row_values[i] = Value::Float64(f);
+                                }
+                            }
+                            DataType::Bool => {
+                                match s.trim().to_ascii_lowercase().as_str() {
+                                    "true" | "t" | "1" | "yes" => row_values[i] = Value::Bool(true),
+                                    "false" | "f" | "0" | "no" => row_values[i] = Value::Bool(false),
+                                    _ => {}
+                                }
+                            }
                             DataType::Date => {
                                 if let Some(d) = bytedb_core::tuple::value::parse_date(s) {
                                     row_values[i] = Value::Date(d);
