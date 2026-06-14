@@ -1661,6 +1661,11 @@ impl QueryEngine {
                             continue;
                         }
                     }
+                } else if !pk_cols.is_empty() {
+                    return Err(QueryError::Execution(format!(
+                        "duplicate key value violates primary key constraint on table '{}'",
+                        table
+                    )));
                 }
             }
 
