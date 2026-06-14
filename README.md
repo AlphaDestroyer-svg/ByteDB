@@ -215,7 +215,7 @@ ByteDB persists a database as a directory on disk. Pass `--data-dir <path>` to t
     └── snapshot_*.bin
 ```
 
-- **Per-table data files** (`databases/<db>/tables/<table>.tbl`) - every committed `INSERT/UPDATE/DELETE` rewrites the affected table file via atomic rename. **Schema and data are stored separately**: `catalog.bin` holds metadata, `*.tbl` holds rows. No periodic flush is needed - the file on disk is always up to date after each successful mutation.
+- **Per-table data files** (`databases/<db>/tables/<table>.tbl` + `<table>.log`) - mutations are appended as O(delta) records to a per-table change log (`<table>.log`, magic `BTLG`, per-record CRC32, fsynced on each statement) instead of rewriting the whole `.tbl`. On load the engine reads `<table>.tbl` then folds `<table>.log` over it (PUT sets, DEL removes), dropping any torn tail record. When a log outgrows its base file it is compacted: the full state is written to a fresh `.tbl` via atomic rename, then the log is truncated (crash-safe, the fold is idempotent). **Schema and data are stored separately**: `catalog.bin` holds metadata, `*.tbl`/`*.log` hold rows. This removes the previous O(rows) write amplification per mutation.
 - **WAL** (`bytedb.wal`) - durability for in-flight transactions; redo committed / undo uncommitted on restart.
 - **Snapshots** (`snapshots/`) - optional full-state archives. Disabled by default (`--snapshot-write-threshold 0`); time-based snapshots default to every 30 min. To turn them off entirely use `--no-snapshot`. Set `--no-shutdown-snapshot` to skip the final snapshot on Ctrl+C.
 
@@ -517,7 +517,7 @@ ByteDB сохраняет базу как директорию на диске. 
     └── snapshot_*.bin
 ```
 
-- **Файлы таблиц** (`databases/<db>/tables/<table>.tbl`) - каждый зафиксированный `INSERT/UPDATE/DELETE` атомарно перезаписывает файл соответствующей таблицы (через `rename`). **Схема и данные хранятся раздельно**: `catalog.bin` для метаданных, `*.tbl` для строк. Никаких периодических флашей не нужно - файл на диске всегда актуален после успешной мутации.
+- **Файлы таблиц** (`databases/<db>/tables/<table>.tbl` + `<table>.log`) - мутации дописываются как O(delta) записи в журнал изменений таблицы (`<table>.log`, magic `BTLG`, CRC32 на запись, fsync на каждом стейтменте) вместо перезаписи всего `.tbl`. При загрузке движок читает `<table>.tbl` и сворачивает поверх него `<table>.log` (PUT задаёт, DEL удаляет), отбрасывая оборванный хвост. Когда журнал перерастает базовый файл, выполняется compaction: полное состояние пишется в свежий `.tbl` через атомарный `rename`, затем журнал обнуляется (crash-safe, свёртка идемпотентна). **Схема и данные хранятся раздельно**: `catalog.bin` для метаданных, `*.tbl`/`*.log` для строк. Это убирает прежнюю O(строк) амплификацию записи на каждую мутацию.
 - **WAL** (`bytedb.wal`) - durability для in-flight транзакций; на рестарте REDO/UNDO.
 - **Snapshots** (`snapshots/`) - опциональные архивы полного состояния. По умолчанию write-threshold отключён (`--snapshot-write-threshold 0`); по времени снапшоты пишутся раз в 30 минут. Чтобы выключить полностью - `--no-snapshot`. Чтобы пропустить финальный снапшот при Ctrl+C - `--no-shutdown-snapshot`.
 

@@ -28,11 +28,14 @@ use crate::planner::logical_plan::build_logical_plan;
 use crate::planner::optimizer::{optimize_with_catalog, IndexCatalog, IndexInfo};
 use crate::planner::physical_plan::PhysicalPlan;
 use rayon::prelude::*;
+use bytedb_core::dbstore::{OP_DEL, OP_PUT};
 
 const PARALLEL_SCAN_THRESHOLD: usize = 16384;
+const LOG_COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<TxnId>> = std::cell::Cell::new(None);
+    static PENDING_DELTAS: std::cell::RefCell<Vec<(String, u8, Vec<u8>, Vec<u8>)>> = std::cell::RefCell::new(Vec::new());
 }
 
 fn current_txn_id() -> Option<TxnId> {
@@ -344,13 +347,60 @@ impl QueryEngine {
         let tables = self.tables.read();
         let Some(td) = tables.get(table) else { return; };
         if let Ok(entries) = td.index.scan_all() {
-            let _ = ds.flush_table_data(table, &entries);
+            let _ = ds.compact_table(table, &entries);
         }
+        self.flush_sequences_for(table, &td, ds);
+    }
+
+    fn flush_sequences_for(&self, table: &str, td: &TableData, ds: &crate::executor::diskstore::DiskStore) {
         let seqs: Vec<(String, i64)> = td.sequences.iter()
             .map(|(c, s)| (c.clone(), s.counter.load(std::sync::atomic::Ordering::SeqCst)))
             .collect();
         if !seqs.is_empty() {
             let _ = ds.flush_table_sequences(table, seqs);
+        }
+    }
+
+    fn log_put(&self, table: &str, key: &[u8], data: &[u8]) {
+        if self.disk_store.is_some() {
+            PENDING_DELTAS.with(|p| p.borrow_mut().push((table.to_string(), OP_PUT, key.to_vec(), data.to_vec())));
+        }
+    }
+
+    fn log_del(&self, table: &str, key: &[u8]) {
+        if self.disk_store.is_some() {
+            PENDING_DELTAS.with(|p| p.borrow_mut().push((table.to_string(), OP_DEL, key.to_vec(), Vec::new())));
+        }
+    }
+
+    fn clear_pending_deltas(&self) {
+        PENDING_DELTAS.with(|p| p.borrow_mut().clear());
+    }
+
+    fn persist_pending_deltas(&self) {
+        let Some(ds) = self.disk_store.as_ref() else {
+            self.clear_pending_deltas();
+            return;
+        };
+        let deltas = PENDING_DELTAS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if deltas.is_empty() {
+            return;
+        }
+        let mut by_table: HashMap<String, Vec<(u8, Vec<u8>, Vec<u8>)>> = HashMap::new();
+        for (t, op, k, v) in deltas {
+            by_table.entry(t).or_default().push((op, k, v));
+        }
+        for (table, table_deltas) in by_table {
+            let _ = ds.append_table_log(&table, &table_deltas);
+            let td = self.tables.read().get(&table).cloned();
+            if let Some(td) = td {
+                self.flush_sequences_for(&table, &td, ds);
+                if ds.table_log_bytes(&table) >= LOG_COMPACT_THRESHOLD_BYTES {
+                    if let Ok(entries) = td.index.scan_all() {
+                        let _ = ds.compact_table(&table, &entries);
+                    }
+                }
+            }
         }
     }
 
@@ -808,26 +858,18 @@ impl QueryEngine {
                 })
             }
             Statement::Insert(ins) => {
-                let tname = ins.table.clone();
                 let r = self.exec_insert(&ins.table, ins.columns, ins.source, ins.on_conflict, ins.returning, txn_id);
-                if r.is_ok() { self.flush_table_to_disk(&tname); }
+                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Update(upd) => {
-                let tname = upd.table.clone();
                 let r = self.exec_update(&upd.table, upd.assignments, upd.where_clause, upd.returning, txn_id);
-                if r.is_ok() { self.flush_table_to_disk(&tname); }
+                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Delete(del) => {
-                let tname = del.table.clone();
                 let r = self.exec_delete(&del.table, del.where_clause, del.returning, txn_id);
-                if r.is_ok() {
-
-                    let names: Vec<String> = self.tables.read().keys().cloned().collect();
-                    for n in names { self.flush_table_to_disk(&n); }
-                    let _ = tname;
-                }
+                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Select(ref select) if !select.ctes.is_empty() || matches!(select.from, FromClause::Subquery(_)) => {
@@ -1573,6 +1615,7 @@ impl QueryEngine {
                             if let Some(ov) = &old_values {
                                 Self::update_secondary_indexes_update(&table_data, ov, &existing_tuple.to_vec(), &key)?;
                             }
+                            self.log_put(table, &key, &new_data);
                             table_data.index.insert(key, new_data)
                                 .map_err(|e| QueryError::Execution(e.to_string()))?;
                             if returning.is_some() {
@@ -1601,6 +1644,7 @@ impl QueryEngine {
 
             Self::update_secondary_indexes_insert(&table_data, &row_values, &key)?;
 
+            self.log_put(table, &key, &data);
             table_data.index.insert(key, data)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -1761,6 +1805,7 @@ impl QueryEngine {
 
                     Self::update_secondary_indexes_update(&table_data, &old_row_values, &tuple.to_vec(), &key)?;
 
+                    self.log_put(table, &key, &new_data);
                     table_data.index.insert(key, new_data)
                         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -1867,6 +1912,7 @@ impl QueryEngine {
                                         }
                                     }
                                 }
+                                self.log_del(cname, ck);
                                 ctd.index.delete(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
                             }
                             bytedb_core::tuple::schema::FkAction::SetNull => {
@@ -1877,7 +1923,9 @@ impl QueryEngine {
                                             ct.set(*ci, Value::Null);
                                         }
                                         Self::update_secondary_indexes_update(ctd, &old_vals, &ct.to_vec(), ck)?;
-                                        ctd.index.insert(ck.clone(), ct.serialize())
+                                        let serialized = ct.serialize();
+                                        self.log_put(cname, ck, &serialized);
+                                        ctd.index.insert(ck.clone(), serialized)
                                             .map_err(|e| QueryError::Execution(e.to_string()))?;
                                     }
                                 }
@@ -1909,6 +1957,7 @@ impl QueryEngine {
         }
 
         for key in keys_to_delete {
+            self.log_del(table, &key);
             table_data.index.delete(&key)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
         }

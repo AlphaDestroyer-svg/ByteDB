@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use bytedb_core::dbstore::{DbCatalog, DatabaseRegistry, IndexDef, TableCatalog, TableFile};
+use bytedb_core::dbstore::{DbCatalog, DatabaseRegistry, IndexDef, TableCatalog, TableFile, TableLog};
 use bytedb_core::tuple::schema::Schema;
 use bytedb_core::error::Result as CoreResult;
 
@@ -96,6 +96,7 @@ impl DiskStore {
         if removed {
             cat.save(&self.db_dir())?;
             TableFile::delete(&self.db_dir(), name)?;
+            TableLog::delete(&self.db_dir(), name)?;
         }
         Ok(())
     }
@@ -106,6 +107,25 @@ impl DiskStore {
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> CoreResult<()> {
         TableFile::save(&self.db_dir(), table, entries)?;
+        TableLog::truncate(&self.db_dir(), table)?;
+        Ok(())
+    }
+
+    pub fn append_table_log(
+        &self,
+        table: &str,
+        deltas: &[(u8, Vec<u8>, Vec<u8>)],
+    ) -> CoreResult<()> {
+        TableLog::append(&self.db_dir(), table, deltas)
+    }
+
+    pub fn table_log_bytes(&self, table: &str) -> u64 {
+        TableLog::size_bytes(&self.db_dir(), table)
+    }
+
+    pub fn compact_table(&self, table: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> CoreResult<()> {
+        TableFile::save(&self.db_dir(), table, entries)?;
+        TableLog::truncate(&self.db_dir(), table)?;
         Ok(())
     }
 
@@ -123,6 +143,8 @@ impl DiskStore {
     }
 
     pub fn load_table_data(&self, table: &str) -> CoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        TableFile::load(&self.db_dir(), table)
+        let base = TableFile::load(&self.db_dir(), table)?;
+        let deltas = TableLog::load(&self.db_dir(), table)?;
+        Ok(TableLog::fold(base, deltas))
     }
 }
