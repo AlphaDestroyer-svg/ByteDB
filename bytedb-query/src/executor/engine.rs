@@ -3710,16 +3710,21 @@ impl QueryEngine {
 
         let mut groups: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
             HashMap::with_capacity_and_hasher(rows.len().min(1024), ahash::RandomState::new());
+        let mut keybuf = Vec::with_capacity(group_indices.len() * 16);
         for (row_idx, row) in rows.iter().enumerate() {
-            self.poll_ctx()?;
-            let mut key = Vec::with_capacity(group_indices.len() * 16);
+            if row_idx % 1024 == 0 { self.poll_ctx()?; }
+            keybuf.clear();
             for &i in &group_indices {
                 let part = self.hash_key(row.get(i).unwrap_or(&Value::Null));
-                key.extend_from_slice(&(part.len() as u32).to_le_bytes());
-                key.extend_from_slice(&part);
+                keybuf.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                keybuf.extend_from_slice(&part);
             }
-            self.account_memory(key.len() as u64 + 24)?;
-            groups.entry(key).or_default().push(row_idx);
+            if let Some(v) = groups.get_mut(&keybuf) {
+                v.push(row_idx);
+            } else {
+                self.account_memory(keybuf.len() as u64 + 24)?;
+                groups.insert(keybuf.clone(), vec![row_idx]);
+            }
         }
 
         let mut out_col_names = Vec::with_capacity(group_indices.len() + agg_functions.len());
