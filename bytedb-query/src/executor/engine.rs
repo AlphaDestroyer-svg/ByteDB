@@ -3381,7 +3381,33 @@ impl QueryEngine {
         let left_width = left_cols.len();
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
 
-        if left_all_int {
+        let build_inner_on_left = left_all_int
+            && matches!(join_type, JoinType::Inner)
+            && left_rows.len() < right_rows.len();
+
+        if build_inner_on_left {
+            let mut hash_table: HashMap<i64, Vec<usize>, ahash::RandomState> =
+                HashMap::with_capacity_and_hasher(left_rows.len(), ahash::RandomState::new());
+            self.account_memory((left_rows.len() as u64) * 24)?;
+            for (i, row) in left_rows.iter().enumerate() {
+                if i % 1024 == 0 { self.poll_ctx()?; }
+                if let Some(Value::Int64(k)) = row.get(left_key_idx) {
+                    hash_table.entry(*k).or_default().push(i);
+                }
+            }
+            for right_row in &right_rows {
+                if let Some(Value::Int64(k)) = right_row.get(right_key_idx) {
+                    if let Some(indices) = hash_table.get(k) {
+                        for &li in indices {
+                            let mut combined = Vec::with_capacity(left_width + right_width);
+                            combined.extend(left_rows[li].iter().cloned());
+                            combined.extend(right_row.iter().cloned());
+                            out_rows.push(combined);
+                        }
+                    }
+                }
+            }
+        } else if left_all_int {
             let mut hash_table: HashMap<i64, Vec<usize>, ahash::RandomState> =
                 HashMap::with_capacity_and_hasher(right_rows.len(), ahash::RandomState::new());
             self.account_memory((right_rows.len() as u64) * 24)?;
@@ -3653,14 +3679,7 @@ impl QueryEngine {
     }
 
     fn hash_key(&self, value: &Value) -> Vec<u8> {
-        match value {
-            Value::Int64(n) => n.to_le_bytes().to_vec(),
-            Value::Float64(f) => f.to_le_bytes().to_vec(),
-            Value::Text(s) => s.as_bytes().to_vec(),
-            Value::Bool(b) => vec![*b as u8],
-            Value::Null => vec![],
-            _ => format!("{:?}", value).into_bytes(),
-        }
+        bytedb_core::index::order_key::encode_okey(&[value])
     }
 
     fn exec_hash_aggregate(&self, input: PhysicalPlan, group_by: Vec<Expr>, aggregates: Vec<Expr>, having: Option<Expr>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
@@ -3783,7 +3802,7 @@ impl QueryEngine {
 
         struct GroupAcc {
             count: i64,
-            sum: i64,
+            sum: i128,
             min: i64,
             max: i64,
             group_val: Value,
@@ -3813,11 +3832,11 @@ impl QueryEngine {
                 } else {
                     Value::Null
                 };
-                GroupAcc { count: 0, sum: 0, min: i64::MAX, max: i64::MIN, group_val: gv }
+                GroupAcc { count: 0, sum: 0i128, min: i64::MAX, max: i64::MIN, group_val: gv }
             });
             entry.count += 1;
             if let Some(v) = agg_val {
-                entry.sum += v;
+                entry.sum += v as i128;
                 if v < entry.min { entry.min = v; }
                 if v > entry.max { entry.max = v; }
             }
@@ -3842,7 +3861,7 @@ impl QueryEngine {
                 let n = name.to_uppercase();
                 let val = match n.as_str() {
                     "COUNT" => Value::Int64(acc.count),
-                    "SUM" => Value::Int64(acc.sum),
+                    "SUM" => int128_to_value(acc.sum),
                     "AVG" => if acc.count > 0 { Value::Float64(acc.sum as f64 / acc.count as f64) } else { Value::Null },
                     "MIN" => if acc.min == i64::MAX { Value::Null } else { Value::Int64(acc.min) },
                     "MAX" => if acc.max == i64::MIN { Value::Null } else { Value::Int64(acc.max) },
@@ -3887,17 +3906,17 @@ impl QueryEngine {
                     Some(i) => i,
                     None => return Value::Null,
                 };
-                let mut sum = 0i64;
+                let mut sum = 0i128;
                 let mut is_float = false;
                 let mut fsum = 0.0f64;
                 for &ri in row_indices {
                     match rows[ri].get(idx) {
-                        Some(Value::Int64(n)) => sum += n,
+                        Some(Value::Int64(n)) => sum += *n as i128,
                         Some(Value::Float64(f)) => { is_float = true; fsum += f; }
                         _ => {}
                     }
                 }
-                if is_float { Value::Float64(fsum + sum as f64) } else { Value::Int64(sum) }
+                if is_float { Value::Float64(fsum + sum as f64) } else { int128_to_value(sum) }
             }
             "AVG" => {
                 let idx = match col_idx {
@@ -5064,6 +5083,14 @@ impl QueryEngine {
         }).map_err(|e| QueryError::Execution(e.to_string()))?;
 
         Ok(ExecutionResult::Rows { columns: col_names, rows: all_rows })
+    }
+}
+
+fn int128_to_value(s: i128) -> Value {
+    if s >= i64::MIN as i128 && s <= i64::MAX as i128 {
+        Value::Int64(s as i64)
+    } else {
+        Value::Float64(s as f64)
     }
 }
 
