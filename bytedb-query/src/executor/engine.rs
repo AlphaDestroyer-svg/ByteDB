@@ -521,11 +521,18 @@ impl QueryEngine {
             }
             Statement::Commit => {
                 if let Some(txn_id) = txn_id {
-                    self.wal_append(LogRecord::Commit { txn_id });
-                    self.wal_flush();
-                    self.txn_manager.commit(txn_id)
-                        .map_err(|e| QueryError::Execution(e.to_string()))?;
-                    Ok(ExecutionResult::Ok("COMMIT".into()))
+                    match self.txn_manager.commit(txn_id) {
+                        Ok(_) => {
+                            self.wal_append(LogRecord::Commit { txn_id });
+                            self.wal_flush();
+                            Ok(ExecutionResult::Ok("COMMIT".into()))
+                        }
+                        Err(e) => {
+                            self.wal_append(LogRecord::Abort { txn_id });
+                            self.wal_flush();
+                            Err(QueryError::Execution(e.to_string()))
+                        }
+                    }
                 } else {
                     Err(QueryError::Execution("No active transaction".into()))
                 }
@@ -1518,6 +1525,7 @@ impl QueryEngine {
                 let snapshot = self.txn_manager.get_snapshot(tid)
                     .map_err(|e| QueryError::Execution(e.to_string()))?;
                 table_data.version_store.insert(key.clone(), tuple.clone(), tid, snapshot.start_ts);
+                self.ssi_write(Some(tid), table, &key);
             }
 
             Self::update_secondary_indexes_insert(&table_data, &row_values, &key)?;
@@ -1550,11 +1558,13 @@ impl QueryEngine {
         let table_id = table_data.schema.columns.len() as u32;
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
+            self.ssi_read(txn_id, table, &key);
             match table_data.read_visible_one(&self.txn_manager, txn_id, &key)? {
                 Some(data) => vec![(key, data)],
                 None => vec![],
             }
         } else {
+            self.ssi_predicate(txn_id, table);
             table_data.read_visible_entries(&self.txn_manager, txn_id)?
         };
 
@@ -1570,6 +1580,7 @@ impl QueryEngine {
                 };
 
                 if matches {
+                    self.ssi_read(txn_id, table, &key);
                     let old_data = data.clone();
                     let old_row_values = tuple.to_vec();
                     for (col_name, expr) in &assignments {
@@ -1666,6 +1677,7 @@ impl QueryEngine {
                             snapshot.start_ts,
                             &snapshot.active_txns,
                         )?;
+                        self.ssi_write(Some(tid), table, &key);
                         self.wal_append(LogRecord::Update {
                             txn_id: tid,
                             table_id,
@@ -1708,11 +1720,13 @@ impl QueryEngine {
         let table_id = table_data.schema.columns.len() as u32;
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = if let Some(key) = self.try_pk_lookup(filter.as_ref(), &table_data.schema) {
+            self.ssi_read(txn_id, table, &key);
             match table_data.read_visible_one(&self.txn_manager, txn_id, &key)? {
                 Some(data) => vec![(key, data)],
                 None => vec![],
             }
         } else {
+            self.ssi_predicate(txn_id, table);
             table_data.read_visible_entries(&self.txn_manager, txn_id)?
         };
 
@@ -1728,6 +1742,7 @@ impl QueryEngine {
                     true
                 };
                 if matches {
+                    self.ssi_read(txn_id, table, &key);
 
                     let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
                     let tables = self.tables.read();
@@ -1803,6 +1818,7 @@ impl QueryEngine {
                         let snapshot = self.txn_manager.get_snapshot(tid)
                             .map_err(|e| QueryError::Execution(e.to_string()))?;
                         table_data.version_store.try_delete(&key, tid, snapshot.start_ts, snapshot.start_ts, &snapshot.active_txns)?;
+                        self.ssi_write(Some(tid), table, &key);
                         self.wal_append(LogRecord::Delete {
                             txn_id: tid,
                             table_id,
@@ -2009,6 +2025,7 @@ impl QueryEngine {
             _ => return self.exec_seq_scan(table, filter, txn_id, limit, None),
         }.map_err(|e| QueryError::Execution(e.to_string()))?;
 
+        self.ssi_predicate(txn_id, table);
         let col_names: Vec<String> = table_data.schema.columns.iter().map(|c| c.name.clone()).collect();
         let mut rows = Vec::new();
         for pk in pks {
@@ -2025,6 +2042,7 @@ impl QueryEngine {
                             continue;
                         }
                     }
+                    self.ssi_read(txn_id, table, &pk);
                     rows.push(tuple.into_vec());
                     if let Some(lim) = limit {
                         if rows.len() >= lim {
@@ -2061,6 +2079,7 @@ impl QueryEngine {
 
         if let Some(tid) = txn_id {
             if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
+                self.ssi_read(Some(tid), table, &key);
                 if let Some(data) = table_data.read_visible_one(&self.txn_manager, Some(tid), &key)? {
                     if let Some(tuple) = Tuple::deserialize(&data) {
                         self.account_scan_row()?;
@@ -2068,6 +2087,7 @@ impl QueryEngine {
                     }
                 }
             } else if let Some((lo, hi)) = self.try_pk_range(filter, &table_data.schema) {
+                self.ssi_predicate(Some(tid), table);
                 let snapshot = self.txn_manager.get_snapshot(tid)
                     .map_err(|e| QueryError::Execution(e.to_string()))?;
                 let base = table_data.index.range_scan(&lo, &hi)
@@ -2091,6 +2111,7 @@ impl QueryEngine {
                         if let Some(f) = filter {
                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                         }
+                        self.ssi_read(Some(tid), table, &k);
                         rows.push(tuple.into_vec());
                         if let Some(lim) = limit {
                             if rows.len() >= lim { break; }
@@ -2107,6 +2128,7 @@ impl QueryEngine {
                                         if let Some(f) = filter {
                                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                                         }
+                                        self.ssi_read(Some(tid), table, k);
                                         rows.push(tuple.into_vec());
                                     }
                                 }
@@ -2115,18 +2137,20 @@ impl QueryEngine {
                     }
                 }
             } else {
+                self.ssi_predicate(Some(tid), table);
                 let entries = table_data.read_visible_entries(&self.txn_manager, Some(tid))?;
                 let fast_filter = filter.and_then(|f| self.try_fast_filter(f, &table_data.schema));
                 let op_code: u8 = fast_filter.as_ref().map(|(_, op, _)| match op {
                     BinOp::Eq => 0, BinOp::Neq => 1, BinOp::Lt => 2,
                     BinOp::Gt => 3, BinOp::Lte => 4, BinOp::Gte => 5, _ => 255,
                 }).unwrap_or(255);
-                for (_key, data) in &entries {
+                for (key_ref, data) in &entries {
                     if let Some((col_idx, _, ref lit_val)) = fast_filter {
                         match raw_filter_matches(data, col_idx, op_code, lit_val) {
                             Some(true) => {
                                 if let Some(tuple) = Tuple::deserialize(data) {
                                     self.account_scan_row()?;
+                                    self.ssi_read(Some(tid), table, key_ref);
                                     rows.push(tuple.into_vec());
                                     if let Some(lim) = limit {
                                         if rows.len() >= lim { break; }
@@ -2146,6 +2170,7 @@ impl QueryEngine {
                             true
                         };
                         if matches {
+                            self.ssi_read(Some(tid), table, key_ref);
                             rows.push(tuple.into_vec());
                             if let Some(lim) = limit {
                                 if rows.len() >= lim { break; }
@@ -2321,6 +2346,7 @@ impl QueryEngine {
         };
 
         if let Some(tid) = txn_id {
+            self.txn_manager.ssi_record_predicate(tid, table);
             let snapshot = self.txn_manager.get_snapshot(tid)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
             let mut keep = true;
@@ -4486,6 +4512,27 @@ impl QueryEngine {
 
     fn stats_snapshot(&self) -> StatsCatalog {
         self.stats.read().clone()
+    }
+
+    #[inline]
+    fn ssi_read(&self, txn_id: Option<TxnId>, table: &str, key: &[u8]) {
+        if let Some(tid) = txn_id {
+            self.txn_manager.ssi_record_read(tid, table, key);
+        }
+    }
+
+    #[inline]
+    fn ssi_predicate(&self, txn_id: Option<TxnId>, table: &str) {
+        if let Some(tid) = txn_id {
+            self.txn_manager.ssi_record_predicate(tid, table);
+        }
+    }
+
+    #[inline]
+    fn ssi_write(&self, txn_id: Option<TxnId>, table: &str, key: &[u8]) {
+        if let Some(tid) = txn_id {
+            self.txn_manager.ssi_record_write(tid, table, key);
+        }
     }
 
     fn index_snapshot(&self) -> IndexCatalog {

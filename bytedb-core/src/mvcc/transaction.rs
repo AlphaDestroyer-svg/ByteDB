@@ -1,13 +1,61 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Serialize, Deserialize};
 
 use crate::error::{CoreError, Result};
 
 pub type TxnId = u64;
 pub type Timestamp = u64;
+
+type RwKey = (String, Vec<u8>);
+
+pub struct SsiState {
+    pub start_ts: Timestamp,
+    reads: Mutex<HashSet<RwKey>>,
+    scanned: Mutex<HashSet<String>>,
+    writes: Mutex<HashSet<RwKey>>,
+    in_conflict: AtomicBool,
+    out_conflict: AtomicBool,
+    aborted: AtomicBool,
+}
+
+impl SsiState {
+    fn new(start_ts: Timestamp) -> Self {
+        SsiState {
+            start_ts,
+            reads: Mutex::new(HashSet::new()),
+            scanned: Mutex::new(HashSet::new()),
+            writes: Mutex::new(HashSet::new()),
+            in_conflict: AtomicBool::new(false),
+            out_conflict: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    fn is_dangerous(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    fn is_pivot(&self) -> bool {
+        !self.aborted.load(Ordering::Acquire)
+            && self.in_conflict.load(Ordering::Acquire)
+            && self.out_conflict.load(Ordering::Acquire)
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+}
+
+struct CommittedSsi {
+    commit_ts: Timestamp,
+    reads: HashSet<RwKey>,
+    scanned: HashSet<String>,
+    writes: HashSet<RwKey>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsolationLevel {
@@ -48,6 +96,8 @@ pub struct TransactionManager {
     active_txns: RwLock<HashMap<TxnId, Transaction>>,
     committed_txns: RwLock<HashMap<TxnId, Timestamp>>,
     default_txn_timeout: RwLock<Option<Duration>>,
+    ssi: RwLock<HashMap<TxnId, Arc<SsiState>>>,
+    ssi_recent: RwLock<HashMap<TxnId, CommittedSsi>>,
 }
 
 impl TransactionManager {
@@ -58,6 +108,8 @@ impl TransactionManager {
             active_txns: RwLock::new(HashMap::new()),
             committed_txns: RwLock::new(HashMap::new()),
             default_txn_timeout: RwLock::new(None),
+            ssi: RwLock::new(HashMap::new()),
+            ssi_recent: RwLock::new(HashMap::new()),
         }
     }
 
@@ -96,7 +148,92 @@ impl TransactionManager {
         };
 
         active.insert(txn_id, txn);
+        drop(active);
+
+        if isolation == IsolationLevel::Serializable {
+            self.ssi.write().insert(txn_id, Arc::new(SsiState::new(start_ts)));
+        }
         txn_id
+    }
+
+    fn oldest_active_serializable_start(&self) -> Timestamp {
+        self.ssi
+            .read()
+            .values()
+            .map(|s| s.start_ts)
+            .min()
+            .unwrap_or_else(|| self.next_timestamp.load(Ordering::Relaxed))
+    }
+
+    pub fn ssi_record_read(&self, txn_id: TxnId, table: &str, key: &[u8]) {
+        let map = self.ssi.read();
+        let Some(me) = map.get(&txn_id).cloned() else { return; };
+        let rk: RwKey = (table.to_string(), key.to_vec());
+        me.reads.lock().insert(rk.clone());
+        // rw-antidependency me --> other: me reads a key that `other` wrote.
+        for (oid, other) in map.iter() {
+            if *oid == txn_id { continue; }
+            if other.writes.lock().contains(&rk) {
+                me.out_conflict.store(true, Ordering::Release);
+                other.in_conflict.store(true, Ordering::Release);
+                if me.is_pivot() {
+                    me.abort();
+                } else if other.is_pivot() {
+                    other.abort();
+                }
+            }
+        }
+        drop(map);
+        let recent = self.ssi_recent.read();
+        for c in recent.values() {
+            if c.commit_ts > me.start_ts && c.writes.contains(&rk) {
+                me.out_conflict.store(true, Ordering::Release);
+                if me.is_pivot() {
+                    me.abort();
+                }
+            }
+        }
+    }
+
+    pub fn ssi_record_predicate(&self, txn_id: TxnId, table: &str) {
+        let map = self.ssi.read();
+        let Some(me) = map.get(&txn_id).cloned() else { return; };
+        me.scanned.lock().insert(table.to_string());
+    }
+
+    pub fn ssi_record_write(&self, txn_id: TxnId, table: &str, key: &[u8]) {
+        let map = self.ssi.read();
+        let Some(me) = map.get(&txn_id).cloned() else { return; };
+        let rk: RwKey = (table.to_string(), key.to_vec());
+        me.writes.lock().insert(rk.clone());
+        // rw-antidependency other --> me: `other` read a key (or scanned the
+        // table) that `me` now overwrites.
+        for (oid, other) in map.iter() {
+            if *oid == txn_id { continue; }
+            let read_it = other.reads.lock().contains(&rk);
+            let scanned_it = other.scanned.lock().contains(table);
+            if read_it || scanned_it {
+                other.out_conflict.store(true, Ordering::Release);
+                me.in_conflict.store(true, Ordering::Release);
+                if me.is_pivot() {
+                    me.abort();
+                } else if other.is_pivot() {
+                    other.abort();
+                }
+            }
+        }
+        drop(map);
+        let recent = self.ssi_recent.read();
+        for c in recent.values() {
+            if c.commit_ts > me.start_ts
+                && (c.reads.contains(&rk) || c.scanned.contains(table))
+            {
+                me.in_conflict.store(true, Ordering::Release);
+                if me.is_pivot() {
+                    me.abort();
+                }
+            }
+        }
     }
 
     pub fn check_deadline(&self, txn_id: TxnId) -> Result<()> {
@@ -126,6 +263,20 @@ impl TransactionManager {
     }
 
     pub fn commit(&self, txn_id: TxnId) -> Result<Timestamp> {
+        let ssi_state = self.ssi.read().get(&txn_id).cloned();
+
+        if let Some(state) = &ssi_state {
+            if state.is_dangerous() {
+                self.ssi.write().remove(&txn_id);
+                let mut active = self.active_txns.write();
+                if let Some(txn) = active.get_mut(&txn_id) {
+                    txn.status = TxnStatus::Aborted;
+                }
+                active.remove(&txn_id);
+                return Err(CoreError::SerializationConflict);
+            }
+        }
+
         let commit_ts = {
             let mut active = self.active_txns.write();
             let txn = active.get_mut(&txn_id)
@@ -142,16 +293,45 @@ impl TransactionManager {
             commit_ts
         };
         self.committed_txns.write().insert(txn_id, commit_ts);
+
+        if let Some(state) = ssi_state {
+            let writes = state.writes.lock().clone();
+            // Only writers can be the target of a future inbound rw-edge, so
+            // read-only serializable txns leave no footprint behind.
+            if !writes.is_empty() {
+                let reads = state.reads.lock().clone();
+                let scanned = state.scanned.lock().clone();
+                self.ssi_recent.write().insert(txn_id, CommittedSsi { commit_ts, reads, scanned, writes });
+            }
+            self.ssi.write().remove(&txn_id);
+            // Trim regardless of whether this txn wrote, so a read-only or
+            // aborting serializable workload still reclaims old footprints.
+            self.gc_ssi_recent();
+        }
         Ok(commit_ts)
     }
 
+    /// Drop committed-txn footprints no live serializable txn can still form an
+    /// edge with. Acquires `ssi` and `ssi_recent` disjointly (never nested) to
+    /// stay consistent with the ssi -> ssi_recent order used on the read/write
+    /// tracking paths.
+    pub fn gc_ssi_recent(&self) {
+        let oldest = self.oldest_active_serializable_start();
+        self.ssi_recent.write().retain(|_, c| c.commit_ts >= oldest);
+    }
+
     pub fn abort(&self, txn_id: TxnId) -> Result<()> {
+        let was_ssi = self.ssi.write().remove(&txn_id).is_some();
         let mut active = self.active_txns.write();
         let txn = active.get_mut(&txn_id)
             .ok_or(CoreError::TransactionNotFound(txn_id))?;
 
         txn.status = TxnStatus::Aborted;
         active.remove(&txn_id);
+        drop(active);
+        if was_ssi {
+            self.gc_ssi_recent();
+        }
         Ok(())
     }
 
@@ -205,6 +385,14 @@ impl TransactionManager {
 
     pub fn committed_count(&self) -> usize {
         self.committed_txns.read().len()
+    }
+
+    pub fn ssi_recent_count(&self) -> usize {
+        self.ssi_recent.read().len()
+    }
+
+    pub fn ssi_active_count(&self) -> usize {
+        self.ssi.read().len()
     }
 
     pub fn is_aborted(&self, txn_id: TxnId) -> bool {

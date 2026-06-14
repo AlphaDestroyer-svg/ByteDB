@@ -50,6 +50,10 @@ pub async fn handle_connection(
                     Response::Error { code: 401, message: "Not authenticated".into() }
                 } else {
                     let effective_txn = txn_id.or(active_txn);
+                    let ends_txn = {
+                        let s = sql.trim_start().to_ascii_uppercase();
+                        s.starts_with("COMMIT") || s.starts_with("ROLLBACK") || s.starts_with("END")
+                    };
                     match execute_query(&sql, effective_txn, &query_engine, &kv_engine, &doc_engine).await {
                         Ok(resp) => {
                             if let Response::Ok { ref message } = resp {
@@ -66,7 +70,15 @@ pub async fn handle_connection(
                             }
                             resp
                         }
-                        Err(e) => Response::Error { code: 500, message: e.to_string() },
+                        Err(e) => {
+                            // A failed COMMIT/ROLLBACK (e.g. a serialization abort)
+                            // has already discarded the transaction server-side;
+                            // drop the dead id so retries start a fresh txn.
+                            if ends_txn {
+                                active_txn = None;
+                            }
+                            Response::Error { code: 500, message: e.to_string() }
+                        }
                     }
                 }
             }
@@ -81,6 +93,10 @@ pub async fn handle_connection(
 
         let response_data = response.serialize();
         write_frame(&mut stream, &response_data).await?;
+    }
+
+    if let Some(tid) = active_txn.take() {
+        let _ = query_engine.txn_manager().abort(tid);
     }
 
     Ok(())

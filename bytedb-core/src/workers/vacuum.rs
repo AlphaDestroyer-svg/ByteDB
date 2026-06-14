@@ -144,6 +144,7 @@ impl MvccVacuum {
         }
 
         self.txn_manager.gc_committed(oldest);
+        self.txn_manager.gc_ssi_recent();
 
         self.versions_removed.fetch_add(total_v, Ordering::Relaxed);
         self.keys_removed.fetch_add(total_k, Ordering::Relaxed);
