@@ -27,6 +27,9 @@ use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
 use crate::planner::optimizer::{optimize_with_catalog, IndexCatalog, IndexInfo};
 use crate::planner::physical_plan::PhysicalPlan;
+use rayon::prelude::*;
+
+const PARALLEL_SCAN_THRESHOLD: usize = 16384;
 
 thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<TxnId>> = std::cell::Cell::new(None);
@@ -477,6 +480,74 @@ impl QueryEngine {
             ctx.account_memory(bytes)?;
         }
         Ok(())
+    }
+
+    fn parallel_filter_leaves(
+        &self,
+        leaves: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+        schema: &Schema,
+        filter: Option<&Expr>,
+        needed_columns: Option<&[usize]>,
+        fast_filter: Option<(usize, BinOp, Value)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let ctx = self.active_ctx.read().as_ref().map(Arc::clone);
+        let fast_op: Option<(usize, u8, Value)> = fast_filter.map(|(ci, op, v)| {
+            let code = match op {
+                BinOp::Eq => 0, BinOp::Neq => 1, BinOp::Lt => 2,
+                BinOp::Gt => 3, BinOp::Lte => 4, BinOp::Gte => 5, _ => 255,
+            };
+            (ci, code, v)
+        });
+
+        let total: usize = leaves.iter().map(|l| l.len()).sum();
+        if let Some(c) = &ctx {
+            c.account_scan_rows(total as u64)?;
+        }
+
+        let per_leaf: Vec<Result<Vec<Vec<Value>>>> = leaves
+            .par_iter()
+            .map(|leaf| {
+                if let Some(c) = &ctx {
+                    c.check()?;
+                }
+                let mut out = Vec::new();
+                for (_k, data) in leaf {
+                    if let Some((ci, code, lit)) = &fast_op {
+                        match raw_filter_matches(data, *ci, *code, lit) {
+                            Some(true) => {
+                                if let Some(t) = Tuple::deserialize(data) {
+                                    out.push(t.into_vec());
+                                }
+                                continue;
+                            }
+                            Some(false) => continue,
+                            None => {}
+                        }
+                    }
+                    let tuple = if let Some(nc) = needed_columns {
+                        Tuple::deserialize_columns(data, nc)
+                    } else {
+                        Tuple::deserialize(data)
+                    };
+                    if let Some(tuple) = tuple {
+                        let matches = match filter {
+                            Some(f) => self.eval_predicate(f, &tuple, schema),
+                            None => true,
+                        };
+                        if matches {
+                            out.push(tuple.into_vec());
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .collect();
+
+        let mut rows = Vec::new();
+        for part in per_leaf {
+            rows.extend(part?);
+        }
+        Ok(rows)
     }
 
     #[allow(dead_code)]
@@ -2189,6 +2260,22 @@ impl QueryEngine {
             let schema = &table_data.schema;
             let scan_limit = limit;
             let fast_filter = filter.and_then(|f| self.try_fast_filter(f, schema));
+
+            if scan_limit.is_none()
+                && filter.is_some()
+                && table_data.index.approx_len() >= PARALLEL_SCAN_THRESHOLD
+            {
+                let leaves = table_data.index.collect_leaves();
+                let parallel_rows = self.parallel_filter_leaves(
+                    leaves,
+                    schema,
+                    filter,
+                    needed_columns,
+                    fast_filter.clone(),
+                )?;
+                return Ok(ExecutionResult::Rows { columns: col_names, rows: parallel_rows });
+            }
+
             let scan_err: std::cell::RefCell<Option<QueryError>> = std::cell::RefCell::new(None);
             if let Some((col_idx, op, ref lit_val)) = fast_filter {
                 let op_code: u8 = match op {
