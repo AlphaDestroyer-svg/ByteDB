@@ -3783,23 +3783,24 @@ impl QueryEngine {
             }
         }
 
-        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-        for (_key, row_indices) in &groups {
+        let group_vals: Vec<&Vec<usize>> = groups.values().collect();
+        let build_group = |row_indices: &Vec<usize>| {
             let mut row_out = Vec::with_capacity(group_indices.len() + agg_functions.len());
-
             for &gi in &group_indices {
                 row_out.push(rows[row_indices[0]].get(gi).cloned().unwrap_or(Value::Null));
             }
-
             for (fi, expr) in agg_functions.iter().enumerate() {
                 if let Expr::Function { name, .. } = expr {
-                    let agg_val = self.compute_aggregate_fast(name, agg_col_indices[fi], row_indices, &rows);
-                    row_out.push(agg_val);
+                    row_out.push(self.compute_aggregate_fast(name, agg_col_indices[fi], row_indices, &rows));
                 }
             }
-
-            out_rows.push(row_out);
-        }
+            row_out
+        };
+        let mut out_rows: Vec<Vec<Value>> = if group_vals.len() >= 64 {
+            group_vals.par_iter().map(|ri| build_group(ri)).collect()
+        } else {
+            group_vals.iter().map(|ri| build_group(ri)).collect()
+        };
 
         if let Some(ref having_expr) = having {
             let having_schema = Schema::new("", out_col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
