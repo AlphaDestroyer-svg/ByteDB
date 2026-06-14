@@ -111,6 +111,7 @@ pub struct QueryEngine {
     slow_query_log_capacity: usize,
 
     txn_undo: parking_lot::Mutex<HashMap<TxnId, HashMap<(String, Vec<u8>), Option<Vec<u8>>>>>,
+    txn_deltas: parking_lot::Mutex<HashMap<TxnId, Vec<(String, u8, Vec<u8>, Vec<u8>)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +207,7 @@ impl QueryEngine {
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
             slow_query_log_capacity: 256,
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
+            txn_deltas: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -230,6 +232,7 @@ impl QueryEngine {
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
             slow_query_log_capacity: 256,
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
+            txn_deltas: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -381,12 +384,36 @@ impl QueryEngine {
         PENDING_DELTAS.with(|p| p.borrow_mut().clear());
     }
 
+    fn stash_or_persist_deltas(&self, txn_id: Option<TxnId>) {
+        match txn_id {
+            Some(tid) => {
+                let deltas = PENDING_DELTAS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+                if !deltas.is_empty() {
+                    self.txn_deltas.lock().entry(tid).or_default().extend(deltas);
+                }
+            }
+            None => self.persist_pending_deltas(),
+        }
+    }
+
+    fn commit_txn_deltas(&self, txn_id: TxnId) {
+        let deltas = self.txn_deltas.lock().remove(&txn_id).unwrap_or_default();
+        self.write_deltas_to_disk(deltas);
+    }
+
+    fn discard_txn_deltas(&self, txn_id: TxnId) {
+        self.txn_deltas.lock().remove(&txn_id);
+    }
+
     fn persist_pending_deltas(&self) {
+        let deltas = PENDING_DELTAS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        self.write_deltas_to_disk(deltas);
+    }
+
+    fn write_deltas_to_disk(&self, deltas: Vec<(String, u8, Vec<u8>, Vec<u8>)>) {
         let Some(ds) = self.disk_store.as_ref() else {
-            self.clear_pending_deltas();
             return;
         };
-        let deltas = PENDING_DELTAS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         if deltas.is_empty() {
             return;
         }
@@ -649,6 +676,7 @@ impl QueryEngine {
                     match self.txn_manager.commit(txn_id) {
                         Ok(_) => {
                             self.clear_txn_undo(txn_id);
+                            self.commit_txn_deltas(txn_id);
                             self.wal_append(LogRecord::Commit { txn_id });
                             self.wal_flush();
                             Ok(ExecutionResult::Ok("COMMIT".into()))
@@ -866,17 +894,17 @@ impl QueryEngine {
             }
             Statement::Insert(ins) => {
                 let r = self.exec_insert(&ins.table, ins.columns, ins.source, ins.on_conflict, ins.returning, txn_id);
-                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
+                if r.is_ok() { self.stash_or_persist_deltas(txn_id); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Update(upd) => {
                 let r = self.exec_update(&upd.table, upd.assignments, upd.where_clause, upd.returning, txn_id);
-                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
+                if r.is_ok() { self.stash_or_persist_deltas(txn_id); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Delete(del) => {
                 let r = self.exec_delete(&del.table, del.where_clause, del.returning, txn_id);
-                if r.is_ok() { self.persist_pending_deltas(); } else { self.clear_pending_deltas(); }
+                if r.is_ok() { self.stash_or_persist_deltas(txn_id); } else { self.clear_pending_deltas(); }
                 r
             }
             Statement::Select(ref select) if !select.ctes.is_empty() || matches!(select.from, FromClause::Subquery(_)) => {
@@ -4703,6 +4731,8 @@ impl QueryEngine {
     }
 
     fn rollback_txn_effects(&self, txn_id: TxnId) {
+        self.discard_txn_deltas(txn_id);
+        self.clear_pending_deltas();
         let Some(undo) = self.txn_undo.lock().remove(&txn_id) else { return; };
         let tables = self.tables.read();
         let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4718,21 +4748,18 @@ impl QueryEngine {
                         let _ = Self::update_secondary_indexes_update(td, &cv, &pvv, key);
                     }
                     let _ = td.index.insert(key.clone(), pv.clone());
-                    self.log_put(table, key, pv);
                 }
                 (Some(cur), None) => {
                     if let Some(cv) = Tuple::deserialize_to_vec(&cur) {
                         Self::update_secondary_indexes_delete(td, &cv, key);
                     }
                     let _ = td.index.delete(key);
-                    self.log_del(table, key);
                 }
                 (None, Some(pv)) => {
                     if let Some(pvv) = Tuple::deserialize_to_vec(pv) {
                         let _ = Self::update_secondary_indexes_insert(td, &pvv, key);
                     }
                     let _ = td.index.insert(key.clone(), pv.clone());
-                    self.log_put(table, key, pv);
                 }
                 (None, None) => {}
             }
@@ -4742,8 +4769,6 @@ impl QueryEngine {
                 td.version_store.rollback_txn(txn_id);
             }
         }
-        drop(tables);
-        self.persist_pending_deltas();
     }
 
     fn index_snapshot(&self) -> IndexCatalog {
