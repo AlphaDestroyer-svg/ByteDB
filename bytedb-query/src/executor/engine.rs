@@ -112,6 +112,7 @@ pub struct QueryEngine {
 
     txn_undo: parking_lot::Mutex<HashMap<TxnId, HashMap<(String, Vec<u8>), Option<Vec<u8>>>>>,
     txn_deltas: parking_lot::Mutex<HashMap<TxnId, Vec<(String, u8, Vec<u8>, Vec<u8>)>>>,
+    rowids: parking_lot::Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,7 @@ impl QueryEngine {
             slow_query_log_capacity: 256,
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
+            rowids: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -233,6 +235,7 @@ impl QueryEngine {
             slow_query_log_capacity: 256,
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
+            rowids: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1125,6 +1128,7 @@ impl QueryEngine {
             Ok(_) => {
                 self.tables.write().remove(&dt.name);
                 self.stats.write().remove(&dt.name);
+                self.rowids.lock().remove(&dt.name);
                 if let Some(ds) = &self.disk_store {
                     let _ = ds.drop_table(&dt.name);
                 }
@@ -1627,7 +1631,11 @@ impl QueryEngine {
             }
 
             let tuple = Tuple::new(row_values.clone());
-            let key = tuple.key_bytes(&pk_cols);
+            let key = if pk_cols.is_empty() {
+                self.next_rowid(table, &table_data)
+            } else {
+                tuple.key_bytes(&pk_cols)
+            };
             let data = tuple.serialize();
 
             let existing = table_data.index.search(&key)
@@ -4728,6 +4736,31 @@ impl QueryEngine {
 
     fn clear_txn_undo(&self, txn_id: TxnId) {
         self.txn_undo.lock().remove(&txn_id);
+    }
+
+    fn next_rowid(&self, table: &str, td: &TableData) -> Vec<u8> {
+        let mut map = self.rowids.lock();
+        let next = match map.get_mut(table) {
+            Some(c) => {
+                let v = *c;
+                *c += 1;
+                v
+            }
+            None => {
+                let mut max: u64 = 0;
+                if let Ok(entries) = td.index.scan_all() {
+                    for (k, _) in &entries {
+                        if let Ok(arr) = <[u8; 8]>::try_from(k.as_slice()) {
+                            max = max.max(u64::from_be_bytes(arr));
+                        }
+                    }
+                }
+                let v = max + 1;
+                map.insert(table.to_string(), v + 1);
+                v
+            }
+        };
+        next.to_be_bytes().to_vec()
     }
 
     pub fn rollback(&self, txn_id: TxnId) {
