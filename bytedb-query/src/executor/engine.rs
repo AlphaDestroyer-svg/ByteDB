@@ -3765,6 +3765,10 @@ impl QueryEngine {
             }
         }
 
+        if group_by.is_empty() && groups.is_empty() {
+            groups.insert(Vec::new(), Vec::new());
+        }
+
         let mut out_col_names = Vec::with_capacity(group_indices.len() + agg_functions.len());
         for expr in &group_by {
             if let Expr::Column(name) = expr {
@@ -3953,14 +3957,17 @@ impl QueryEngine {
                 let mut sum = 0i128;
                 let mut is_float = false;
                 let mut fsum = 0.0f64;
+                let mut seen = false;
                 for &ri in row_indices {
                     match rows[ri].get(idx) {
-                        Some(Value::Int64(n)) => sum += *n as i128,
-                        Some(Value::Float64(f)) => { is_float = true; fsum += f; }
+                        Some(Value::Int64(n)) => { sum += *n as i128; seen = true; }
+                        Some(Value::Float64(f)) => { is_float = true; fsum += f; seen = true; }
                         _ => {}
                     }
                 }
-                if is_float { Value::Float64(fsum + sum as f64) } else { int128_to_value(sum) }
+                if !seen { Value::Null }
+                else if is_float { Value::Float64(fsum + sum as f64) }
+                else { int128_to_value(sum) }
             }
             "AVG" => {
                 let idx = match col_idx {
