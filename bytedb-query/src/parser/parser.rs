@@ -1259,7 +1259,11 @@ impl Parser {
             Token::Minus => {
                 self.advance();
                 let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp { op: UnaryOp::Neg, expr: Box::new(expr) })
+                match expr {
+                    Expr::Literal(LiteralValue::Integer(n)) => Ok(Expr::Literal(LiteralValue::Integer(-n))),
+                    Expr::Literal(LiteralValue::Float(f)) => Ok(Expr::Literal(LiteralValue::Float(-f))),
+                    other => Ok(Expr::UnaryOp { op: UnaryOp::Neg, expr: Box::new(other) }),
+                }
             }
             _ => self.parse_primary(),
         }
