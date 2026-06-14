@@ -4033,7 +4033,7 @@ impl QueryEngine {
                     .and_then(|c| c.default.clone())
                     .unwrap_or(Value::Null)
             }
-            _ => Value::Null,
+            other => self.eval_value(other, &Tuple::new(Vec::new()), schema),
         }
     }
 
@@ -4220,10 +4220,13 @@ impl QueryEngine {
                 let val = self.eval_value(expr, tuple, schema);
                 match op {
                     UnaryOp::Neg => match val {
-                        Value::Int64(n) => Value::Int64(-n),
+                        Value::Int64(n) => n.checked_neg()
+                            .map(Value::Int64)
+                            .unwrap_or_else(|| Value::Float64(-(n as f64))),
                         Value::Float64(f) => Value::Float64(-f),
                         _ => Value::Null,
                     },
+
                     UnaryOp::Not => match val {
                         Value::Bool(b) => Value::Bool(!b),
                         _ => Value::Null,
@@ -4461,7 +4464,9 @@ impl QueryEngine {
                     "ABS" => {
                         if let Some(arg) = args.first() {
                             match self.eval_value(arg, tuple, schema) {
-                                Value::Int64(n) => Value::Int64(n.abs()),
+                                Value::Int64(n) => n.checked_abs()
+                                    .map(Value::Int64)
+                                    .unwrap_or_else(|| Value::Float64((n as f64).abs())),
                                 Value::Float64(f) => Value::Float64(f.abs()),
                                 _ => Value::Null,
                             }
@@ -4619,7 +4624,13 @@ impl QueryEngine {
                             let s = self.eval_value(&args[0], tuple, schema);
                             let n = self.eval_value(&args[1], tuple, schema);
                             match (s, n) {
-                                (Value::Text(s), Value::Int64(n)) => Value::Text(s.repeat(n.max(0) as usize)),
+                                (Value::Text(s), Value::Int64(n)) => {
+                                    let count = n.max(0) as usize;
+                                    match s.len().checked_mul(count) {
+                                        Some(total) if total <= 64 * 1024 * 1024 => Value::Text(s.repeat(count)),
+                                        _ => Value::Null,
+                                    }
+                                }
                                 _ => Value::Null,
                             }
                         } else { Value::Null }
