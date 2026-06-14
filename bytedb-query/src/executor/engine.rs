@@ -1627,18 +1627,29 @@ impl QueryEngine {
                     .ok_or_else(|| QueryError::Execution(format!("Foreign key references unknown table '{}'", fk.ref_table)))?;
                 let parent_idxs: Vec<usize> = fk.ref_columns.iter()
                     .filter_map(|c| parent.schema.column_index(c)).collect();
-                let parent_all = parent.index.scan_all()
-                    .map_err(|e| QueryError::Execution(e.to_string()))?;
-                let mut found = false;
-                for (_, pdata) in &parent_all {
-                    if let Some(pt) = Tuple::deserialize(pdata) {
+                let parent_pk = parent.schema.primary_key_columns();
+                let found = if !parent_pk.is_empty() && parent_idxs == parent_pk {
+                    let probe = Tuple::new(child_vals.clone());
+                    let cols: Vec<usize> = (0..child_vals.len()).collect();
+                    let pk_key = probe.key_bytes(&cols);
+                    parent.index.search(&pk_key)
+                        .map_err(|e| QueryError::Execution(e.to_string()))?
+                        .is_some()
+                } else {
+                    let mut hit = false;
+                    parent.index.for_each(|_k, pdata| {
                         let mut all_eq = true;
                         for (j, pi) in parent_idxs.iter().enumerate() {
-                            if pt.get(*pi) != Some(&child_vals[j]) { all_eq = false; break; }
+                            match bytedb_core::tuple::tuple::read_value_at(pdata, *pi) {
+                                Some(pv) if &pv == &child_vals[j] => {}
+                                _ => { all_eq = false; break; }
+                            }
                         }
-                        if all_eq { found = true; break; }
-                    }
-                }
+                        if all_eq { hit = true; return false; }
+                        true
+                    }).ok();
+                    hit
+                };
                 if !found {
                     return Err(QueryError::fk_violation(&fk.ref_table));
                 }
