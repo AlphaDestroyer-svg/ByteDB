@@ -569,6 +569,8 @@ impl Parser {
         let mut columns = Vec::new();
         let mut table_checks: Vec<Expr> = Vec::new();
         let mut table_fks: Vec<ForeignKeyDef> = Vec::new();
+        let mut table_pk_cols: Vec<String> = Vec::new();
+        let mut table_unique_cols: Vec<String> = Vec::new();
         loop {
 
             if self.current() == &Token::Unique || self.current() == &Token::Primary
@@ -608,6 +610,19 @@ impl Parser {
                         on_delete,
                         on_update,
                     });
+                } else if self.current() == &Token::Primary {
+                    self.advance();
+                    self.expect(Token::Key)?;
+                    self.expect(Token::LParen)?;
+                    let cols = self.parse_ident_list()?;
+                    self.expect(Token::RParen)?;
+                    table_pk_cols = cols;
+                } else if self.current() == &Token::Unique {
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let cols = self.parse_ident_list()?;
+                    self.expect(Token::RParen)?;
+                    table_unique_cols.extend(cols);
                 } else {
                     return Err(QueryError::Parse(format!("Unexpected constraint token: {:?}", self.current())));
                 }
@@ -708,6 +723,18 @@ impl Parser {
         }
 
         self.expect(Token::RParen)?;
+
+        for pk in &table_pk_cols {
+            if let Some(c) = columns.iter_mut().find(|c| &c.name == pk) {
+                c.primary_key = true;
+                c.nullable = false;
+            }
+        }
+        for u in &table_unique_cols {
+            if let Some(c) = columns.iter_mut().find(|c| &c.name == u) {
+                c.unique = true;
+            }
+        }
 
         Ok(Statement::CreateTable(CreateTableStmt {
             name,
