@@ -966,8 +966,9 @@ impl QueryEngine {
                 self.exec_delete(&table, filter, None, txn_id)
             }
             PhysicalPlan::Project { input, columns } => {
+                let src = Self::plan_table_name(&input);
                 let result = self.execute_physical(*input, txn_id)?;
-                self.apply_projection(result, &columns)
+                self.apply_projection(result, &columns, src.as_deref())
             }
             PhysicalPlan::SeqScan { table, filter, limit, needed_columns } => {
                 self.exec_seq_scan(&table, filter.as_ref(), txn_id, limit, needed_columns.as_deref())
@@ -2745,7 +2746,7 @@ impl QueryEngine {
         tuple.key_bytes(&[0])
     }
 
-    fn apply_projection(&self, result: ExecutionResult, columns: &[SelectColumn]) -> Result<ExecutionResult> {
+    fn apply_projection(&self, result: ExecutionResult, columns: &[SelectColumn], src_table: Option<&str>) -> Result<ExecutionResult> {
         match result {
             ExecutionResult::Rows { columns: col_names, rows } => {
                 if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
@@ -2757,7 +2758,7 @@ impl QueryEngine {
                     return self.apply_projection_with_windows(col_names, rows, columns);
                 }
 
-                let schema = Schema::new("", col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
+                let schema = Schema::new(src_table.unwrap_or(""), col_names.iter().map(|c| Column::new(c.clone(), DataType::Text)).collect());
 
                 let mut new_col_names = Vec::new();
                 for col in columns {
@@ -4044,6 +4045,18 @@ impl QueryEngine {
         }
     }
 
+    fn correlate_subquery(&self, subquery: &SelectStmt, tuple: &Tuple, schema: &Schema) -> SelectStmt {
+        let mut sq = subquery.clone();
+        if !schema.table_name.is_empty() {
+            let mut vals: HashMap<String, Value> = HashMap::with_capacity(schema.columns.len());
+            for (i, c) in schema.columns.iter().enumerate() {
+                vals.insert(c.name.clone(), tuple.get(i).cloned().unwrap_or(Value::Null));
+            }
+            rewrite_select_correlated(&mut sq, &schema.table_name, &vals);
+        }
+        sq
+    }
+
     fn eval_expr_simple(&self, expr: &Expr) -> Value {
         match expr {
             Expr::Literal(LiteralValue::Integer(n)) => Value::Int64(*n),
@@ -4747,7 +4760,8 @@ impl QueryEngine {
                 Value::Bool(ge_low && le_high)
             }
             Expr::Subquery(subquery) => {
-                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                let sq = self.correlate_subquery(subquery, tuple, schema);
+                let result = self.execute(Statement::Select(sq), current_txn_id());
                 match result {
                     Ok(ExecutionResult::Rows { rows, .. }) => {
                         if rows.len() == 1 && !rows[0].is_empty() {
@@ -4760,14 +4774,16 @@ impl QueryEngine {
                 }
             }
             Expr::Exists(subquery) => {
-                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                let sq = self.correlate_subquery(subquery, tuple, schema);
+                let result = self.execute(Statement::Select(sq), current_txn_id());
                 match result {
                     Ok(ExecutionResult::Rows { rows, .. }) => Value::Bool(!rows.is_empty()),
                     _ => Value::Bool(false),
                 }
             }
             Expr::InSubquery { expr, subquery } => {
-                let result = self.execute(Statement::Select(*subquery.clone()), current_txn_id());
+                let sq = self.correlate_subquery(subquery, tuple, schema);
+                let result = self.execute(Statement::Select(sq), current_txn_id());
                 let val = self.eval_value(expr, tuple, schema);
                 match result {
                     Ok(ExecutionResult::Rows { rows, .. }) => {
@@ -5163,6 +5179,104 @@ fn int128_to_value(s: i128) -> Value {
         Value::Int64(s as i64)
     } else {
         Value::Float64(s as f64)
+    }
+}
+
+fn value_to_literal_expr(v: &Value) -> Expr {
+    use bytedb_core::tuple::value as bv;
+    let lit = match v {
+        Value::Int64(n) => LiteralValue::Integer(*n),
+        Value::Float64(f) => LiteralValue::Float(*f),
+        Value::Text(s) => LiteralValue::String(s.clone()),
+        Value::Bool(b) => LiteralValue::Bool(*b),
+        Value::Null => LiteralValue::Null,
+        Value::Bytes(b) => LiteralValue::HexBlob(b.clone()),
+        Value::Date(d) => LiteralValue::String(bv::format_date(*d)),
+        Value::Timestamp(t) => LiteralValue::String(bv::format_timestamp(*t)),
+        Value::Uuid(u) => LiteralValue::String(bv::format_uuid(u)),
+        Value::Decimal(m, s) => LiteralValue::String(bv::format_decimal(*m, *s)),
+        Value::Json(j) => LiteralValue::String(j.to_string()),
+        Value::Interval(us) => LiteralValue::Integer(*us),
+    };
+    Expr::Literal(lit)
+}
+
+fn rewrite_expr_correlated(expr: &mut Expr, outer_table: &str, vals: &HashMap<String, Value>) {
+    match expr {
+        Expr::QualifiedColumn(t, c) => {
+            if t.eq_ignore_ascii_case(outer_table) {
+                if let Some(v) = vals.get(c) {
+                    *expr = value_to_literal_expr(v);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_correlated(left, outer_table, vals);
+            rewrite_expr_correlated(right, outer_table, vals);
+        }
+        Expr::UnaryOp { expr: e, .. } => rewrite_expr_correlated(e, outer_table, vals),
+        Expr::Function { args, .. } => {
+            for a in args {
+                rewrite_expr_correlated(a, outer_table, vals);
+            }
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) => rewrite_expr_correlated(e, outer_table, vals),
+        Expr::InList { expr: e, list } => {
+            rewrite_expr_correlated(e, outer_table, vals);
+            for x in list {
+                rewrite_expr_correlated(x, outer_table, vals);
+            }
+        }
+        Expr::Between { expr: e, low, high } => {
+            rewrite_expr_correlated(e, outer_table, vals);
+            rewrite_expr_correlated(low, outer_table, vals);
+            rewrite_expr_correlated(high, outer_table, vals);
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            if let Some(o) = operand {
+                rewrite_expr_correlated(o, outer_table, vals);
+            }
+            for (w, t) in when_clauses {
+                rewrite_expr_correlated(w, outer_table, vals);
+                rewrite_expr_correlated(t, outer_table, vals);
+            }
+            if let Some(er) = else_result {
+                rewrite_expr_correlated(er, outer_table, vals);
+            }
+        }
+        Expr::Cast { expr: e, .. } => rewrite_expr_correlated(e, outer_table, vals),
+        Expr::Subquery(s) | Expr::Exists(s) => rewrite_select_correlated(s, outer_table, vals),
+        Expr::InSubquery { expr: e, subquery } => {
+            rewrite_expr_correlated(e, outer_table, vals);
+            rewrite_select_correlated(subquery, outer_table, vals);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_select_correlated(stmt: &mut SelectStmt, outer_table: &str, vals: &HashMap<String, Value>) {
+    for col in &mut stmt.columns {
+        if let SelectColumn::Expr(e, _) = col {
+            rewrite_expr_correlated(e, outer_table, vals);
+        }
+    }
+    if let Some(w) = &mut stmt.where_clause {
+        rewrite_expr_correlated(w, outer_table, vals);
+    }
+    for j in &mut stmt.joins {
+        rewrite_expr_correlated(&mut j.condition, outer_table, vals);
+    }
+    for g in &mut stmt.group_by {
+        rewrite_expr_correlated(g, outer_table, vals);
+    }
+    if let Some(h) = &mut stmt.having {
+        rewrite_expr_correlated(h, outer_table, vals);
+    }
+    for o in &mut stmt.order_by {
+        rewrite_expr_correlated(&mut o.expr, outer_table, vals);
+    }
+    if let FromClause::Subquery(s) = &mut stmt.from {
+        rewrite_select_correlated(s, outer_table, vals);
     }
 }
 
