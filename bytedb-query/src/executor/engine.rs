@@ -1103,11 +1103,17 @@ impl QueryEngine {
         self.database.create_table(meta)
             .map_err(|e| QueryError::Execution(e.to_string()))?;
 
+        let mut all_checks = ct.check_constraints.clone();
+        for c in &ct.columns {
+            if let Some(chk) = &c.check {
+                all_checks.push(chk.clone());
+            }
+        }
         let table_data = TableData {
             schema: schema.clone(),
             index: Arc::new(BPlusTree::new(format!("{}_pk", ct.name), 128)),
             version_store: Arc::new(VersionStore::new()),
-            check_exprs: ct.check_constraints.clone(),
+            check_exprs: all_checks,
             sequences: sequences.clone(),
             secondary_indexes: Vec::new(),
         };
@@ -1607,7 +1613,7 @@ impl QueryEngine {
             {
                 let tup = Tuple::new(row_values.clone());
                 for chk in &table_data.check_exprs {
-                    if !self.eval_predicate(chk, &tup, &table_data.schema) {
+                    if !self.eval_check(chk, &tup, &table_data.schema) {
                         return Err(QueryError::check_violation(table));
                     }
                 }
@@ -1827,7 +1833,7 @@ impl QueryEngine {
                     }
 
                     for chk in &table_data.check_exprs {
-                        if !self.eval_predicate(chk, &tuple, &table_data.schema) {
+                        if !self.eval_check(chk, &tuple, &table_data.schema) {
                             return Err(QueryError::Execution(
                                 format!("CHECK constraint failed on table '{}'", table)
                             ));
@@ -4078,53 +4084,105 @@ impl QueryEngine {
     }
 
     fn eval_predicate(&self, expr: &Expr, tuple: &Tuple, schema: &Schema) -> bool {
+        self.eval_predicate_tri(expr, tuple, schema).unwrap_or(false)
+    }
+
+    fn eval_check(&self, expr: &Expr, tuple: &Tuple, schema: &Schema) -> bool {
+        self.eval_predicate_tri(expr, tuple, schema).unwrap_or(true)
+    }
+
+    fn eval_predicate_tri(&self, expr: &Expr, tuple: &Tuple, schema: &Schema) -> Option<bool> {
+        use std::cmp::Ordering;
         match expr {
             Expr::BinaryOp { left, op, right } => {
                 match op {
                     BinOp::And => {
-                        self.eval_predicate(left, tuple, schema) && self.eval_predicate(right, tuple, schema)
-                    }
-                    BinOp::Or => {
-                        self.eval_predicate(left, tuple, schema) || self.eval_predicate(right, tuple, schema)
-                    }
-                    _ => {
-                        let lval = self.eval_value(left, tuple, schema);
-                        let rval = self.eval_value(right, tuple, schema);
-                        match op {
-                            BinOp::Eq => lval.compare(&rval) == Some(std::cmp::Ordering::Equal),
-                            BinOp::Neq => lval.compare(&rval) != Some(std::cmp::Ordering::Equal),
-                            BinOp::Lt => lval.compare(&rval) == Some(std::cmp::Ordering::Less),
-                            BinOp::Gt => lval.compare(&rval) == Some(std::cmp::Ordering::Greater),
-                            BinOp::Lte => matches!(lval.compare(&rval), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-                            BinOp::Gte => matches!(lval.compare(&rval), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
-                            BinOp::Like => match (&lval, &rval) {
-                                (Value::Text(s), Value::Text(pattern)) => like_match(s, pattern),
-                                _ => false,
-                            },
-                            BinOp::Ilike => match (&lval, &rval) {
-                                (Value::Text(s), Value::Text(pattern)) => ilike_match(s, pattern),
-                                _ => false,
-                            },
-                            _ => false,
+                        let l = self.eval_predicate_tri(left, tuple, schema);
+                        if l == Some(false) { return Some(false); }
+                        let r = self.eval_predicate_tri(right, tuple, schema);
+                        match (l, r) {
+                            (_, Some(false)) => Some(false),
+                            (Some(true), Some(true)) => Some(true),
+                            _ => None,
                         }
                     }
+                    BinOp::Or => {
+                        let l = self.eval_predicate_tri(left, tuple, schema);
+                        if l == Some(true) { return Some(true); }
+                        let r = self.eval_predicate_tri(right, tuple, schema);
+                        match (l, r) {
+                            (_, Some(true)) => Some(true),
+                            (Some(false), Some(false)) => Some(false),
+                            _ => None,
+                        }
+                    }
+                    BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {
+                        let lval = self.eval_value(left, tuple, schema);
+                        let rval = self.eval_value(right, tuple, schema);
+                        if lval.is_null() || rval.is_null() { return None; }
+                        let cmp = lval.compare(&rval);
+                        Some(match op {
+                            BinOp::Eq => cmp == Some(Ordering::Equal),
+                            BinOp::Neq => matches!(cmp, Some(Ordering::Less | Ordering::Greater)),
+                            BinOp::Lt => cmp == Some(Ordering::Less),
+                            BinOp::Gt => cmp == Some(Ordering::Greater),
+                            BinOp::Lte => matches!(cmp, Some(Ordering::Less | Ordering::Equal)),
+                            BinOp::Gte => matches!(cmp, Some(Ordering::Greater | Ordering::Equal)),
+                            _ => unreachable!(),
+                        })
+                    }
+                    BinOp::Like | BinOp::Ilike => {
+                        let lval = self.eval_value(left, tuple, schema);
+                        let rval = self.eval_value(right, tuple, schema);
+                        if lval.is_null() || rval.is_null() { return None; }
+                        match (&lval, &rval) {
+                            (Value::Text(s), Value::Text(pattern)) => Some(
+                                if matches!(op, BinOp::Like) { like_match(s, pattern) } else { ilike_match(s, pattern) }
+                            ),
+                            _ => Some(false),
+                        }
+                    }
+                    _ => match self.eval_value(expr, tuple, schema) {
+                        Value::Bool(b) => Some(b),
+                        Value::Null => None,
+                        _ => Some(true),
+                    },
                 }
             }
-            Expr::IsNull(inner) => {
-                let val = self.eval_value(inner, tuple, schema);
-                val.is_null()
+            Expr::UnaryOp { op: UnaryOp::Not, expr: inner } => {
+                self.eval_predicate_tri(inner, tuple, schema).map(|b| !b)
             }
-            Expr::IsNotNull(inner) => {
-                let val = self.eval_value(inner, tuple, schema);
-                !val.is_null()
-            }
-            _ => {
-                match self.eval_value(expr, tuple, schema) {
-                    Value::Bool(b) => b,
-                    Value::Null => false,
-                    _ => true,
+            Expr::IsNull(inner) => Some(self.eval_value(inner, tuple, schema).is_null()),
+            Expr::IsNotNull(inner) => Some(!self.eval_value(inner, tuple, schema).is_null()),
+            Expr::Between { expr: e, low, high } => {
+                let v = self.eval_value(e, tuple, schema);
+                if v.is_null() { return None; }
+                let lo = self.eval_value(low, tuple, schema);
+                let hi = self.eval_value(high, tuple, schema);
+                let ge = if lo.is_null() { None } else { Some(matches!(v.compare(&lo), Some(Ordering::Greater | Ordering::Equal))) };
+                let le = if hi.is_null() { None } else { Some(matches!(v.compare(&hi), Some(Ordering::Less | Ordering::Equal))) };
+                match (ge, le) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
                 }
             }
+            Expr::InList { expr: e, list } => {
+                let v = self.eval_value(e, tuple, schema);
+                if v.is_null() { return None; }
+                let mut saw_null = false;
+                for item in list {
+                    let iv = self.eval_value(item, tuple, schema);
+                    if iv.is_null() { saw_null = true; continue; }
+                    if v.compare(&iv) == Some(Ordering::Equal) { return Some(true); }
+                }
+                if saw_null { None } else { Some(false) }
+            }
+            _ => match self.eval_value(expr, tuple, schema) {
+                Value::Bool(b) => Some(b),
+                Value::Null => None,
+                _ => Some(true),
+            },
         }
     }
 
