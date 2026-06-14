@@ -3522,6 +3522,7 @@ impl QueryEngine {
                 HashMap::with_capacity_and_hasher(right_rows.len(), ahash::RandomState::new());
             for (i, row) in right_rows.iter().enumerate() {
                 if i % 1024 == 0 { self.poll_ctx()?; }
+                if row.get(right_key_idx).map_or(true, |v| v.is_null()) { continue; }
                 let key = self.hash_key(&row[right_key_idx]);
                 self.account_memory(key.len() as u64 + 24)?;
                 hash_table.entry(key).or_default().push(i);
@@ -3530,6 +3531,7 @@ impl QueryEngine {
             match join_type {
                 JoinType::Inner => {
                     for left_row in &left_rows {
+                        if left_row.get(left_key_idx).map_or(true, |v| v.is_null()) { continue; }
                         let key = self.hash_key(&left_row[left_key_idx]);
                         if let Some(indices) = hash_table.get(&key) {
                             for &ri in indices {
@@ -3563,10 +3565,17 @@ impl QueryEngine {
                     let mut left_hash: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
                         HashMap::with_capacity_and_hasher(left_rows.len(), ahash::RandomState::new());
                     for (i, row) in left_rows.iter().enumerate() {
+                        if row.get(left_key_idx).map_or(true, |v| v.is_null()) { continue; }
                         let key = self.hash_key(&row[left_key_idx]);
                         left_hash.entry(key).or_default().push(i);
                     }
                     for right_row in &right_rows {
+                        if right_row.get(right_key_idx).map_or(true, |v| v.is_null()) {
+                            let mut combined = vec![Value::Null; left_width];
+                            combined.extend(right_row.iter().cloned());
+                            out_rows.push(combined);
+                            continue;
+                        }
                         let key = self.hash_key(&right_row[right_key_idx]);
                         if let Some(indices) = left_hash.get(&key) {
                             for &li in indices {
