@@ -1577,13 +1577,27 @@ impl QueryEngine {
             for (i, col) in table_data.schema.columns.iter().enumerate() {
                 if col.unique && !col.primary_key && !row_values[i].is_null() {
                     let val = &row_values[i];
-                    let all = table_data.index.scan_all()
-                        .map_err(|e| QueryError::Execution(e.to_string()))?;
-                    for (_, other_data) in &all {
-                        if let Some(other) = Tuple::deserialize(other_data) {
-                            if other.get(i) == Some(val) {
-                                return Err(QueryError::unique_violation(&col.name));
+                    if let Some(sec) = table_data.secondary_indexes.iter()
+                        .find(|s| s.columns.as_slice() == [i])
+                    {
+                        let hits = sec.lookup_eq(&[val])
+                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        if !hits.is_empty() {
+                            return Err(QueryError::unique_violation(&col.name));
+                        }
+                    } else {
+                        let mut violated = false;
+                        table_data.index.for_each(|_key, other_data| {
+                            if let Some(ov) = bytedb_core::tuple::tuple::read_value_at(other_data, i) {
+                                if &ov == val {
+                                    violated = true;
+                                    return false;
+                                }
                             }
+                            true
+                        }).ok();
+                        if violated {
+                            return Err(QueryError::unique_violation(&col.name));
                         }
                     }
                 }
@@ -1770,16 +1784,29 @@ impl QueryEngine {
                         if col.unique && !col.primary_key {
                             if let Some(val) = tuple.get(i) {
                                 if !val.is_null() {
-                                    let all = table_data.index.scan_all()
-                                        .map_err(|e| QueryError::Execution(e.to_string()))?;
-                                    for (other_key, other_data) in &all {
-                                        if other_key == &key { continue; }
-                                        if let Some(other) = Tuple::deserialize(other_data) {
-                                            if other.get(i) == Some(val) {
-                                                return Err(QueryError::Execution(
-                                                    format!("UNIQUE constraint violated for column '{}'", col.name)
-                                                ));
+                                    if let Some(sec) = table_data.secondary_indexes.iter()
+                                        .find(|s| s.columns.as_slice() == [i])
+                                    {
+                                        let hits = sec.lookup_eq(&[val])
+                                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                                        if hits.iter().any(|pk| pk != &key) {
+                                            return Err(QueryError::Execution(
+                                                format!("UNIQUE constraint violated for column '{}'", col.name)
+                                            ));
+                                        }
+                                    } else {
+                                        let mut violated = false;
+                                        table_data.index.for_each(|other_key, other_data| {
+                                            if other_key == key.as_slice() { return true; }
+                                            if let Some(ov) = bytedb_core::tuple::tuple::read_value_at(other_data, i) {
+                                                if &ov == val { violated = true; return false; }
                                             }
+                                            true
+                                        }).ok();
+                                        if violated {
+                                            return Err(QueryError::Execution(
+                                                format!("UNIQUE constraint violated for column '{}'", col.name)
+                                            ));
                                         }
                                     }
                                 }
