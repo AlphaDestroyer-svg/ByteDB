@@ -4134,7 +4134,9 @@ impl QueryEngine {
                 let rval = self.eval_value(right, tuple, schema);
                 match op {
                     BinOp::Plus => match (&lval, &rval) {
-                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a + b),
+                        (Value::Int64(a), Value::Int64(b)) => a.checked_add(*b)
+                            .map(Value::Int64)
+                            .unwrap_or_else(|| Value::Float64(*a as f64 + *b as f64)),
                         (Value::Float64(a), Value::Float64(b)) => Value::Float64(a + b),
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 + b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a + *b as f64),
@@ -4147,7 +4149,9 @@ impl QueryEngine {
                         _ => Value::Null,
                     },
                     BinOp::Minus => match (&lval, &rval) {
-                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a - b),
+                        (Value::Int64(a), Value::Int64(b)) => a.checked_sub(*b)
+                            .map(Value::Int64)
+                            .unwrap_or_else(|| Value::Float64(*a as f64 - *b as f64)),
                         (Value::Float64(a), Value::Float64(b)) => Value::Float64(a - b),
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 - b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a - *b as f64),
@@ -4157,7 +4161,9 @@ impl QueryEngine {
                         _ => Value::Null,
                     },
                     BinOp::Mul => match (&lval, &rval) {
-                        (Value::Int64(a), Value::Int64(b)) => Value::Int64(a * b),
+                        (Value::Int64(a), Value::Int64(b)) => a.checked_mul(*b)
+                            .map(Value::Int64)
+                            .unwrap_or_else(|| Value::Float64(*a as f64 * *b as f64)),
                         (Value::Float64(a), Value::Float64(b)) => Value::Float64(a * b),
                         (Value::Int64(a), Value::Float64(b)) => Value::Float64(*a as f64 * b),
                         (Value::Float64(a), Value::Int64(b)) => Value::Float64(a * *b as f64),
@@ -4166,7 +4172,9 @@ impl QueryEngine {
                         _ => Value::Null,
                     },
                     BinOp::Div => match (&lval, &rval) {
-                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a / b),
+                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => a.checked_div(*b)
+                            .map(Value::Int64)
+                            .unwrap_or_else(|| Value::Float64(*a as f64 / *b as f64)),
                         (Value::Float64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(a / b),
                         (Value::Int64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(*a as f64 / b),
                         (Value::Float64(a), Value::Int64(b)) if *b != 0 => Value::Float64(a / *b as f64),
@@ -4174,7 +4182,9 @@ impl QueryEngine {
                         _ => Value::Null,
                     },
                     BinOp::Mod => match (&lval, &rval) {
-                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a % b),
+                        (Value::Int64(a), Value::Int64(b)) if *b != 0 => a.checked_rem(*b)
+                            .map(Value::Int64)
+                            .unwrap_or(Value::Int64(0)),
                         (Value::Float64(a), Value::Float64(b)) if *b != 0.0 => Value::Float64(a % b),
                         _ => Value::Null,
                     },
