@@ -71,9 +71,6 @@ pub async fn handle_connection(
                             resp
                         }
                         Err(e) => {
-                            // A failed COMMIT/ROLLBACK (e.g. a serialization abort)
-                            // has already discarded the transaction server-side;
-                            // drop the dead id so retries start a fresh txn.
                             if ends_txn {
                                 active_txn = None;
                             }

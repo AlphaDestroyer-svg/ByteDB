@@ -170,7 +170,6 @@ impl TransactionManager {
         let Some(me) = map.get(&txn_id).cloned() else { return; };
         let rk: RwKey = (table.to_string(), key.to_vec());
         me.reads.lock().insert(rk.clone());
-        // rw-antidependency me --> other: me reads a key that `other` wrote.
         for (oid, other) in map.iter() {
             if *oid == txn_id { continue; }
             if other.writes.lock().contains(&rk) {
@@ -206,8 +205,6 @@ impl TransactionManager {
         let Some(me) = map.get(&txn_id).cloned() else { return; };
         let rk: RwKey = (table.to_string(), key.to_vec());
         me.writes.lock().insert(rk.clone());
-        // rw-antidependency other --> me: `other` read a key (or scanned the
-        // table) that `me` now overwrites.
         for (oid, other) in map.iter() {
             if *oid == txn_id { continue; }
             let read_it = other.reads.lock().contains(&rk);
@@ -296,25 +293,17 @@ impl TransactionManager {
 
         if let Some(state) = ssi_state {
             let writes = state.writes.lock().clone();
-            // Only writers can be the target of a future inbound rw-edge, so
-            // read-only serializable txns leave no footprint behind.
             if !writes.is_empty() {
                 let reads = state.reads.lock().clone();
                 let scanned = state.scanned.lock().clone();
                 self.ssi_recent.write().insert(txn_id, CommittedSsi { commit_ts, reads, scanned, writes });
             }
             self.ssi.write().remove(&txn_id);
-            // Trim regardless of whether this txn wrote, so a read-only or
-            // aborting serializable workload still reclaims old footprints.
             self.gc_ssi_recent();
         }
         Ok(commit_ts)
     }
 
-    /// Drop committed-txn footprints no live serializable txn can still form an
-    /// edge with. Acquires `ssi` and `ssi_recent` disjointly (never nested) to
-    /// stay consistent with the ssi -> ssi_recent order used on the read/write
-    /// tracking paths.
     pub fn gc_ssi_recent(&self) {
         let oldest = self.oldest_active_serializable_start();
         self.ssi_recent.write().retain(|_, c| c.commit_ts >= oldest);
