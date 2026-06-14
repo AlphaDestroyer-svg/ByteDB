@@ -109,6 +109,24 @@ impl VersionStore {
         Ok(false)
     }
 
+    pub fn ensure_base(&self, key: &[u8], committed: Tuple) {
+        let mut shard = self.shard_for(key).write();
+        let was_absent = !shard.contains_key(key);
+        let chain = shard.entry(key.to_vec()).or_insert_with(Vec::new);
+        if chain.is_empty() {
+            chain.push(VersionedTuple {
+                data: committed,
+                created_by: 0,
+                deleted_by: None,
+                created_ts: 0,
+                deleted_ts: None,
+            });
+            if was_absent {
+                self.approx_keys.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn try_update(&self, key: Vec<u8>, new_tuple: Tuple, txn_id: TxnId, ts: Timestamp, snapshot_ts: Timestamp, active_txns: &[TxnId]) -> Result<(), crate::error::CoreError> {
         let mut shard = self.shard_for(&key).write();
         let was_empty_chain = !shard.contains_key(&key);

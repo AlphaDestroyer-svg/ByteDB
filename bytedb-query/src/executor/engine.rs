@@ -1835,6 +1835,7 @@ impl QueryEngine {
                     if let Some(tid) = txn_id {
                         let snapshot = self.txn_manager.get_snapshot(tid)
                             .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        table_data.version_store.ensure_base(&key, Tuple::new(old_row_values.clone()));
                         table_data.version_store.try_update(
                             key.clone(),
                             tuple.clone(),
@@ -1989,6 +1990,7 @@ impl QueryEngine {
                     if let Some(tid) = txn_id {
                         let snapshot = self.txn_manager.get_snapshot(tid)
                             .map_err(|e| QueryError::Execution(e.to_string()))?;
+                        table_data.version_store.ensure_base(&key, tuple.clone());
                         table_data.version_store.try_delete(&key, tid, snapshot.start_ts, snapshot.start_ts, &snapshot.active_txns)?;
                         self.ssi_write(Some(tid), table, &key);
                         self.wal_append(LogRecord::Delete {
