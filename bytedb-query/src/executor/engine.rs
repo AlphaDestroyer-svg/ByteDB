@@ -109,6 +109,8 @@ pub struct QueryEngine {
     slow_query_threshold_ms: parking_lot::RwLock<Option<u64>>,
     slow_query_log: parking_lot::RwLock<Vec<SlowQueryEntry>>,
     slow_query_log_capacity: usize,
+
+    txn_undo: parking_lot::Mutex<HashMap<TxnId, HashMap<(String, Vec<u8>), Option<Vec<u8>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +205,7 @@ impl QueryEngine {
             slow_query_threshold_ms: parking_lot::RwLock::new(None),
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
             slow_query_log_capacity: 256,
+            txn_undo: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -226,6 +229,7 @@ impl QueryEngine {
             slow_query_threshold_ms: parking_lot::RwLock::new(None),
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
             slow_query_log_capacity: 256,
+            txn_undo: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -644,11 +648,13 @@ impl QueryEngine {
                 if let Some(txn_id) = txn_id {
                     match self.txn_manager.commit(txn_id) {
                         Ok(_) => {
+                            self.clear_txn_undo(txn_id);
                             self.wal_append(LogRecord::Commit { txn_id });
                             self.wal_flush();
                             Ok(ExecutionResult::Ok("COMMIT".into()))
                         }
                         Err(e) => {
+                            self.rollback_txn_effects(txn_id);
                             self.wal_append(LogRecord::Abort { txn_id });
                             self.wal_flush();
                             Err(QueryError::Execution(e.to_string()))
@@ -660,6 +666,7 @@ impl QueryEngine {
             }
             Statement::Rollback => {
                 if let Some(txn_id) = txn_id {
+                    self.rollback_txn_effects(txn_id);
                     self.wal_append(LogRecord::Abort { txn_id });
                     self.wal_flush();
                     self.txn_manager.abort(txn_id)
@@ -1615,6 +1622,7 @@ impl QueryEngine {
                             if let Some(ov) = &old_values {
                                 Self::update_secondary_indexes_update(&table_data, ov, &existing_tuple.to_vec(), &key)?;
                             }
+                            self.record_undo(txn_id, table, &key, existing.clone());
                             self.log_put(table, &key, &new_data);
                             table_data.index.insert(key, new_data)
                                 .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1644,6 +1652,7 @@ impl QueryEngine {
 
             Self::update_secondary_indexes_insert(&table_data, &row_values, &key)?;
 
+            self.record_undo(txn_id, table, &key, existing.clone());
             self.log_put(table, &key, &data);
             table_data.index.insert(key, data)
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1697,6 +1706,7 @@ impl QueryEngine {
                 if matches {
                     self.ssi_read(txn_id, table, &key);
                     let old_data = data.clone();
+                    self.record_undo(txn_id, table, &key, Some(old_data.clone()));
                     let old_row_values = tuple.to_vec();
                     for (col_name, expr) in &assignments {
                         if let Some(idx) = table_data.schema.column_index(col_name) {
@@ -1859,6 +1869,7 @@ impl QueryEngine {
                 };
                 if matches {
                     self.ssi_read(txn_id, table, &key);
+                    self.record_undo(txn_id, table, &key, Some(data.clone()));
 
                     let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
                     let tables = self.tables.read();
@@ -1905,13 +1916,13 @@ impl QueryEngine {
                         let ctd = tables.get(cname).unwrap();
                         match action {
                             bytedb_core::tuple::schema::FkAction::Cascade => {
-                                if !ctd.secondary_indexes.is_empty() {
-                                    if let Some(d) = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))? {
-                                        if let Some(cvals) = Tuple::deserialize_to_vec(&d) {
-                                            Self::update_secondary_indexes_delete(ctd, &cvals, ck);
-                                        }
+                                let child_prev = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
+                                if let Some(d) = &child_prev {
+                                    if let Some(cvals) = Tuple::deserialize_to_vec(d) {
+                                        Self::update_secondary_indexes_delete(ctd, &cvals, ck);
                                     }
                                 }
+                                self.record_undo(txn_id, cname, ck, child_prev);
                                 self.log_del(cname, ck);
                                 ctd.index.delete(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
                             }
@@ -1924,6 +1935,7 @@ impl QueryEngine {
                                         }
                                         Self::update_secondary_indexes_update(ctd, &old_vals, &ct.to_vec(), ck)?;
                                         let serialized = ct.serialize();
+                                        self.record_undo(txn_id, cname, ck, Some(d.clone()));
                                         self.log_put(cname, ck, &serialized);
                                         ctd.index.insert(ck.clone(), serialized)
                                             .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -4669,6 +4681,69 @@ impl QueryEngine {
         if let Some(tid) = txn_id {
             self.txn_manager.ssi_record_write(tid, table, key);
         }
+    }
+
+    fn record_undo(&self, txn_id: Option<TxnId>, table: &str, key: &[u8], prev: Option<Vec<u8>>) {
+        let Some(tid) = txn_id else { return; };
+        self.txn_undo
+            .lock()
+            .entry(tid)
+            .or_default()
+            .entry((table.to_string(), key.to_vec()))
+            .or_insert(prev);
+    }
+
+    fn clear_txn_undo(&self, txn_id: TxnId) {
+        self.txn_undo.lock().remove(&txn_id);
+    }
+
+    pub fn rollback(&self, txn_id: TxnId) {
+        self.rollback_txn_effects(txn_id);
+        let _ = self.txn_manager.abort(txn_id);
+    }
+
+    fn rollback_txn_effects(&self, txn_id: TxnId) {
+        let Some(undo) = self.txn_undo.lock().remove(&txn_id) else { return; };
+        let tables = self.tables.read();
+        let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ((table, key), prev) in &undo {
+            let Some(td) = tables.get(table) else { continue; };
+            affected.insert(table.clone());
+            let current = td.index.search(key).ok().flatten();
+            match (current, prev) {
+                (Some(cur), Some(pv)) => {
+                    if let (Some(cv), Some(pvv)) =
+                        (Tuple::deserialize_to_vec(&cur), Tuple::deserialize_to_vec(pv))
+                    {
+                        let _ = Self::update_secondary_indexes_update(td, &cv, &pvv, key);
+                    }
+                    let _ = td.index.insert(key.clone(), pv.clone());
+                    self.log_put(table, key, pv);
+                }
+                (Some(cur), None) => {
+                    if let Some(cv) = Tuple::deserialize_to_vec(&cur) {
+                        Self::update_secondary_indexes_delete(td, &cv, key);
+                    }
+                    let _ = td.index.delete(key);
+                    self.log_del(table, key);
+                }
+                (None, Some(pv)) => {
+                    if let Some(pvv) = Tuple::deserialize_to_vec(pv) {
+                        let _ = Self::update_secondary_indexes_insert(td, &pvv, key);
+                    }
+                    let _ = td.index.insert(key.clone(), pv.clone());
+                    self.log_put(table, key, pv);
+                }
+                (None, None) => {}
+            }
+        }
+        for table in &affected {
+            if let Some(td) = tables.get(table) {
+                td.version_store.rollback_txn(txn_id);
+            }
+        }
+        drop(tables);
+        self.persist_pending_deltas();
     }
 
     fn index_snapshot(&self) -> IndexCatalog {

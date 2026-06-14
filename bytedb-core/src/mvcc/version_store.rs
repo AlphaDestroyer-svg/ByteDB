@@ -253,6 +253,31 @@ impl VersionStore {
         }
     }
 
+    pub fn rollback_txn(&self, txn_id: TxnId) {
+        let mut removed_keys: usize = 0;
+        for shard_lock in &self.shards {
+            let mut shard = shard_lock.write();
+            shard.retain(|_, chain| {
+                for v in chain.iter_mut() {
+                    if v.deleted_by == Some(txn_id) {
+                        v.deleted_by = None;
+                        v.deleted_ts = None;
+                    }
+                }
+                chain.retain(|v| v.created_by != txn_id);
+                if chain.is_empty() {
+                    removed_keys += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if removed_keys > 0 {
+            self.approx_keys.fetch_sub(removed_keys, Ordering::Relaxed);
+        }
+    }
+
     pub fn key_count(&self) -> usize {
         self.approx_keys.load(Ordering::Relaxed)
     }

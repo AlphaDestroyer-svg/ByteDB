@@ -93,7 +93,7 @@ pub async fn handle_connection(
     }
 
     if let Some(tid) = active_txn.take() {
-        let _ = query_engine.txn_manager().abort(tid);
+        query_engine.rollback(tid);
     }
 
     Ok(())
