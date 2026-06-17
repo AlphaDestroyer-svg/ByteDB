@@ -36,6 +36,11 @@ const LOG_COMPACT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<TxnId>> = std::cell::Cell::new(None);
     static PENDING_DELTAS: std::cell::RefCell<Vec<(String, u8, Vec<u8>, Vec<u8>)>> = std::cell::RefCell::new(Vec::new());
+    static SUBQUERY_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+fn subquery_depth() -> u32 {
+    SUBQUERY_DEPTH.with(|d| d.get())
 }
 
 fn current_txn_id() -> Option<TxnId> {
@@ -113,6 +118,7 @@ pub struct QueryEngine {
     txn_undo: parking_lot::Mutex<HashMap<TxnId, HashMap<(String, Vec<u8>), Option<Vec<u8>>>>>,
     txn_deltas: parking_lot::Mutex<HashMap<TxnId, Vec<(String, u8, Vec<u8>, Vec<u8>)>>>,
     rowids: parking_lot::Mutex<HashMap<String, u64>>,
+    subquery_cache: parking_lot::Mutex<HashMap<usize, Arc<Vec<Vec<Value>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +239,7 @@ impl QueryEngine {
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
             rowids: parking_lot::Mutex::new(HashMap::new()),
+            subquery_cache: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -259,6 +266,7 @@ impl QueryEngine {
             txn_undo: parking_lot::Mutex::new(HashMap::new()),
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
             rowids: parking_lot::Mutex::new(HashMap::new()),
+            subquery_cache: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -690,6 +698,9 @@ impl QueryEngine {
         }
         CURRENT_TXN_ID.with(|c| c.set(txn_id));
         let _guard = TxnGuard;
+        if subquery_depth() == 0 {
+            self.subquery_cache.lock().clear();
+        }
         match stmt {
             Statement::Begin(isolation) => {
                 let iso = isolation.unwrap_or(IsolationLevel::ReadCommitted);
@@ -4203,6 +4214,33 @@ impl QueryEngine {
         }
     }
 
+    fn run_subquery(&self, sq: SelectStmt) -> Vec<Vec<Value>> {
+        SUBQUERY_DEPTH.with(|d| d.set(d.get() + 1));
+        let result = self.execute(Statement::Select(sq), current_txn_id());
+        SUBQUERY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        match result {
+            Ok(ExecutionResult::Rows { rows, .. }) => rows,
+            _ => Vec::new(),
+        }
+    }
+
+    fn eval_subquery_rows(&self, subquery: &SelectStmt, tuple: &Tuple, schema: &Schema) -> Arc<Vec<Vec<Value>>> {
+        let depth0 = subquery_depth() == 0;
+        let key = subquery as *const SelectStmt as usize;
+        if depth0 {
+            if let Some(rows) = self.subquery_cache.lock().get(&key).cloned() {
+                return rows;
+            }
+        }
+        let cacheable = depth0 && subquery_is_constant(subquery);
+        let sq = self.correlate_subquery(subquery, tuple, schema);
+        let rows = Arc::new(self.run_subquery(sq));
+        if cacheable {
+            self.subquery_cache.lock().insert(key, Arc::clone(&rows));
+        }
+        rows
+    }
+
     fn correlate_subquery(&self, subquery: &SelectStmt, tuple: &Tuple, schema: &Schema) -> SelectStmt {
         let mut sq = subquery.clone();
         if !schema.table_name.is_empty() {
@@ -4966,41 +5004,25 @@ impl QueryEngine {
                 Value::Bool(ge_low && le_high)
             }
             Expr::Subquery(subquery) => {
-                let sq = self.correlate_subquery(subquery, tuple, schema);
-                let result = self.execute(Statement::Select(sq), current_txn_id());
-                match result {
-                    Ok(ExecutionResult::Rows { rows, .. }) => {
-                        if rows.len() == 1 && !rows[0].is_empty() {
-                            rows[0][0].clone()
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
+                let rows = self.eval_subquery_rows(subquery, tuple, schema);
+                if rows.len() == 1 && !rows[0].is_empty() {
+                    rows[0][0].clone()
+                } else {
+                    Value::Null
                 }
             }
             Expr::Exists(subquery) => {
-                let sq = self.correlate_subquery(subquery, tuple, schema);
-                let result = self.execute(Statement::Select(sq), current_txn_id());
-                match result {
-                    Ok(ExecutionResult::Rows { rows, .. }) => Value::Bool(!rows.is_empty()),
-                    _ => Value::Bool(false),
-                }
+                let rows = self.eval_subquery_rows(subquery, tuple, schema);
+                Value::Bool(!rows.is_empty())
             }
             Expr::InSubquery { expr, subquery } => {
-                let sq = self.correlate_subquery(subquery, tuple, schema);
-                let result = self.execute(Statement::Select(sq), current_txn_id());
+                let rows = self.eval_subquery_rows(subquery, tuple, schema);
                 let val = self.eval_value(expr, tuple, schema);
-                match result {
-                    Ok(ExecutionResult::Rows { rows, .. }) => {
-                        let found = rows.iter().any(|row| {
-                            if row.is_empty() { return false; }
-                            val.compare(&row[0]) == Some(std::cmp::Ordering::Equal)
-                        });
-                        Value::Bool(found)
-                    }
-                    _ => Value::Bool(false),
-                }
+                let found = rows.iter().any(|row| {
+                    if row.is_empty() { return false; }
+                    val.compare(&row[0]) == Some(std::cmp::Ordering::Equal)
+                });
+                Value::Bool(found)
             }
             Expr::JsonPath { .. } | Expr::WindowFunction { .. } | Expr::Default => Value::Null,
         }
@@ -5484,6 +5506,130 @@ fn rewrite_select_correlated(stmt: &mut SelectStmt, outer_table: &str, tuple: &T
     }
     if let FromClause::Subquery(s) = &mut stmt.from {
         rewrite_select_correlated(s, outer_table, tuple, schema);
+    }
+}
+
+fn subquery_is_constant(stmt: &SelectStmt) -> bool {
+    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_scope_tables(stmt, &mut scope);
+    select_qualcols_in_scope(stmt, &scope)
+}
+
+fn collect_scope_tables(stmt: &SelectStmt, out: &mut std::collections::HashSet<String>) {
+    match &stmt.from {
+        FromClause::Table(t) => { out.insert(t.to_ascii_lowercase()); }
+        FromClause::Subquery(s) => collect_scope_tables(s, out),
+    }
+    if let Some(a) = &stmt.from_alias { out.insert(a.to_ascii_lowercase()); }
+    for j in &stmt.joins {
+        out.insert(j.table.to_ascii_lowercase());
+        if let Some(a) = &j.alias { out.insert(a.to_ascii_lowercase()); }
+        collect_expr_scope_tables(&j.condition, out);
+    }
+    for c in &stmt.ctes {
+        out.insert(c.name.to_ascii_lowercase());
+        collect_scope_tables(&c.query, out);
+    }
+    for col in &stmt.columns {
+        if let SelectColumn::Expr(e, _) = col { collect_expr_scope_tables(e, out); }
+    }
+    if let Some(w) = &stmt.where_clause { collect_expr_scope_tables(w, out); }
+    for g in &stmt.group_by { collect_expr_scope_tables(g, out); }
+    if let Some(h) = &stmt.having { collect_expr_scope_tables(h, out); }
+    for o in &stmt.order_by { collect_expr_scope_tables(&o.expr, out); }
+}
+
+fn collect_expr_scope_tables(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expr::Subquery(s) | Expr::Exists(s) => collect_scope_tables(s, out),
+        Expr::InSubquery { expr, subquery } => {
+            collect_expr_scope_tables(expr, out);
+            collect_scope_tables(subquery, out);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_scope_tables(left, out);
+            collect_expr_scope_tables(right, out);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::Cast { expr, .. } => {
+            collect_expr_scope_tables(expr, out)
+        }
+        Expr::Function { args, .. } => for a in args { collect_expr_scope_tables(a, out); },
+        Expr::InList { expr, list } => {
+            collect_expr_scope_tables(expr, out);
+            for x in list { collect_expr_scope_tables(x, out); }
+        }
+        Expr::Between { expr, low, high } => {
+            collect_expr_scope_tables(expr, out);
+            collect_expr_scope_tables(low, out);
+            collect_expr_scope_tables(high, out);
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            if let Some(o) = operand { collect_expr_scope_tables(o, out); }
+            for (w, t) in when_clauses {
+                collect_expr_scope_tables(w, out);
+                collect_expr_scope_tables(t, out);
+            }
+            if let Some(er) = else_result { collect_expr_scope_tables(er, out); }
+        }
+        Expr::WindowFunction { args, partition_by, order_by, .. } => {
+            for a in args { collect_expr_scope_tables(a, out); }
+            for p in partition_by { collect_expr_scope_tables(p, out); }
+            for o in order_by { collect_expr_scope_tables(&o.expr, out); }
+        }
+        _ => {}
+    }
+}
+
+fn select_qualcols_in_scope(stmt: &SelectStmt, scope: &std::collections::HashSet<String>) -> bool {
+    stmt.columns.iter().all(|c| match c {
+        SelectColumn::Expr(e, _) => expr_qualcols_in_scope(e, scope),
+        _ => true,
+    })
+        && stmt.where_clause.as_ref().map_or(true, |w| expr_qualcols_in_scope(w, scope))
+        && stmt.joins.iter().all(|j| expr_qualcols_in_scope(&j.condition, scope))
+        && stmt.group_by.iter().all(|g| expr_qualcols_in_scope(g, scope))
+        && stmt.having.as_ref().map_or(true, |h| expr_qualcols_in_scope(h, scope))
+        && stmt.order_by.iter().all(|o| expr_qualcols_in_scope(&o.expr, scope))
+        && match &stmt.from {
+            FromClause::Subquery(s) => select_qualcols_in_scope(s, scope),
+            _ => true,
+        }
+        && stmt.ctes.iter().all(|c| select_qualcols_in_scope(&c.query, scope))
+}
+
+fn expr_qualcols_in_scope(e: &Expr, scope: &std::collections::HashSet<String>) -> bool {
+    match e {
+        Expr::QualifiedColumn(t, _) => scope.contains(&t.to_ascii_lowercase()),
+        Expr::Subquery(s) | Expr::Exists(s) => select_qualcols_in_scope(s, scope),
+        Expr::InSubquery { expr, subquery } => {
+            expr_qualcols_in_scope(expr, scope) && select_qualcols_in_scope(subquery, scope)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_qualcols_in_scope(left, scope) && expr_qualcols_in_scope(right, scope)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::Cast { expr, .. } => {
+            expr_qualcols_in_scope(expr, scope)
+        }
+        Expr::Function { args, .. } => args.iter().all(|a| expr_qualcols_in_scope(a, scope)),
+        Expr::InList { expr, list } => {
+            expr_qualcols_in_scope(expr, scope) && list.iter().all(|x| expr_qualcols_in_scope(x, scope))
+        }
+        Expr::Between { expr, low, high } => {
+            expr_qualcols_in_scope(expr, scope)
+                && expr_qualcols_in_scope(low, scope)
+                && expr_qualcols_in_scope(high, scope)
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            operand.as_ref().map_or(true, |o| expr_qualcols_in_scope(o, scope))
+                && when_clauses.iter().all(|(w, t)| expr_qualcols_in_scope(w, scope) && expr_qualcols_in_scope(t, scope))
+                && else_result.as_ref().map_or(true, |er| expr_qualcols_in_scope(er, scope))
+        }
+        Expr::WindowFunction { args, partition_by, order_by, .. } => {
+            args.iter().all(|a| expr_qualcols_in_scope(a, scope))
+                && partition_by.iter().all(|p| expr_qualcols_in_scope(p, scope))
+                && order_by.iter().all(|o| expr_qualcols_in_scope(&o.expr, scope))
+        }
+        _ => true,
     }
 }
 
