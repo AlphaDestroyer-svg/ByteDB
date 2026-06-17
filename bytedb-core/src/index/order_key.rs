@@ -16,6 +16,12 @@ pub fn encode_okey_owned(values: &[Value]) -> Vec<u8> {
     buf
 }
 
+pub fn encode_okey_into(values: &[&Value], buf: &mut Vec<u8>) {
+    for v in values {
+        encode_one(v, buf);
+    }
+}
+
 fn encode_one(v: &Value, buf: &mut Vec<u8>) {
     match v {
         Value::Null => buf.push(0x00),

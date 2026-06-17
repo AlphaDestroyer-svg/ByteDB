@@ -123,6 +123,29 @@ pub struct SlowQueryEntry {
     pub timestamp_micros: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggKind {
+    Count,
+    CountDistinct,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Other,
+}
+
+impl AggKind {
+    fn from_name(name: &str) -> AggKind {
+        if name.eq_ignore_ascii_case("count") { AggKind::Count }
+        else if name.eq_ignore_ascii_case("count_distinct") { AggKind::CountDistinct }
+        else if name.eq_ignore_ascii_case("sum") { AggKind::Sum }
+        else if name.eq_ignore_ascii_case("avg") { AggKind::Avg }
+        else if name.eq_ignore_ascii_case("min") { AggKind::Min }
+        else if name.eq_ignore_ascii_case("max") { AggKind::Max }
+        else { AggKind::Other }
+    }
+}
+
 pub struct TableData {
     pub schema: Schema,
     pub index: Arc<BPlusTree>,
@@ -3779,6 +3802,12 @@ impl QueryEngine {
             } else { None }
         }).collect();
 
+        let agg_kinds: Vec<AggKind> = agg_functions.iter().map(|expr| {
+            if let Expr::Function { name, .. } = expr {
+                AggKind::from_name(name)
+            } else { AggKind::Other }
+        }).collect();
+
         let mut groups: HashMap<Vec<u8>, Vec<usize>, ahash::RandomState> =
             HashMap::with_capacity_and_hasher(rows.len().min(1024), ahash::RandomState::new());
         let mut keybuf = Vec::with_capacity(group_indices.len() * 16);
@@ -3786,9 +3815,7 @@ impl QueryEngine {
             if row_idx % 1024 == 0 { self.poll_ctx()?; }
             keybuf.clear();
             for &i in &group_indices {
-                let part = self.hash_key(row.get(i).unwrap_or(&Value::Null));
-                keybuf.extend_from_slice(&(part.len() as u32).to_le_bytes());
-                keybuf.extend_from_slice(&part);
+                bytedb_core::index::order_key::encode_okey_into(&[row.get(i).unwrap_or(&Value::Null)], &mut keybuf);
             }
             if let Some(v) = groups.get_mut(&keybuf) {
                 v.push(row_idx);
@@ -3826,10 +3853,8 @@ impl QueryEngine {
             for &gi in &group_indices {
                 row_out.push(rows[row_indices[0]].get(gi).cloned().unwrap_or(Value::Null));
             }
-            for (fi, expr) in agg_functions.iter().enumerate() {
-                if let Expr::Function { name, .. } = expr {
-                    row_out.push(self.compute_aggregate_fast(name, agg_col_indices[fi], row_indices, &rows));
-                }
+            for fi in 0..agg_functions.len() {
+                row_out.push(self.compute_aggregate_fast(agg_kinds[fi], agg_col_indices[fi], row_indices, &rows));
             }
             row_out
         };
@@ -3881,24 +3906,40 @@ impl QueryEngine {
             return None;
         }
 
+        let mut distinct_agg_col: Option<usize> = None;
+        for (name, col_idx) in &agg_functions {
+            if name.to_uppercase() == "COUNT" { continue; }
+            if let Some(ci) = col_idx {
+                match distinct_agg_col {
+                    Some(prev) if prev != *ci => return None,
+                    _ => distinct_agg_col = Some(*ci),
+                }
+            }
+        }
+
         struct GroupAcc {
             count: i64,
             sum: i128,
             min: i64,
             max: i64,
-            group_val: Value,
+            group_vals: Vec<Value>,
         }
 
         let mut groups: HashMap<Vec<u8>, GroupAcc> = HashMap::new();
+        let mut keybuf: Vec<u8> = Vec::with_capacity(group_indices.len() * 16);
 
         let _ = table_data.index.for_each(|_key, data| {
 
-            let group_key_bytes: Vec<u8> = group_indices.iter().filter_map(|&gi| {
-                let pos = bytedb_core::tuple::tuple::column_offset(data, gi)?;
+            keybuf.clear();
+            for &gi in &group_indices {
+                let pos = match bytedb_core::tuple::tuple::column_offset(data, gi) {
+                    Some(p) => p,
+                    None => return true,
+                };
                 let next_pos = bytedb_core::tuple::tuple::column_offset(data, gi + 1)
                     .unwrap_or(data.len());
-                Some(data[pos..next_pos].to_vec())
-            }).flatten().collect();
+                keybuf.extend_from_slice(&data[pos..next_pos]);
+            }
 
             let agg_val = agg_functions.iter().find_map(|(name, col_idx)| {
                 let n = name.to_uppercase();
@@ -3907,14 +3948,16 @@ impl QueryEngine {
                 } else { None }
             });
 
-            let entry = groups.entry(group_key_bytes).or_insert_with(|| {
-                let gv = if group_indices.len() == 1 {
-                    read_value_at(data, group_indices[0]).unwrap_or(Value::Null)
-                } else {
-                    Value::Null
-                };
-                GroupAcc { count: 0, sum: 0i128, min: i64::MAX, max: i64::MIN, group_val: gv }
-            });
+            let entry = if let Some(e) = groups.get_mut(&keybuf) {
+                e
+            } else {
+                let gvs: Vec<Value> = group_indices.iter()
+                    .map(|&gi| read_value_at(data, gi).unwrap_or(Value::Null))
+                    .collect();
+                groups.entry(keybuf.clone()).or_insert(GroupAcc {
+                    count: 0, sum: 0i128, min: i64::MAX, max: i64::MIN, group_vals: gvs,
+                })
+            };
             entry.count += 1;
             if let Some(v) = agg_val {
                 entry.sum += v as i128;
@@ -3936,7 +3979,7 @@ impl QueryEngine {
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
         for (_, acc) in groups {
             let mut row = Vec::with_capacity(out_col_names.len());
-            row.push(acc.group_val);
+            row.extend(acc.group_vals);
 
             for (name, _) in &agg_functions {
                 let n = name.to_uppercase();
@@ -3956,9 +3999,9 @@ impl QueryEngine {
         Some(ExecutionResult::Rows { columns: out_col_names, rows: out_rows })
     }
 
-    fn compute_aggregate_fast(&self, func_name: &str, col_idx: Option<usize>, row_indices: &[usize], rows: &[Vec<Value>]) -> Value {
-        match func_name.to_uppercase().as_str() {
-            "COUNT" => {
+    fn compute_aggregate_fast(&self, kind: AggKind, col_idx: Option<usize>, row_indices: &[usize], rows: &[Vec<Value>]) -> Value {
+        match kind {
+            AggKind::Count => {
                 if let Some(idx) = col_idx {
                     let count = row_indices.iter().filter(|&&ri| {
                         rows[ri].get(idx).map(|v| !v.is_null()).unwrap_or(false)
@@ -3968,7 +4011,7 @@ impl QueryEngine {
                     Value::Int64(row_indices.len() as i64)
                 }
             }
-            "COUNT_DISTINCT" => {
+            AggKind::CountDistinct => {
                 let idx = match col_idx {
                     Some(i) => i,
                     None => return Value::Int64(row_indices.len() as i64),
@@ -3982,7 +4025,7 @@ impl QueryEngine {
                 }
                 Value::Int64(seen.len() as i64)
             }
-            "SUM" => {
+            AggKind::Sum => {
                 let idx = match col_idx {
                     Some(i) => i,
                     None => return Value::Null,
@@ -4002,7 +4045,7 @@ impl QueryEngine {
                 else if is_float { Value::Float64(fsum + sum as f64) }
                 else { int128_to_value(sum) }
             }
-            "AVG" => {
+            AggKind::Avg => {
                 let idx = match col_idx {
                     Some(i) => i,
                     None => return Value::Null,
@@ -4018,7 +4061,7 @@ impl QueryEngine {
                 }
                 if count > 0 { Value::Float64(sum / count as f64) } else { Value::Null }
             }
-            "MIN" => {
+            AggKind::Min => {
                 let idx = match col_idx {
                     Some(i) => i,
                     None => return Value::Null,
@@ -4037,7 +4080,7 @@ impl QueryEngine {
                 }
                 min.cloned().unwrap_or(Value::Null)
             }
-            "MAX" => {
+            AggKind::Max => {
                 let idx = match col_idx {
                     Some(i) => i,
                     None => return Value::Null,
@@ -4056,7 +4099,7 @@ impl QueryEngine {
                 }
                 max.cloned().unwrap_or(Value::Null)
             }
-            _ => Value::Null,
+            AggKind::Other => Value::Null,
         }
     }
 
