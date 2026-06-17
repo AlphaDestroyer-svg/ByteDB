@@ -87,6 +87,9 @@ fn build_select_plan(select: &SelectStmt) -> crate::error::Result<LogicalPlan> {
     let table_name = match &select.from {
         FromClause::Table(name) => name.clone(),
         FromClause::Subquery(_) => select.from_alias.clone().unwrap_or_else(|| "__subquery__".to_string()),
+        FromClause::None => {
+            return Err(crate::error::QueryError::Plan("SELECT without FROM is handled by the executor".into()));
+        }
     };
 
     let mut plan = LogicalPlan::Scan {

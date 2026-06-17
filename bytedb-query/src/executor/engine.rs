@@ -974,6 +974,9 @@ impl QueryEngine {
                 }
                 result
             }
+            Statement::Select(ref select) if matches!(select.from, FromClause::None) => {
+                self.exec_select_no_from(select)
+            }
             _ => {
                 let stmt = Self::rewrite_aliases(stmt);
                 let logical = build_logical_plan(&stmt)?;
@@ -2400,6 +2403,29 @@ impl QueryEngine {
         }
 
         Ok(ExecutionResult::Rows { columns: col_names, rows })
+    }
+
+    fn exec_select_no_from(&self, select: &SelectStmt) -> Result<ExecutionResult> {
+        let empty_schema = Schema::new("", Vec::new());
+        let empty_tuple = Tuple::new(Vec::new());
+        let mut columns = Vec::with_capacity(select.columns.len());
+        let mut row = Vec::with_capacity(select.columns.len());
+        for (i, col) in select.columns.iter().enumerate() {
+            match col {
+                SelectColumn::Expr(expr, alias) => {
+                    let name = alias.clone().unwrap_or_else(|| match expr {
+                        Expr::Column(c) => c.clone(),
+                        _ => format!("col{}", i + 1),
+                    });
+                    columns.push(name);
+                    row.push(self.eval_value(expr, &empty_tuple, &empty_schema));
+                }
+                SelectColumn::Star => {
+                    return Err(QueryError::Execution("SELECT * requires a FROM clause".into()));
+                }
+            }
+        }
+        Ok(ExecutionResult::Rows { columns, rows: vec![row] })
     }
 
     fn exec_seq_scan(&self, table: &str, filter: Option<&Expr>, txn_id: Option<TxnId>, limit: Option<usize>, needed_columns: Option<&[usize]>) -> Result<ExecutionResult> {
@@ -5618,6 +5644,7 @@ fn collect_scope_tables(stmt: &SelectStmt, out: &mut std::collections::HashSet<S
     match &stmt.from {
         FromClause::Table(t) => { out.insert(t.to_ascii_lowercase()); }
         FromClause::Subquery(s) => collect_scope_tables(s, out),
+        FromClause::None => {}
     }
     if let Some(a) = &stmt.from_alias { out.insert(a.to_ascii_lowercase()); }
     for j in &stmt.joins {

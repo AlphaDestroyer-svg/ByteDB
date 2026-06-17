@@ -149,8 +149,12 @@ impl Parser {
         };
 
         let columns = self.parse_select_columns()?;
-        self.expect(Token::From)?;
-        let (from, from_alias) = self.parse_from_clause()?;
+        let (from, from_alias) = if self.current() == &Token::From {
+            self.advance();
+            self.parse_from_clause()?
+        } else {
+            (FromClause::None, None)
+        };
 
         let mut joins = Vec::new();
         while matches!(self.current(), Token::Join | Token::Inner | Token::Left | Token::Right) {
@@ -226,8 +230,12 @@ impl Parser {
         };
 
         let columns = self.parse_select_columns()?;
-        self.expect(Token::From)?;
-        let (from, from_alias) = self.parse_from_clause()?;
+        let (from, from_alias) = if self.current() == &Token::From {
+            self.advance();
+            self.parse_from_clause()?
+        } else {
+            (FromClause::None, None)
+        };
 
         let mut joins = Vec::new();
         while matches!(self.current(), Token::Join | Token::Inner | Token::Left | Token::Right) {

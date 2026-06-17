@@ -141,6 +141,7 @@ pub struct SelectStmt {
 pub enum FromClause {
     Table(String),
     Subquery(Box<SelectStmt>),
+    None,
 }
 
 #[derive(Debug, Clone)]
