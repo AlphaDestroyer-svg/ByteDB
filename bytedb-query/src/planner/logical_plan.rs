@@ -160,11 +160,35 @@ fn build_select_plan(select: &SelectStmt) -> crate::error::Result<LogicalPlan> {
 }
 
 fn has_aggregate_functions(columns: &[SelectColumn]) -> bool {
-    const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "COUNT_DISTINCT"];
     columns.iter().any(|c| match c {
-        SelectColumn::Expr(Expr::Function { name, .. }, _) => {
-            AGG_NAMES.contains(&name.to_uppercase().as_str())
-        }
+        SelectColumn::Expr(expr, _) => expr_has_aggregate(expr),
         _ => false,
     })
+}
+
+fn is_aggregate_name(name: &str) -> bool {
+    const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "COUNT_DISTINCT"];
+    AGG_NAMES.contains(&name.to_uppercase().as_str())
+}
+
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, args } => {
+            is_aggregate_name(name) || args.iter().any(expr_has_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::Cast { expr, .. } => {
+            expr_has_aggregate(expr)
+        }
+        Expr::InList { expr, list } => expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate),
+        Expr::Between { expr, low, high } => {
+            expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high)
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            operand.as_ref().map_or(false, |o| expr_has_aggregate(o))
+                || when_clauses.iter().any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
+                || else_result.as_ref().map_or(false, |e| expr_has_aggregate(e))
+        }
+        _ => false,
+    }
 }

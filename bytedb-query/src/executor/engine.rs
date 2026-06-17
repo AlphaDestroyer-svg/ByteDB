@@ -3922,7 +3922,14 @@ impl QueryEngine {
             }
         }).collect();
 
-        let agg_functions: Vec<&Expr> = aggregates.iter().filter(|e| matches!(e, Expr::Function { .. })).collect();
+        let agg_functions: Vec<Expr> = {
+            let mut out = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for expr in &aggregates {
+                collect_agg_functions(expr, &mut out, &mut seen);
+            }
+            out
+        };
 
         let agg_col_indices: Vec<Option<usize>> = agg_functions.iter().map(|expr| {
             if let Expr::Function { args, .. } = expr {
@@ -3968,13 +3975,7 @@ impl QueryEngine {
         }
         for expr in &agg_functions {
             if let Expr::Function { name, args } = expr {
-                let arg_name = if args.is_empty() { "*".to_string() } else {
-                    match &args[0] {
-                        Expr::Column(c) => c.clone(),
-                        _ => "*".to_string(),
-                    }
-                };
-                out_col_names.push(format!("{}({})", name.to_lowercase(), arg_name));
+                out_col_names.push(agg_func_col_name(name, args));
             }
         }
 
@@ -4016,6 +4017,16 @@ impl QueryEngine {
         }).collect();
 
         if group_indices.len() != group_by.len() { return None; }
+
+        let group_names: std::collections::HashSet<&str> = group_by.iter()
+            .filter_map(|e| if let Expr::Column(n) = e { Some(n.as_str()) } else { None })
+            .collect();
+        let all_simple = aggregates.iter().all(|e| match e {
+            Expr::Column(n) => group_names.contains(n.as_str()),
+            Expr::Function { name, .. } => AggKind::from_name(name) != AggKind::Other,
+            _ => false,
+        });
+        if !all_simple { return None; }
 
         let agg_functions: Vec<(&str, Option<usize>)> = aggregates.iter().filter_map(|e| {
             if let Expr::Function { name, args } = e {
@@ -5543,6 +5554,57 @@ fn rewrite_select_correlated(stmt: &mut SelectStmt, outer_table: &str, tuple: &T
     }
     if let FromClause::Subquery(s) = &mut stmt.from {
         rewrite_select_correlated(s, outer_table, tuple, schema);
+    }
+}
+
+fn agg_func_col_name(name: &str, args: &[Expr]) -> String {
+    let arg_name = if args.is_empty() {
+        "*".to_string()
+    } else {
+        match &args[0] {
+            Expr::Column(c) => c.clone(),
+            _ => "*".to_string(),
+        }
+    };
+    format!("{}({})", name.to_lowercase(), arg_name)
+}
+
+fn collect_agg_functions(expr: &Expr, out: &mut Vec<Expr>, seen: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Function { name, args } if AggKind::from_name(name) != AggKind::Other => {
+            let key = agg_func_col_name(name, args);
+            if seen.insert(key) {
+                out.push(expr.clone());
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args { collect_agg_functions(a, out, seen); }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_agg_functions(left, out, seen);
+            collect_agg_functions(right, out, seen);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::Cast { expr, .. } => {
+            collect_agg_functions(expr, out, seen)
+        }
+        Expr::InList { expr, list } => {
+            collect_agg_functions(expr, out, seen);
+            for x in list { collect_agg_functions(x, out, seen); }
+        }
+        Expr::Between { expr, low, high } => {
+            collect_agg_functions(expr, out, seen);
+            collect_agg_functions(low, out, seen);
+            collect_agg_functions(high, out, seen);
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            if let Some(o) = operand { collect_agg_functions(o, out, seen); }
+            for (w, t) in when_clauses {
+                collect_agg_functions(w, out, seen);
+                collect_agg_functions(t, out, seen);
+            }
+            if let Some(er) = else_result { collect_agg_functions(er, out, seen); }
+        }
+        _ => {}
     }
 }
 
