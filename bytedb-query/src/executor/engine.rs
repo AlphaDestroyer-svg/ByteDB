@@ -3817,9 +3817,46 @@ impl QueryEngine {
                 expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
                 data_type: *data_type,
             },
-            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists(_) | Expr::WindowFunction { .. } | Expr::Default | Expr::Interval(_) => expr.clone(),
+            Expr::Subquery(s) => Expr::Subquery(Box::new(Self::rewrite_subquery_aliases(s, alias_map))),
+            Expr::Exists(s) => Expr::Exists(Box::new(Self::rewrite_subquery_aliases(s, alias_map))),
+            Expr::InSubquery { expr: inner, subquery } => Expr::InSubquery {
+                expr: Box::new(Self::rewrite_expr_aliases(inner, alias_map)),
+                subquery: Box::new(Self::rewrite_subquery_aliases(subquery, alias_map)),
+            },
+            Expr::WindowFunction { .. } | Expr::Default | Expr::Interval(_) => expr.clone(),
             Expr::Literal(_) | Expr::Column(_) | Expr::JsonPath { .. } => expr.clone(),
         }
+    }
+
+    fn rewrite_subquery_aliases(select: &SelectStmt, parent_map: &HashMap<String, String>) -> SelectStmt {
+        let mut map = parent_map.clone();
+        if let Some(a) = &select.from_alias { map.remove(a); }
+        for j in &select.joins {
+            if let Some(a) = &j.alias { map.remove(a); }
+        }
+        if map.is_empty() {
+            return select.clone();
+        }
+        let mut s = select.clone();
+        s.columns = s.columns.into_iter().map(|c| match c {
+            SelectColumn::Expr(e, al) => SelectColumn::Expr(Self::rewrite_expr_aliases(&e, &map), al),
+            other => other,
+        }).collect();
+        s.where_clause = s.where_clause.map(|e| Self::rewrite_expr_aliases(&e, &map));
+        s.group_by = s.group_by.into_iter().map(|e| Self::rewrite_expr_aliases(&e, &map)).collect();
+        s.having = s.having.map(|e| Self::rewrite_expr_aliases(&e, &map));
+        s.order_by = s.order_by.into_iter().map(|mut o| {
+            o.expr = Self::rewrite_expr_aliases(&o.expr, &map);
+            o
+        }).collect();
+        s.joins = s.joins.into_iter().map(|mut j| {
+            j.condition = Self::rewrite_expr_aliases(&j.condition, &map);
+            j
+        }).collect();
+        if let FromClause::Subquery(inner) = &s.from {
+            s.from = FromClause::Subquery(Box::new(Self::rewrite_subquery_aliases(inner, &map)));
+        }
+        s
     }
 
     fn plan_table_name(plan: &PhysicalPlan) -> Option<String> {

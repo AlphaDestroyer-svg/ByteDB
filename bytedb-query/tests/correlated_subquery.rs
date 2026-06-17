@@ -68,6 +68,22 @@ fn correlated_two_outer_columns_in_predicate() {
 }
 
 #[test]
+fn correlated_exists_via_outer_alias() {
+    let e = engine();
+    seed(&e);
+    let r = rows(&e, "SELECT dname FROM dept d WHERE EXISTS (SELECT 1 FROM emp WHERE emp.dept = d.id) ORDER BY d.id");
+    assert_eq!(r, vec![vec![Value::Text("eng".into())], vec![Value::Text("sales".into())]]);
+}
+
+#[test]
+fn correlated_scalar_via_outer_alias() {
+    let e = engine();
+    seed(&e);
+    let r = rows(&e, "SELECT (SELECT COUNT(*) FROM emp WHERE emp.dept = d.id) FROM dept d ORDER BY d.id");
+    assert_eq!(r, vec![vec![Value::Int64(2)], vec![Value::Int64(1)], vec![Value::Int64(0)]]);
+}
+
+#[test]
 fn correlated_in_subquery_with_outer_ref() {
     let e = engine();
     seed(&e);
