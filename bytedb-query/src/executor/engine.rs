@@ -2958,16 +2958,24 @@ impl QueryEngine {
                     _ => 1,
                 }).sum();
 
+                let needs_eval = plan.iter().any(|s| matches!(s, ProjStep::Eval(_)));
                 let new_rows: Vec<Vec<Value>> = rows.into_iter().map(|row| {
                     let mut out = Vec::with_capacity(out_width);
-                    let mut tuple_cache: Option<Tuple> = None;
-                    for step in &plan {
-                        match step {
-                            ProjStep::StarAll => out.extend(row.iter().cloned()),
-                            ProjStep::Idx(i) => out.push(row.get(*i).cloned().unwrap_or(Value::Null)),
-                            ProjStep::Eval(expr) => {
-                                let t = tuple_cache.get_or_insert_with(|| Tuple::new(row.clone()));
-                                out.push(self.eval_value(expr, t, &schema));
+                    if needs_eval {
+                        let t = Tuple::new(row);
+                        for step in &plan {
+                            match step {
+                                ProjStep::StarAll => out.extend(t.values_ref().iter().cloned()),
+                                ProjStep::Idx(i) => out.push(t.get(*i).cloned().unwrap_or(Value::Null)),
+                                ProjStep::Eval(expr) => out.push(self.eval_value(expr, &t, &schema)),
+                            }
+                        }
+                    } else {
+                        for step in &plan {
+                            match step {
+                                ProjStep::StarAll => out.extend(row.iter().cloned()),
+                                ProjStep::Idx(i) => out.push(row.get(*i).cloned().unwrap_or(Value::Null)),
+                                ProjStep::Eval(_) => {}
                             }
                         }
                     }
