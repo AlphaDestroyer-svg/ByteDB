@@ -4198,11 +4198,7 @@ impl QueryEngine {
     fn correlate_subquery(&self, subquery: &SelectStmt, tuple: &Tuple, schema: &Schema) -> SelectStmt {
         let mut sq = subquery.clone();
         if !schema.table_name.is_empty() {
-            let mut vals: HashMap<String, Value> = HashMap::with_capacity(schema.columns.len());
-            for (i, c) in schema.columns.iter().enumerate() {
-                vals.insert(c.name.clone(), tuple.get(i).cloned().unwrap_or(Value::Null));
-            }
-            rewrite_select_correlated(&mut sq, &schema.table_name, &vals);
+            rewrite_select_correlated(&mut sq, &schema.table_name, tuple, schema);
         }
         sq
     }
@@ -5403,82 +5399,83 @@ fn value_to_literal_expr(v: &Value) -> Expr {
     Expr::Literal(lit)
 }
 
-fn rewrite_expr_correlated(expr: &mut Expr, outer_table: &str, vals: &HashMap<String, Value>) {
+fn rewrite_expr_correlated(expr: &mut Expr, outer_table: &str, tuple: &Tuple, schema: &Schema) {
     match expr {
         Expr::QualifiedColumn(t, c) => {
             if t.eq_ignore_ascii_case(outer_table) {
-                if let Some(v) = vals.get(c) {
-                    *expr = value_to_literal_expr(v);
+                if let Some(idx) = schema.column_index(c) {
+                    let v = tuple.get(idx).cloned().unwrap_or(Value::Null);
+                    *expr = value_to_literal_expr(&v);
                 }
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_expr_correlated(left, outer_table, vals);
-            rewrite_expr_correlated(right, outer_table, vals);
+            rewrite_expr_correlated(left, outer_table, tuple, schema);
+            rewrite_expr_correlated(right, outer_table, tuple, schema);
         }
-        Expr::UnaryOp { expr: e, .. } => rewrite_expr_correlated(e, outer_table, vals),
+        Expr::UnaryOp { expr: e, .. } => rewrite_expr_correlated(e, outer_table, tuple, schema),
         Expr::Function { args, .. } => {
             for a in args {
-                rewrite_expr_correlated(a, outer_table, vals);
+                rewrite_expr_correlated(a, outer_table, tuple, schema);
             }
         }
-        Expr::IsNull(e) | Expr::IsNotNull(e) => rewrite_expr_correlated(e, outer_table, vals),
+        Expr::IsNull(e) | Expr::IsNotNull(e) => rewrite_expr_correlated(e, outer_table, tuple, schema),
         Expr::InList { expr: e, list } => {
-            rewrite_expr_correlated(e, outer_table, vals);
+            rewrite_expr_correlated(e, outer_table, tuple, schema);
             for x in list {
-                rewrite_expr_correlated(x, outer_table, vals);
+                rewrite_expr_correlated(x, outer_table, tuple, schema);
             }
         }
         Expr::Between { expr: e, low, high } => {
-            rewrite_expr_correlated(e, outer_table, vals);
-            rewrite_expr_correlated(low, outer_table, vals);
-            rewrite_expr_correlated(high, outer_table, vals);
+            rewrite_expr_correlated(e, outer_table, tuple, schema);
+            rewrite_expr_correlated(low, outer_table, tuple, schema);
+            rewrite_expr_correlated(high, outer_table, tuple, schema);
         }
         Expr::Case { operand, when_clauses, else_result } => {
             if let Some(o) = operand {
-                rewrite_expr_correlated(o, outer_table, vals);
+                rewrite_expr_correlated(o, outer_table, tuple, schema);
             }
             for (w, t) in when_clauses {
-                rewrite_expr_correlated(w, outer_table, vals);
-                rewrite_expr_correlated(t, outer_table, vals);
+                rewrite_expr_correlated(w, outer_table, tuple, schema);
+                rewrite_expr_correlated(t, outer_table, tuple, schema);
             }
             if let Some(er) = else_result {
-                rewrite_expr_correlated(er, outer_table, vals);
+                rewrite_expr_correlated(er, outer_table, tuple, schema);
             }
         }
-        Expr::Cast { expr: e, .. } => rewrite_expr_correlated(e, outer_table, vals),
-        Expr::Subquery(s) | Expr::Exists(s) => rewrite_select_correlated(s, outer_table, vals),
+        Expr::Cast { expr: e, .. } => rewrite_expr_correlated(e, outer_table, tuple, schema),
+        Expr::Subquery(s) | Expr::Exists(s) => rewrite_select_correlated(s, outer_table, tuple, schema),
         Expr::InSubquery { expr: e, subquery } => {
-            rewrite_expr_correlated(e, outer_table, vals);
-            rewrite_select_correlated(subquery, outer_table, vals);
+            rewrite_expr_correlated(e, outer_table, tuple, schema);
+            rewrite_select_correlated(subquery, outer_table, tuple, schema);
         }
         _ => {}
     }
 }
 
-fn rewrite_select_correlated(stmt: &mut SelectStmt, outer_table: &str, vals: &HashMap<String, Value>) {
+fn rewrite_select_correlated(stmt: &mut SelectStmt, outer_table: &str, tuple: &Tuple, schema: &Schema) {
     for col in &mut stmt.columns {
         if let SelectColumn::Expr(e, _) = col {
-            rewrite_expr_correlated(e, outer_table, vals);
+            rewrite_expr_correlated(e, outer_table, tuple, schema);
         }
     }
     if let Some(w) = &mut stmt.where_clause {
-        rewrite_expr_correlated(w, outer_table, vals);
+        rewrite_expr_correlated(w, outer_table, tuple, schema);
     }
     for j in &mut stmt.joins {
-        rewrite_expr_correlated(&mut j.condition, outer_table, vals);
+        rewrite_expr_correlated(&mut j.condition, outer_table, tuple, schema);
     }
     for g in &mut stmt.group_by {
-        rewrite_expr_correlated(g, outer_table, vals);
+        rewrite_expr_correlated(g, outer_table, tuple, schema);
     }
     if let Some(h) = &mut stmt.having {
-        rewrite_expr_correlated(h, outer_table, vals);
+        rewrite_expr_correlated(h, outer_table, tuple, schema);
     }
     for o in &mut stmt.order_by {
-        rewrite_expr_correlated(&mut o.expr, outer_table, vals);
+        rewrite_expr_correlated(&mut o.expr, outer_table, tuple, schema);
     }
     if let FromClause::Subquery(s) = &mut stmt.from {
-        rewrite_select_correlated(s, outer_table, vals);
+        rewrite_select_correlated(s, outer_table, tuple, schema);
     }
 }
 

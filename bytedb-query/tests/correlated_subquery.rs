@@ -49,3 +49,28 @@ fn correlated_scalar_subquery_in_projection() {
     let r = rows(&e, "SELECT (SELECT COUNT(*) FROM emp WHERE emp.dept = dept.id) FROM dept ORDER BY id");
     assert_eq!(r, vec![vec![Value::Int64(2)], vec![Value::Int64(1)], vec![Value::Int64(0)]]);
 }
+
+#[test]
+fn correlated_two_outer_columns_in_predicate() {
+    let e = engine();
+    e.execute_sql("CREATE TABLE o (id INT PRIMARY KEY, lo INT, hi INT)", None).unwrap();
+    e.execute_sql("INSERT INTO o VALUES (1, 100, 200)", None).unwrap();
+    e.execute_sql("INSERT INTO o VALUES (2, 150, 160)", None).unwrap();
+    e.execute_sql("CREATE TABLE v (id INT PRIMARY KEY, val INT)", None).unwrap();
+    for (i, x) in [(1, 120), (2, 155), (3, 300)] {
+        e.execute_sql(&format!("INSERT INTO v VALUES ({i},{x})"), None).unwrap();
+    }
+    let r = rows(&e, "SELECT id, (SELECT COUNT(*) FROM v WHERE v.val >= o.lo AND v.val <= o.hi) FROM o ORDER BY id");
+    assert_eq!(r, vec![
+        vec![Value::Int64(1), Value::Int64(2)],
+        vec![Value::Int64(2), Value::Int64(1)],
+    ]);
+}
+
+#[test]
+fn correlated_in_subquery_with_outer_ref() {
+    let e = engine();
+    seed(&e);
+    let r = rows(&e, "SELECT dname FROM dept WHERE id IN (SELECT dept FROM emp WHERE emp.sal > 120) ORDER BY id");
+    assert_eq!(r, vec![vec![Value::Text("eng".into())], vec![Value::Text("sales".into())]]);
+}
