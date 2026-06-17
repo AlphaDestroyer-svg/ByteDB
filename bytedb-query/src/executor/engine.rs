@@ -2011,6 +2011,34 @@ impl QueryEngine {
             table_data.read_visible_entries(&self.txn_manager, txn_id)?
         };
 
+        struct FkRef {
+            child_name: String,
+            parent_idxs: Vec<usize>,
+            child_idxs: Vec<usize>,
+            on_delete: bytedb_core::tuple::schema::FkAction,
+        }
+        let fk_refs: Vec<FkRef> = {
+            let tables = self.tables.read();
+            let mut refs = Vec::new();
+            for (other_name, other_td) in tables.iter() {
+                if other_name == table { continue; }
+                for fk in &other_td.schema.foreign_keys {
+                    if fk.ref_table != table { continue; }
+                    let parent_idxs: Vec<usize> = fk.ref_columns.iter()
+                        .filter_map(|c| table_data.schema.column_index(c)).collect();
+                    let child_idxs: Vec<usize> = fk.columns.iter()
+                        .filter_map(|c| other_td.schema.column_index(c)).collect();
+                    refs.push(FkRef {
+                        child_name: other_name.clone(),
+                        parent_idxs,
+                        child_idxs,
+                        on_delete: fk.on_delete,
+                    });
+                }
+            }
+            refs
+        };
+
         let mut count = 0u64;
         let mut keys_to_delete = Vec::new();
         let mut returned_rows: Vec<Vec<Value>> = Vec::new();
@@ -2028,61 +2056,57 @@ impl QueryEngine {
 
                     let mut cascade_targets: Vec<(String, bytedb_core::tuple::schema::FkAction, Vec<u8>, Vec<usize>)> = Vec::new();
                     let tables = self.tables.read();
-                    for (other_name, other_td) in tables.iter() {
-                        if other_name == table { continue; }
-                        for fk in &other_td.schema.foreign_keys {
-                            if fk.ref_table != table { continue; }
-                            let parent_idxs: Vec<usize> = fk.ref_columns.iter()
-                                .filter_map(|c| table_data.schema.column_index(c)).collect();
-                            let mut parent_vals: Vec<Value> = Vec::new();
-                            let mut any_null = false;
-                            for pi in &parent_idxs {
-                                let v = tuple.get(*pi).cloned().unwrap_or(Value::Null);
-                                if v.is_null() { any_null = true; break; }
-                                parent_vals.push(v);
-                            }
-                            if any_null { continue; }
-                            let child_idxs: Vec<usize> = fk.columns.iter()
-                                .filter_map(|c| other_td.schema.column_index(c)).collect();
+                    for fkr in &fk_refs {
+                        let other_td = match tables.get(&fkr.child_name) {
+                            Some(td) => td,
+                            None => continue,
+                        };
+                        let mut parent_vals: Vec<Value> = Vec::new();
+                        let mut any_null = false;
+                        for pi in &fkr.parent_idxs {
+                            let v = tuple.get(*pi).cloned().unwrap_or(Value::Null);
+                            if v.is_null() { any_null = true; break; }
+                            parent_vals.push(v);
+                        }
+                        if any_null { continue; }
 
-                            let parent_refs: Vec<&Value> = parent_vals.iter().collect();
-                            let index_pks: Option<Vec<Vec<u8>>> = if Self::fk_index_eligible(&parent_vals) {
-                                other_td.secondary_indexes.iter()
-                                    .find(|s| s.columns == child_idxs)
-                                    .and_then(|s| s.lookup_eq(&parent_refs).ok())
-                            } else {
-                                None
-                            };
+                        let parent_refs: Vec<&Value> = parent_vals.iter().collect();
+                        let index_pks: Option<Vec<Vec<u8>>> = if Self::fk_index_eligible(&parent_vals) {
+                            other_td.secondary_indexes.iter()
+                                .find(|s| s.columns == fkr.child_idxs)
+                                .and_then(|s| s.lookup_eq(&parent_refs).ok())
+                        } else {
+                            None
+                        };
 
-                            let candidates: Vec<(Vec<u8>, Vec<u8>)> = match index_pks {
-                                Some(pks) => {
-                                    let mut out = Vec::with_capacity(pks.len());
-                                    for pk in pks {
-                                        if let Some(cdata) = other_td.index.search(&pk)
-                                            .map_err(|e| QueryError::Execution(e.to_string()))? {
-                                            out.push((pk, cdata));
-                                        }
+                        let candidates: Vec<(Vec<u8>, Vec<u8>)> = match index_pks {
+                            Some(pks) => {
+                                let mut out = Vec::with_capacity(pks.len());
+                                for pk in pks {
+                                    if let Some(cdata) = other_td.index.search(&pk)
+                                        .map_err(|e| QueryError::Execution(e.to_string()))? {
+                                        out.push((pk, cdata));
                                     }
-                                    out
                                 }
-                                None => other_td.index.scan_all()
-                                    .map_err(|e| QueryError::Execution(e.to_string()))?,
-                            };
+                                out
+                            }
+                            None => other_td.index.scan_all()
+                                .map_err(|e| QueryError::Execution(e.to_string()))?,
+                        };
 
-                            for (ck, cdata) in &candidates {
-                                if let Some(ct) = Tuple::deserialize(cdata) {
-                                    let mut all_eq = true;
-                                    for (j, ci) in child_idxs.iter().enumerate() {
-                                        if ct.get(*ci) != Some(&parent_vals[j]) { all_eq = false; break; }
-                                    }
-                                    if all_eq {
-                                        match fk.on_delete {
-                                            bytedb_core::tuple::schema::FkAction::Restrict => {
-                                                return Err(QueryError::fk_referenced(other_name));
-                                            }
-                                            other => {
-                                                cascade_targets.push((other_name.clone(), other, ck.clone(), child_idxs.clone()));
-                                            }
+                        for (ck, cdata) in &candidates {
+                            if let Some(ct) = Tuple::deserialize(cdata) {
+                                let mut all_eq = true;
+                                for (j, ci) in fkr.child_idxs.iter().enumerate() {
+                                    if ct.get(*ci) != Some(&parent_vals[j]) { all_eq = false; break; }
+                                }
+                                if all_eq {
+                                    match fkr.on_delete {
+                                        bytedb_core::tuple::schema::FkAction::Restrict => {
+                                            return Err(QueryError::fk_referenced(&fkr.child_name));
+                                        }
+                                        other => {
+                                            cascade_targets.push((fkr.child_name.clone(), other, ck.clone(), fkr.child_idxs.clone()));
                                         }
                                     }
                                 }
