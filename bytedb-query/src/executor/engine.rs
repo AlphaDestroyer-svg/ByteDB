@@ -1267,6 +1267,20 @@ impl QueryEngine {
         }).collect()
     }
 
+    fn fk_index_eligible(vals: &[Value]) -> bool {
+        vals.iter().all(|v| matches!(
+            v,
+            Value::Bool(_)
+                | Value::Int64(_)
+                | Value::Timestamp(_)
+                | Value::Interval(_)
+                | Value::Date(_)
+                | Value::Uuid(_)
+                | Value::Text(_)
+                | Value::Bytes(_)
+        ))
+    }
+
     fn update_secondary_indexes_insert(td: &TableData, values: &[Value], pk: &[u8]) -> Result<()> {
         for sec in &td.secondary_indexes {
             let key_vals: Vec<&Value> = sec.columns.iter().filter_map(|&i| values.get(i)).collect();
@@ -2016,9 +2030,32 @@ impl QueryEngine {
                             if any_null { continue; }
                             let child_idxs: Vec<usize> = fk.columns.iter()
                                 .filter_map(|c| other_td.schema.column_index(c)).collect();
-                            let child_all = other_td.index.scan_all()
-                                .map_err(|e| QueryError::Execution(e.to_string()))?;
-                            for (ck, cdata) in &child_all {
+
+                            let parent_refs: Vec<&Value> = parent_vals.iter().collect();
+                            let index_pks: Option<Vec<Vec<u8>>> = if Self::fk_index_eligible(&parent_vals) {
+                                other_td.secondary_indexes.iter()
+                                    .find(|s| s.columns == child_idxs)
+                                    .and_then(|s| s.lookup_eq(&parent_refs).ok())
+                            } else {
+                                None
+                            };
+
+                            let candidates: Vec<(Vec<u8>, Vec<u8>)> = match index_pks {
+                                Some(pks) => {
+                                    let mut out = Vec::with_capacity(pks.len());
+                                    for pk in pks {
+                                        if let Some(cdata) = other_td.index.search(&pk)
+                                            .map_err(|e| QueryError::Execution(e.to_string()))? {
+                                            out.push((pk, cdata));
+                                        }
+                                    }
+                                    out
+                                }
+                                None => other_td.index.scan_all()
+                                    .map_err(|e| QueryError::Execution(e.to_string()))?,
+                            };
+
+                            for (ck, cdata) in &candidates {
                                 if let Some(ct) = Tuple::deserialize(cdata) {
                                     let mut all_eq = true;
                                     for (j, ci) in child_idxs.iter().enumerate() {
