@@ -116,6 +116,43 @@ fn cache_reflects_update_between_statements() {
 }
 
 #[test]
+fn scalar_subquery_multiple_rows_errors() {
+    let e = engine();
+    seed(&e);
+    // small has 3 rows; scalar context must error, not silently pick one or NULL
+    let res = e.execute_sql("SELECT id FROM big WHERE id = (SELECT ref FROM small)", None);
+    assert!(res.is_err(), "scalar subquery returning >1 row must error, got {res:?}");
+}
+
+#[test]
+fn scalar_subquery_single_row_ok() {
+    let e = engine();
+    seed(&e);
+    let got = ints(&e, "SELECT id FROM big WHERE id = (SELECT ref FROM small WHERE id = 1) ORDER BY id");
+    assert_eq!(got, vec![2]); // small.ref where id=1 is 2
+}
+
+#[test]
+fn scalar_subquery_zero_rows_is_null_not_error() {
+    let e = engine();
+    seed(&e);
+    // empty subquery -> NULL -> predicate id = NULL is false for all, no error
+    let res = e.execute_sql("SELECT id FROM big WHERE id = (SELECT ref FROM small WHERE id = 999)", None);
+    assert!(res.is_ok(), "zero-row scalar subquery must not error");
+    assert!(ints(&e, "SELECT id FROM big WHERE id = (SELECT ref FROM small WHERE id = 999)").is_empty());
+}
+
+#[test]
+fn error_does_not_persist_to_next_statement() {
+    let e = engine();
+    seed(&e);
+    let _ = e.execute_sql("SELECT id FROM big WHERE id = (SELECT ref FROM small)", None);
+    // a subsequent valid statement must succeed (pending error cleared)
+    let got = ints(&e, "SELECT id FROM big WHERE id IN (SELECT ref FROM small) ORDER BY id");
+    assert_eq!(got, vec![2, 4, 6]);
+}
+
+#[test]
 fn two_distinct_constant_subqueries_one_statement() {
     let e = engine();
     seed(&e);

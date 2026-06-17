@@ -119,6 +119,7 @@ pub struct QueryEngine {
     txn_deltas: parking_lot::Mutex<HashMap<TxnId, Vec<(String, u8, Vec<u8>, Vec<u8>)>>>,
     rowids: parking_lot::Mutex<HashMap<String, u64>>,
     subquery_cache: parking_lot::Mutex<HashMap<usize, Arc<Vec<Vec<Value>>>>>,
+    pending_subquery_error: parking_lot::Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +241,7 @@ impl QueryEngine {
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
             rowids: parking_lot::Mutex::new(HashMap::new()),
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
+            pending_subquery_error: parking_lot::Mutex::new(None),
         }
     }
 
@@ -267,6 +269,7 @@ impl QueryEngine {
             txn_deltas: parking_lot::Mutex::new(HashMap::new()),
             rowids: parking_lot::Mutex::new(HashMap::new()),
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
+            pending_subquery_error: parking_lot::Mutex::new(None),
         }
     }
 
@@ -698,10 +701,12 @@ impl QueryEngine {
         }
         CURRENT_TXN_ID.with(|c| c.set(txn_id));
         let _guard = TxnGuard;
-        if subquery_depth() == 0 {
+        let top_level = subquery_depth() == 0;
+        if top_level {
             self.subquery_cache.lock().clear();
+            *self.pending_subquery_error.lock() = None;
         }
-        match stmt {
+        let result = match stmt {
             Statement::Begin(isolation) => {
                 let iso = isolation.unwrap_or(IsolationLevel::ReadCommitted);
                 let id = self.txn_manager.begin(iso);
@@ -984,7 +989,13 @@ impl QueryEngine {
                 let physical = optimize_with_catalog(logical, &stats_snapshot, &self.index_snapshot())?;
                 self.execute_physical(physical, txn_id)
             }
+        };
+        if top_level && result.is_ok() {
+            if let Some(msg) = self.pending_subquery_error.lock().take() {
+                return Err(QueryError::Execution(msg));
+            }
         }
+        result
     }
 
     fn execute_physical(&self, plan: PhysicalPlan, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
@@ -5082,7 +5093,13 @@ impl QueryEngine {
             }
             Expr::Subquery(subquery) => {
                 let rows = self.eval_subquery_rows(subquery, tuple, schema);
-                if rows.len() == 1 && !rows[0].is_empty() {
+                if rows.len() > 1 {
+                    let mut pending = self.pending_subquery_error.lock();
+                    if pending.is_none() {
+                        *pending = Some("more than one row returned by a subquery used as an expression".to_string());
+                    }
+                    Value::Null
+                } else if rows.len() == 1 && !rows[0].is_empty() {
                     rows[0][0].clone()
                 } else {
                     Value::Null
