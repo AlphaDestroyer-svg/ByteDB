@@ -3954,6 +3954,9 @@ impl QueryEngine {
             for expr in &aggregates {
                 collect_agg_functions(expr, &mut out, &mut seen);
             }
+            if let Some(h) = &having {
+                collect_agg_functions(h, &mut out, &mut seen);
+            }
             out
         };
 

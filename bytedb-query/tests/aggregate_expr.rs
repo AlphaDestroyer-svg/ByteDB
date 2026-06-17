@@ -80,6 +80,29 @@ fn aggregate_in_scalar_subquery_expression() {
 }
 
 #[test]
+fn having_aggregate_not_in_select() {
+    let e = engine();
+    seed(&e);
+    // g1: sum=30,count=2,max-min=10 ; g2: sum=45,count=3,max-min=20
+    let r = rows(&e, "SELECT g FROM t GROUP BY g HAVING SUM(v) > 30 ORDER BY g");
+    assert_eq!(r, vec![vec![Value::Int64(2)]]);
+
+    let r = rows(&e, "SELECT g FROM t GROUP BY g HAVING COUNT(*) > 2 ORDER BY g");
+    assert_eq!(r, vec![vec![Value::Int64(2)]]);
+
+    let r = rows(&e, "SELECT g FROM t GROUP BY g HAVING MAX(v) - MIN(v) > 15 ORDER BY g");
+    assert_eq!(r, vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn having_aggregate_also_in_select() {
+    let e = engine();
+    seed(&e);
+    let r = rows(&e, "SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 30 ORDER BY g");
+    assert_eq!(r, vec![vec![Value::Int64(2), Value::Int64(45)]]);
+}
+
+#[test]
 fn plain_aggregates_still_work() {
     let e = engine();
     seed(&e);
