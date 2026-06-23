@@ -52,6 +52,49 @@ fn uncommitted_txn_does_not_survive_crash() {
 }
 
 #[test]
+fn wal_redo_replays_after_disk_load() {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("bytedb_wal_redo_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let _scope = {
+        let ds = DiskStore::open(dir.clone(), "test").unwrap();
+        let db = Arc::new(Database::new("test"));
+        let txn = Arc::new(TransactionManager::new());
+        let mut e = QueryEngine::new(db, txn.clone());
+        e.attach_disk_store(ds);
+        e.execute_sql("CREATE TABLE t (id INT PRIMARY KEY, v INT)", None).unwrap();
+
+        let t1 = txn.begin(IsolationLevel::ReadCommitted);
+        e.execute_sql("INSERT INTO t VALUES (1, 10)", Some(t1)).unwrap();
+        e.execute_sql("INSERT INTO t VALUES (2, 20)", Some(t1)).unwrap();
+        e.execute_sql("COMMIT", Some(t1)).unwrap();
+    };
+
+    {
+        let ds = DiskStore::open(dir.clone(), "test").unwrap();
+        let db = Arc::new(Database::new("test"));
+        let txn = Arc::new(TransactionManager::new());
+        let mut e = QueryEngine::new(db, txn);
+        e.attach_disk_store(ds);
+
+        let result = e.execute_sql("SELECT * FROM t ORDER BY id", None).unwrap();
+        match result {
+            ExecutionResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2, "both committed rows must survive");
+                assert_eq!(rows[0][0].as_i64().unwrap(), 1);
+                assert_eq!(rows[0][1].as_i64().unwrap(), 10);
+                assert_eq!(rows[1][0].as_i64().unwrap(), 2);
+                assert_eq!(rows[1][1].as_i64().unwrap(), 20);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn committed_txn_survives_crash() {
     let mut dir = std::env::temp_dir();
     dir.push(format!("bytedb_crash_commit_test_{}", std::process::id()));

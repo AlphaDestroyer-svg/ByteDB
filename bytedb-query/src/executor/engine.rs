@@ -5424,6 +5424,62 @@ impl QueryEngine {
         &self.tables
     }
 
+    pub fn replay_wal_recovery(&self, result: &bytedb_core::wal::recovery::RecoveryResult) {
+        if result.redo_records.is_empty() {
+            return;
+        }
+        let tables = self.tables.read();
+        for (_lsn, record) in &result.redo_records {
+            match record {
+                LogRecord::Insert { txn_id: _, table_id: _, page_id: _, slot: _, data } => {
+                    if let Some(tuple) = Tuple::deserialize(data) {
+                        for (_name, td) in tables.iter() {
+                            if td.schema.columns.len() == tuple.len() {
+                                let pk_cols = td.schema.primary_key_columns();
+                                let key = if pk_cols.is_empty() {
+                                    continue;
+                                } else {
+                                    tuple.key_bytes(&pk_cols)
+                                };
+                                let _ = td.index.insert(key, data.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                LogRecord::Delete { txn_id: _, table_id: _, page_id: _, slot: _, old_data } => {
+                    if let Some(tuple) = Tuple::deserialize(old_data) {
+                        for (_name, td) in tables.iter() {
+                            if td.schema.columns.len() == tuple.len() {
+                                let pk_cols = td.schema.primary_key_columns();
+                                if !pk_cols.is_empty() {
+                                    let key = tuple.key_bytes(&pk_cols);
+                                    let _ = td.index.delete(&key);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                LogRecord::Update { txn_id: _, table_id: _, page_id: _, slot: _, old_data, new_data } => {
+                    if let Some(old_tuple) = Tuple::deserialize(old_data) {
+                        for (_name, td) in tables.iter() {
+                            if td.schema.columns.len() == old_tuple.len() {
+                                let pk_cols = td.schema.primary_key_columns();
+                                if !pk_cols.is_empty() {
+                                    let key = old_tuple.key_bytes(&pk_cols);
+                                    let _ = td.index.insert(key, new_data.clone());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn bulk_insert(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
         let tables = self.tables.read();
         let table_data = tables.get(table)

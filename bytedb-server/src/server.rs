@@ -60,7 +60,7 @@ impl Server {
             match std::fs::read_to_string(&pitr_marker) {
                 Ok(s) => match s.trim().parse::<u64>() {
                     Ok(lsn) => {
-                        info!("PITR target LSN={} detected, replaying up to that point", lsn);
+                        info!("PITR target LSN={} detected", lsn);
                         Some(lsn)
                     }
                     Err(e) => {
@@ -76,24 +76,6 @@ impl Server {
         } else {
             None
         };
-
-        let recovery_result = match pitr_target {
-            Some(lsn) => RecoveryManager::recover_to_lsn(&log_manager, lsn),
-            None => RecoveryManager::recover(&log_manager),
-        };
-
-        match recovery_result {
-            Ok(result) => {
-                let redo_count = result.redo_records.len();
-                let undo_count = result.undo_records.len();
-                if redo_count > 0 || undo_count > 0 {
-                    info!("WAL recovery: {} redo, {} undo records processed", redo_count, undo_count);
-                }
-            }
-            Err(e) => {
-                warn!("WAL recovery failed: {}", e);
-            }
-        }
 
         if pitr_marker.exists() {
             if let Err(e) = std::fs::remove_file(&pitr_marker) {
@@ -116,6 +98,25 @@ impl Server {
             }
             Err(e) => {
                 warn!("Failed to open disk store: {}. Continuing in-memory only.", e);
+            }
+        }
+
+        let recovery = match pitr_target {
+            Some(lsn) => {
+                info!("PITR target LSN={} set, recovering to that point", lsn);
+                RecoveryManager::recover_to_lsn(&log_manager, lsn)
+            }
+            None => RecoveryManager::recover(&log_manager),
+        };
+        match recovery {
+            Ok(result) => {
+                if !result.redo_records.is_empty() {
+                    info!("Replaying {} WAL redo records on top of disk state", result.redo_records.len());
+                    engine_owned.replay_wal_recovery(&result);
+                }
+            }
+            Err(e) => {
+                warn!("WAL recovery failed, continuing with disk state: {}", e);
             }
         }
 
