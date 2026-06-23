@@ -315,11 +315,14 @@ impl QueryEngine {
 
             let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
             let _ = self.database.create_table(meta);
+            let check_exprs: Vec<Expr> = tcat.schema.check_constraints.iter()
+                .filter_map(|s| crate::parser::parser::Parser::parse_expression(s).ok())
+                .collect();
             tables.insert(tcat.name.clone(), Arc::new(TableData {
                 schema: tcat.schema,
                 index,
                 version_store: Arc::new(VersionStore::new()),
-                check_exprs: Vec::new(),
+                check_exprs,
                 sequences,
                 secondary_indexes,
             }));
@@ -1104,8 +1107,15 @@ impl QueryEngine {
             col
         }).collect();
 
+        let mut all_checks = ct.check_constraints.clone();
+        for c in &ct.columns {
+            if let Some(chk) = &c.check {
+                all_checks.push(chk.clone());
+            }
+        }
+
         let mut schema = Schema::new(ct.name.clone(), columns);
-        schema.check_constraints = ct.check_constraints.iter().map(|e| format!("{:?}", e)).collect();
+        schema.check_constraints = all_checks.iter().map(crate::parser::ast::expr_to_sql).collect();
         schema.foreign_keys = ct.foreign_keys.iter().map(|fk| {
             bytedb_core::tuple::schema::ForeignKey {
                 columns: fk.columns.clone(),
@@ -1141,12 +1151,6 @@ impl QueryEngine {
         self.database.create_table(meta)
             .map_err(|e| QueryError::Execution(e.to_string()))?;
 
-        let mut all_checks = ct.check_constraints.clone();
-        for c in &ct.columns {
-            if let Some(chk) = &c.check {
-                all_checks.push(chk.clone());
-            }
-        }
         let table_data = TableData {
             schema: schema.clone(),
             index: Arc::new(BPlusTree::new(format!("{}_pk", ct.name), 128)),

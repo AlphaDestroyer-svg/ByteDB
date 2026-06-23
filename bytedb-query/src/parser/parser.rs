@@ -32,6 +32,12 @@ impl Parser {
         Ok(stmt)
     }
 
+    pub fn parse_expression(input: &str) -> Result<Expr> {
+        let mut parser = Parser::new(input)?;
+        let expr = parser.parse_expr()?;
+        Ok(expr)
+    }
+
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.current().clone() {
             Token::Explain => self.parse_explain(),

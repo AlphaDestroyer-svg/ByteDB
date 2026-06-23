@@ -336,3 +336,152 @@ pub enum UnaryOp {
     Not,
     Neg,
 }
+
+pub fn expr_to_sql(expr: &Expr) -> String {
+    let mut s = String::new();
+    write_expr(expr, &mut s);
+    s
+}
+
+fn binop_sql(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "=",
+        BinOp::Neq => "<>",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Lte => "<=",
+        BinOp::Gte => ">=",
+        BinOp::And => "AND",
+        BinOp::Or => "OR",
+        BinOp::Plus => "+",
+        BinOp::Minus => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Like => "LIKE",
+        BinOp::Ilike => "ILIKE",
+    }
+}
+
+fn quote_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn write_expr(expr: &Expr, out: &mut String) {
+    match expr {
+        Expr::Literal(LiteralValue::Integer(n)) => out.push_str(&n.to_string()),
+        Expr::Literal(LiteralValue::Float(f)) => out.push_str(&format!("{:?}", f)),
+        Expr::Literal(LiteralValue::String(s)) => out.push_str(&quote_string(s)),
+        Expr::Literal(LiteralValue::Bool(b)) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
+        Expr::Literal(LiteralValue::Null) => out.push_str("NULL"),
+        Expr::Literal(LiteralValue::HexBlob(bytes)) => {
+            out.push_str("X'");
+            for b in bytes {
+                out.push_str(&format!("{:02X}", b));
+            }
+            out.push('\'');
+        }
+        Expr::Column(name) => out.push_str(name),
+        Expr::QualifiedColumn(t, c) => {
+            out.push_str(t);
+            out.push('.');
+            out.push_str(c);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            out.push('(');
+            write_expr(left, out);
+            out.push(' ');
+            out.push_str(binop_sql(*op));
+            out.push(' ');
+            write_expr(right, out);
+            out.push(')');
+        }
+        Expr::UnaryOp { op, expr } => {
+            match op {
+                UnaryOp::Not => {
+                    out.push_str("(NOT ");
+                    write_expr(expr, out);
+                    out.push(')');
+                }
+                UnaryOp::Neg => {
+                    out.push_str("(-");
+                    write_expr(expr, out);
+                    out.push(')');
+                }
+            }
+        }
+        Expr::Function { name, args } => {
+            out.push_str(name);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(a, out);
+            }
+            out.push(')');
+        }
+        Expr::IsNull(inner) => {
+            out.push('(');
+            write_expr(inner, out);
+            out.push_str(" IS NULL)");
+        }
+        Expr::IsNotNull(inner) => {
+            out.push('(');
+            write_expr(inner, out);
+            out.push_str(" IS NOT NULL)");
+        }
+        Expr::InList { expr, list } => {
+            out.push('(');
+            write_expr(expr, out);
+            out.push_str(" IN (");
+            for (i, a) in list.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(a, out);
+            }
+            out.push_str("))");
+        }
+        Expr::Between { expr, low, high } => {
+            out.push('(');
+            write_expr(expr, out);
+            out.push_str(" BETWEEN ");
+            write_expr(low, out);
+            out.push_str(" AND ");
+            write_expr(high, out);
+            out.push(')');
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            out.push_str("CASE");
+            if let Some(o) = operand {
+                out.push(' ');
+                write_expr(o, out);
+            }
+            for (w, t) in when_clauses {
+                out.push_str(" WHEN ");
+                write_expr(w, out);
+                out.push_str(" THEN ");
+                write_expr(t, out);
+            }
+            if let Some(e) = else_result {
+                out.push_str(" ELSE ");
+                write_expr(e, out);
+            }
+            out.push_str(" END");
+        }
+        Expr::Cast { expr, data_type } => {
+            out.push_str("CAST(");
+            write_expr(expr, out);
+            out.push_str(" AS ");
+            out.push_str(&data_type.to_string());
+            out.push(')');
+        }
+        Expr::Interval(s) => {
+            out.push_str("INTERVAL ");
+            out.push_str(&quote_string(s));
+        }
+        Expr::JsonPath { path } => out.push_str(path),
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::WindowFunction { .. }
+        | Expr::Default => out.push_str("NULL"),
+    }
+}
