@@ -15,4 +15,5 @@ parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 clap = { version = "4", features = ["derive"] }
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["rand"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
