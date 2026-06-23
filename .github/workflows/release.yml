@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.2.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            apt: musl-tools
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross deps (Linux)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build release binaries
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: >
+          cargo build --release --target ${{ matrix.target }}
+          --bin bytedb-server --bin bytedb-client --bin bytedb-bench
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="bytedb-${VERSION}-${{ matrix.target }}"
+          STAGE="$NAME"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/bytedb-server" "$STAGE/"
+          cp "target/${{ matrix.target }}/release/bytedb-client" "$STAGE/"
+          cp "target/${{ matrix.target }}/release/bytedb-bench" "$STAGE/"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          tar -czf "$NAME.tar.gz" "$STAGE"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.tag }}"
+          if (-not $version) { $version = "${{ github.ref_name }}" }
+          $name = "bytedb-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bytedb-server.exe" $name/
+          Copy-Item "target/${{ matrix.target }}/release/bytedb-client.exe" $name/
+          Copy-Item "target/${{ matrix.target }}/release/bytedb-bench.exe" $name/
+          if (Test-Path README.md) { Copy-Item README.md $name/ }
+          if (Test-Path LICENSE) { Copy-Item LICENSE $name/ }
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bytedb-${{ matrix.target }}
+          path: |
+            bytedb-*.tar.gz
+            bytedb-*.tar.gz.sha256
+            bytedb-*.zip
+            bytedb-*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ByteDB ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256

@@ -189,6 +189,26 @@ The optimizer consults this catalog for selectivity and join cardinality. Withou
 - **Key-value** - `KV SET "k" "v"`, `KV GET "k"`, `KV SCAN "a" "z"`
 - **Document** - `DOC INSERT INTO logs {"level":"error"}`, `DOC FIND IN logs WHERE level = 'error'`
 
+### Download prebuilt binaries
+
+Prebuilt release archives are published on the [GitHub Releases](../../releases) page for each tagged version, covering:
+
+| OS | Architecture | Target triple | Archive |
+|----|-------------|---------------|---------|
+| Linux | x86_64 (glibc) | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+| Linux | x86_64 (static musl) | `x86_64-unknown-linux-musl` | `.tar.gz` |
+| Linux | aarch64 | `aarch64-unknown-linux-gnu` | `.tar.gz` |
+| Windows | x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| macOS | x86_64 (Intel) | `x86_64-apple-darwin` | `.tar.gz` |
+| macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin` | `.tar.gz` |
+
+Each archive contains `bytedb-server`, `bytedb-client`, and `bytedb-bench`, plus a `.sha256` checksum file. Cutting a release is a one-liner — push a version tag and CI builds and publishes every target:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
 ### Build & test
 
 ```bash
