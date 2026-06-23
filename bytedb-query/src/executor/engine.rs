@@ -795,33 +795,23 @@ impl QueryEngine {
                     let tables = self.tables.read();
                     let table_data = tables.get(&name)
                         .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
-                    let keys: Vec<Vec<u8>> = table_data.index.scan_all()
-                        .map_err(|e| QueryError::Execution(e.to_string()))?
-                        .into_iter().map(|(k, _)| k).collect();
-                    for key in keys {
-                        table_data.index.delete(&key)
-                            .map_err(|e| QueryError::Execution(e.to_string()))?;
-                    }
-                }
-                let td = self.tables.read().get(&name).cloned();
-                if let Some(td) = td {
-                    if !td.secondary_indexes.is_empty() {
-                        let fresh: Vec<Arc<SecondaryIndex>> = td.secondary_indexes.iter()
-                            .map(|s| Arc::new(SecondaryIndex::new(s.name.clone(), s.columns.clone(), s.unique)))
-                            .collect();
-                        let new_td = TableData {
-                            schema: td.schema.clone(),
-                            index: Arc::clone(&td.index),
-                            version_store: Arc::clone(&td.version_store),
-                            check_exprs: td.check_exprs.clone(),
-                            sequences: td.sequences.clone(),
-                            secondary_indexes: fresh,
-                        };
-                        self.tables.write().insert(name.clone(), Arc::new(new_td));
-                    }
+                    let fresh_index = Arc::new(BPlusTree::new(format!("{}_pk", name), 128));
+                    let fresh_secs: Vec<Arc<SecondaryIndex>> = table_data.secondary_indexes.iter()
+                        .map(|s| Arc::new(SecondaryIndex::new(s.name.clone(), s.columns.clone(), s.unique)))
+                        .collect();
+                    let new_td = TableData {
+                        schema: table_data.schema.clone(),
+                        index: fresh_index,
+                        version_store: Arc::new(VersionStore::new()),
+                        check_exprs: table_data.check_exprs.clone(),
+                        sequences: table_data.sequences.clone(),
+                        secondary_indexes: fresh_secs,
+                    };
+                    drop(tables);
+                    self.tables.write().insert(name.clone(), Arc::new(new_td));
                 }
                 self.flush_table_to_disk(&name);
-                Ok(ExecutionResult::Ok(format!("TRUNCATE TABLE")))
+                Ok(ExecutionResult::Ok("TRUNCATE TABLE".into()))
             }
             Statement::KvGet(_) | Statement::KvSet(_, _) | Statement::KvDelete(_) | Statement::KvScan(_, _) => {
                 Err(QueryError::Execution("Use KV engine for KV operations".into()))
