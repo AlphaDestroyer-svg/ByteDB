@@ -76,6 +76,37 @@ impl Backup {
         target_data_dir: &Path,
     ) -> Result<BackupManifest> {
         let manifest = Self::read_manifest(backup_dir)?;
+
+        let staging = target_data_dir.with_file_name(match target_data_dir.file_name() {
+            Some(n) => format!("{}.restore_staging", n.to_string_lossy()),
+            None => "restore_staging".to_string(),
+        });
+        if staging.exists() {
+            fs::remove_dir_all(&staging).map_err(CoreError::Io)?;
+        }
+        fs::create_dir_all(&staging).map_err(CoreError::Io)?;
+
+        let copy_all = (|| -> Result<()> {
+            for name in &["bytedb.wal", "server.meta"] {
+                let src = backup_dir.join(name);
+                if src.exists() {
+                    copy_file(&src, &staging.join(name))?;
+                }
+            }
+            for name in &["snapshots", "databases"] {
+                let src = backup_dir.join(name);
+                if src.exists() {
+                    copy_dir(&src, &staging.join(name))?;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = copy_all {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+
         if target_data_dir.exists() {
             for entry in fs::read_dir(target_data_dir).map_err(CoreError::Io)? {
                 let p = entry.map_err(CoreError::Io)?.path();
@@ -89,18 +120,13 @@ impl Backup {
             fs::create_dir_all(target_data_dir).map_err(CoreError::Io)?;
         }
 
-        for name in &["bytedb.wal", "server.meta"] {
-            let src = backup_dir.join(name);
-            if src.exists() {
-                copy_file(&src, &target_data_dir.join(name))?;
-            }
+        for entry in fs::read_dir(&staging).map_err(CoreError::Io)? {
+            let entry = entry.map_err(CoreError::Io)?;
+            let from = entry.path();
+            let to = target_data_dir.join(entry.file_name());
+            fs::rename(&from, &to).map_err(CoreError::Io)?;
         }
-        for name in &["snapshots", "databases"] {
-            let src = backup_dir.join(name);
-            if src.exists() {
-                copy_dir(&src, &target_data_dir.join(name))?;
-            }
-        }
+        let _ = fs::remove_dir_all(&staging);
         Ok(manifest)
     }
 }
@@ -246,5 +272,41 @@ mod tests {
         fs::write(&mp, data).unwrap();
         let r = read_manifest(&mp);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn failed_restore_preserves_existing_target() {
+        let bk = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+
+        // existing target data that must NOT be destroyed by a failed restore
+        fs::write(dst.path().join("important.tbl"), b"keep me").unwrap();
+
+        // backup dir has no manifest -> restore must fail before touching target
+        let r = Backup::restore_to(bk.path(), dst.path());
+        assert!(r.is_err(), "restore from invalid backup must fail");
+        assert!(dst.path().join("important.tbl").exists(),
+            "existing target data must survive a failed restore");
+        assert_eq!(fs::read(dst.path().join("important.tbl")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn restore_replaces_target_atomically() {
+        let src = tempdir().unwrap();
+        let bk = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+
+        fs::create_dir_all(src.path().join("databases/main/tables")).unwrap();
+        fs::write(src.path().join("databases/main/tables/new.tbl"), b"new data").unwrap();
+        let wal = LogManager::new(&src.path().join("bytedb.wal")).unwrap();
+        wal.append(LogRecord::Commit { txn_id: 1 }).unwrap();
+        wal.flush().unwrap();
+        Backup::create(src.path(), &wal, bk.path(), 1).unwrap();
+
+        fs::write(dst.path().join("stale.tbl"), b"old").unwrap();
+
+        Backup::restore_to(bk.path(), dst.path()).unwrap();
+        assert!(!dst.path().join("stale.tbl").exists(), "stale data must be cleared");
+        assert!(dst.path().join("databases/main/tables/new.tbl").exists());
     }
 }
