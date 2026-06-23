@@ -54,7 +54,7 @@ fn equality_lookup_matches_seq_scan() {
 
     let plan = rows(&e, "EXPLAIN SELECT id FROM users WHERE age = 30");
     let txt: String = plan.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
-    assert!(txt.contains("IndexScan"), "expected IndexScan in plan, got:\n{txt}");
+    assert!(txt.contains("Index Scan"), "expected Index Scan in plan, got:\n{txt}");
 
     assert_eq!(ints(&e, "SELECT id FROM users WHERE age = 30", 0), vec![1, 3]);
     assert_eq!(ints(&e, "SELECT id FROM users WHERE age = 25", 0), vec![2, 5]);
@@ -81,7 +81,7 @@ fn text_index_equality() {
 
     let plan = rows(&e, "EXPLAIN SELECT id FROM users WHERE city = 'NYC'");
     let txt: String = plan.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
-    assert!(txt.contains("IndexScan"), "expected IndexScan, got:\n{txt}");
+    assert!(txt.contains("Index Scan"), "expected Index Scan, got:\n{txt}");
 
     assert_eq!(ints(&e, "SELECT id FROM users WHERE city = 'NYC'", 0), vec![1, 3, 6]);
     assert_eq!(ints(&e, "SELECT id FROM users WHERE city = 'LA'", 0), vec![2, 5]);
@@ -140,7 +140,7 @@ fn drop_index_falls_back_to_seq_scan() {
 
     let plan = rows(&e, "EXPLAIN SELECT id FROM users WHERE age = 30");
     let txt: String = plan.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
-    assert!(!txt.contains("IndexScan"), "index should be gone, got:\n{txt}");
+    assert!(!txt.contains("Index Scan"), "index should be gone, got:\n{txt}");
     // Results still correct via seq scan.
     assert_eq!(ints(&e, "SELECT id FROM users WHERE age = 30", 0), vec![1, 3]);
 }
@@ -173,7 +173,7 @@ fn index_survives_reopen_from_disk() {
 
         let plan = rows(&e, "EXPLAIN SELECT id FROM users WHERE age = 30");
         let txt: String = plan.iter().flatten().map(|v| v.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(txt.contains("IndexScan"), "index should persist, got:\n{txt}");
+        assert!(txt.contains("Index Scan"), "index should persist, got:\n{txt}");
         assert_eq!(ints(&e, "SELECT id FROM users WHERE age = 30", 0), vec![1, 3]);
     }
 

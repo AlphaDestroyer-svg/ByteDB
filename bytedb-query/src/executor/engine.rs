@@ -890,7 +890,7 @@ impl QueryEngine {
                 let pc = cost_plan(&physical, &stats_snapshot);
                 let estimated_rows = pc.rows.round() as u64;
                 let estimated_cost = pc.total_cost;
-                let plan_text = format!("{:#?}", physical);
+                let plan_lines = physical.explain_tree();
                 let mut lines: Vec<String> = Vec::new();
                 lines.push(format!(
                     "Plan  (estimated_rows={}  estimated_cost={:.2})",
@@ -919,8 +919,8 @@ impl QueryEngine {
                         factor
                     ));
                 }
-                for l in plan_text.lines() {
-                    lines.push(l.to_string());
+                for l in plan_lines {
+                    lines.push(l);
                 }
                 Ok(ExecutionResult::Rows {
                     columns: vec!["QUERY PLAN".into()],
