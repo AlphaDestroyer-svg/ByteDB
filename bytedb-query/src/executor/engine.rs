@@ -160,6 +160,7 @@ pub struct TableData {
     pub check_exprs: Vec<Expr>,
     pub sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>>,
     pub secondary_indexes: Vec<Arc<SecondaryIndex>>,
+    pub write_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl TableData {
@@ -325,6 +326,7 @@ impl QueryEngine {
                 check_exprs,
                 sequences,
                 secondary_indexes,
+                write_lock: Arc::new(parking_lot::Mutex::new(())),
             }));
         }
         Ok(())
@@ -809,6 +811,7 @@ impl QueryEngine {
                         check_exprs: table_data.check_exprs.clone(),
                         sequences: table_data.sequences.clone(),
                         secondary_indexes: fresh_secs,
+                        write_lock: Arc::clone(&table_data.write_lock),
                     };
                     drop(tables);
                     self.tables.write().insert(name.clone(), Arc::new(new_td));
@@ -1158,6 +1161,7 @@ impl QueryEngine {
             check_exprs: all_checks,
             sequences: sequences.clone(),
             secondary_indexes: Vec::new(),
+            write_lock: Arc::new(parking_lot::Mutex::new(())),
         };
         self.tables.write().insert(ct.name.clone(), Arc::new(table_data));
 
@@ -1229,6 +1233,7 @@ impl QueryEngine {
             check_exprs: td.check_exprs.clone(),
             sequences: td.sequences.clone(),
             secondary_indexes: new_secs.clone(),
+            write_lock: Arc::clone(&td.write_lock),
         };
         self.tables.write().insert(ci.table.clone(), Arc::new(new_td));
 
@@ -1265,6 +1270,7 @@ impl QueryEngine {
             check_exprs: td.check_exprs.clone(),
             sequences: td.sequences.clone(),
             secondary_indexes: new_secs.clone(),
+            write_lock: Arc::clone(&td.write_lock),
         };
         self.tables.write().insert(tname.clone(), Arc::new(new_td));
 
@@ -1409,6 +1415,7 @@ impl QueryEngine {
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: table_data.secondary_indexes.clone(),
+                    write_lock: Arc::clone(&table_data.write_lock),
                 };
                 *table_data = Arc::new(new_td);
 
@@ -1432,6 +1439,7 @@ impl QueryEngine {
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: Vec::new(),
+                    write_lock: Arc::clone(&table_data.write_lock),
                 };
                 *table_data = Arc::new(new_td);
                 if let Some(ds) = &self.disk_store {
@@ -1453,6 +1461,7 @@ impl QueryEngine {
                     check_exprs: table_data.check_exprs.clone(),
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: Vec::new(),
+                    write_lock: Arc::clone(&table_data.write_lock),
                 };
                 *table_data = Arc::new(new_td);
                 if let Some(ds) = &self.disk_store {
@@ -1614,6 +1623,8 @@ impl QueryEngine {
         let num_cols = table_data.schema.columns.len();
         let mut count = 0u64;
         let mut returned_rows: Vec<Vec<Value>> = Vec::new();
+
+        let _write_guard = table_data.write_lock.lock();
 
         for mut row_values in rows_to_insert {
             row_values.resize(num_cols, Value::Null);
@@ -1865,6 +1876,8 @@ impl QueryEngine {
 
         let mut count = 0u64;
         let mut returned_rows: Vec<Vec<Value>> = Vec::new();
+
+        let _write_guard = table_data.write_lock.lock();
 
         for (key, data) in entries {
             if let Some(mut tuple) = Tuple::deserialize(&data) {
@@ -2278,7 +2291,7 @@ impl QueryEngine {
         let schema = Schema::new(name, col_schemas);
         let index = Arc::new(BPlusTree::new(name, 64));
         let version_store = Arc::new(VersionStore::new());
-        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new(), secondary_indexes: Vec::new() };
+        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new(), secondary_indexes: Vec::new(), write_lock: Arc::new(parking_lot::Mutex::new(())) };
 
         for (i, row) in rows.into_iter().enumerate() {
             let tuple = Tuple::new(row);

@@ -14,7 +14,7 @@ use bytedb_query::parser::ast::Statement;
 use bytedb_core::tuple::value::Value;
 
 pub async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     query_engine: Arc<QueryEngine>,
     kv_engine: Arc<KvEngine>,
     doc_engine: Arc<DocEngine>,
@@ -24,20 +24,59 @@ pub async fn handle_connection(
     let mut session_id: Option<u64> = None;
     let mut active_txn: Option<u64> = None;
 
+    let result = connection_loop(
+        stream,
+        &query_engine,
+        &kv_engine,
+        &doc_engine,
+        &credentials,
+        &session_manager,
+        &mut session_id,
+        &mut active_txn,
+    )
+    .await;
+
+    if let Some(tid) = active_txn.take() {
+        query_engine.rollback(tid);
+    }
+    if let Some(sid) = session_id.take() {
+        session_manager.remove_session(sid);
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connection_loop(
+    mut stream: TcpStream,
+    query_engine: &Arc<QueryEngine>,
+    kv_engine: &Arc<KvEngine>,
+    doc_engine: &Arc<DocEngine>,
+    credentials: &Arc<Credentials>,
+    session_manager: &Arc<SessionManager>,
+    session_id: &mut Option<u64>,
+    active_txn: &mut Option<u64>,
+) -> Result<()> {
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(f) => f,
             Err(_) => break,
         };
 
-        let request = Request::deserialize(&frame)
-            .ok_or_else(|| ServerError::Protocol("Invalid request".into()))?;
+        let request = match Request::deserialize(&frame) {
+            Some(r) => r,
+            None => {
+                let resp = Response::Error { code: 400, message: "Invalid request".into() };
+                let _ = write_frame(&mut stream, &resp.serialize()).await;
+                break;
+            }
+        };
 
         let response = match request {
             Request::Authenticate { username, password } => {
                 if credentials.authenticate(&username, &password) {
                     let sid = session_manager.create_session(username.clone());
-                    session_id = Some(sid);
+                    *session_id = Some(sid);
                     info!("User '{}' authenticated, session {}", username, sid);
                     Response::AuthOk { session_id: sid }
                 } else {
@@ -49,30 +88,30 @@ pub async fn handle_connection(
                 if session_id.is_none() {
                     Response::Error { code: 401, message: "Not authenticated".into() }
                 } else {
-                    let effective_txn = txn_id.or(active_txn);
+                    let effective_txn = txn_id.or(*active_txn);
                     let ends_txn = {
                         let s = sql.trim_start().to_ascii_uppercase();
                         s.starts_with("COMMIT") || s.starts_with("ROLLBACK") || s.starts_with("END")
                     };
-                    match execute_query(&sql, effective_txn, &query_engine, &kv_engine, &doc_engine).await {
+                    match execute_query(&sql, effective_txn, query_engine, kv_engine, doc_engine).await {
                         Ok(resp) => {
                             if let Response::Ok { ref message } = resp {
                                 if message.starts_with("Transaction ") && message.ends_with(" started") {
                                     let parts: Vec<&str> = message.split_whitespace().collect();
                                     if let Some(id_str) = parts.get(1) {
                                         if let Ok(id) = id_str.parse::<u64>() {
-                                            active_txn = Some(id);
+                                            *active_txn = Some(id);
                                         }
                                     }
                                 } else if message == "COMMIT" || message == "ROLLBACK" {
-                                    active_txn = None;
+                                    *active_txn = None;
                                 }
                             }
                             resp
                         }
                         Err(e) => {
                             if ends_txn {
-                                active_txn = None;
+                                *active_txn = None;
                             }
                             Response::Error { code: 500, message: e.to_string() }
                         }
@@ -81,19 +120,12 @@ pub async fn handle_connection(
             }
             Request::Ping => Response::Pong,
             Request::Disconnect => {
-                if let Some(sid) = session_id {
-                    session_manager.remove_session(sid);
-                }
                 break;
             }
         };
 
         let response_data = response.serialize();
         write_frame(&mut stream, &response_data).await?;
-    }
-
-    if let Some(tid) = active_txn.take() {
-        query_engine.rollback(tid);
     }
 
     Ok(())

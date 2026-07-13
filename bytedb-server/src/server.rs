@@ -190,6 +190,7 @@ impl Server {
                 check_exprs: Vec::new(),
                 sequences,
                 secondary_indexes: Vec::new(),
+                write_lock: Arc::new(parking_lot::Mutex::new(())),
             }));
         }
     }
