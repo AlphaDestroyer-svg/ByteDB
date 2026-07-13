@@ -17,6 +17,7 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -36,14 +37,14 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +113,9 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -122,6 +125,9 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: List downloaded artifacts
+        run: ls -la dist || echo "no artifacts"
+
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
@@ -130,6 +136,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: false
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
