@@ -26,3 +26,5 @@ jobs:
         run: cargo test --workspace
       - name: Release build (binaries)
         run: cargo build --release --bin bytedb-server --bin bytedb-client --bin bytedb-bench
+      - name: Check optional TLS feature
+        run: cargo check -p bytedb-server --features tls
