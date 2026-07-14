@@ -1075,7 +1075,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_default_keyword_explicit() {
         let engine = setup_engine();
 

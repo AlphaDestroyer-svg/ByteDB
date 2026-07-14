@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use bytedb_core::catalog::database::Database;
 use bytedb_core::mvcc::transaction::TransactionManager;
-use bytedb_core::tuple::value::Value;
 use bytedb_query::executor::engine::{ExecutionResult, QueryEngine};
 
 fn engine() -> QueryEngine {

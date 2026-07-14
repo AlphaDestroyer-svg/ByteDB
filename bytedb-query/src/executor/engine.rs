@@ -21,7 +21,7 @@ use bytedb_core::metrics::{LatencyHistogram, Timer};
 
 use crate::error::{QueryError, Result};
 use crate::executor::batch::{SelectionVector, deserialize_batch};
-use crate::executor::context::QueryContext;
+use crate::executor::context::{QueryContext, ResourceLimits};
 use crate::parser::ast::*;
 use crate::planner::cost::StatsCatalog;
 use crate::planner::logical_plan::build_logical_plan;
@@ -37,6 +37,7 @@ thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<TxnId>> = std::cell::Cell::new(None);
     static PENDING_DELTAS: std::cell::RefCell<Vec<(String, u8, Vec<u8>, Vec<u8>)>> = std::cell::RefCell::new(Vec::new());
     static SUBQUERY_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+    static ACTIVE_CTX: std::cell::RefCell<Option<Arc<QueryContext>>> = std::cell::RefCell::new(None);
 }
 
 fn subquery_depth() -> u32 {
@@ -50,7 +51,7 @@ fn current_txn_id() -> Option<TxnId> {
 const STMT_CACHE_SIZE: usize = 256;
 
 struct StmtCache {
-    entries: Vec<(u64, Statement)>,
+    entries: Vec<(u64, String, Statement)>,
 }
 
 impl StmtCache {
@@ -60,15 +61,18 @@ impl StmtCache {
         }
     }
 
-    fn get(&self, hash: u64) -> Option<&Statement> {
-        self.entries.iter().find(|(h, _)| *h == hash).map(|(_, s)| s)
+    fn get(&self, hash: u64, sql: &str) -> Option<&Statement> {
+        self.entries
+            .iter()
+            .find(|(h, s, _)| *h == hash && s == sql)
+            .map(|(_, _, stmt)| stmt)
     }
 
-    fn insert(&mut self, hash: u64, stmt: Statement) {
+    fn insert(&mut self, hash: u64, sql: String, stmt: Statement) {
         if self.entries.len() >= STMT_CACHE_SIZE {
             self.entries.remove(0);
         }
-        self.entries.push((hash, stmt));
+        self.entries.push((hash, sql, stmt));
     }
 }
 
@@ -108,7 +112,8 @@ pub struct QueryEngine {
 
     stats: Arc<parking_lot::RwLock<HashMap<String, TableStats>>>,
 
-    active_ctx: parking_lot::RwLock<Option<Arc<QueryContext>>>,
+    default_stmt_timeout: parking_lot::RwLock<Option<std::time::Duration>>,
+    default_limits: parking_lot::RwLock<ResourceLimits>,
 
     query_latency: Arc<LatencyHistogram>,
     slow_query_threshold_ms: parking_lot::RwLock<Option<u64>>,
@@ -233,7 +238,8 @@ impl QueryEngine {
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            active_ctx: parking_lot::RwLock::new(None),
+            default_stmt_timeout: parking_lot::RwLock::new(None),
+            default_limits: parking_lot::RwLock::new(ResourceLimits::UNLIMITED),
             query_latency: Arc::new(LatencyHistogram::default()),
             slow_query_threshold_ms: parking_lot::RwLock::new(None),
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
@@ -261,7 +267,8 @@ impl QueryEngine {
             current_db: Arc::new(parking_lot::RwLock::new(default_name)),
             disk_store: None,
             stats: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            active_ctx: parking_lot::RwLock::new(None),
+            default_stmt_timeout: parking_lot::RwLock::new(None),
+            default_limits: parking_lot::RwLock::new(ResourceLimits::UNLIMITED),
             query_latency: Arc::new(LatencyHistogram::default()),
             slow_query_threshold_ms: parking_lot::RwLock::new(None),
             slow_query_log: parking_lot::RwLock::new(Vec::new()),
@@ -477,23 +484,21 @@ impl QueryEngine {
         }
     }
 
+    pub fn parse_cached(&self, sql: &str) -> Result<Statement> {
+        let hash = hash_sql(sql);
+        if let Some(s) = self.stmt_cache.lock().get(hash, sql).cloned() {
+            return Ok(s);
+        }
+        let mut parser = crate::parser::parser::Parser::new(sql)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let stmt = parser.parse()?;
+        self.stmt_cache.lock().insert(hash, sql.to_string(), stmt.clone());
+        Ok(stmt)
+    }
+
     pub fn execute_sql(&self, sql: &str, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
         let timer = Timer::start();
-        let hash = hash_sql(sql);
-        let cached = {
-            let cache = self.stmt_cache.lock();
-            cache.get(hash).cloned()
-        };
-        let stmt = if let Some(s) = cached {
-            s
-        } else {
-            let mut parser = crate::parser::parser::Parser::new(sql)
-                .map_err(|e| QueryError::Parse(e.to_string()))?;
-            let s = parser.parse()?;
-            let mut cache = self.stmt_cache.lock();
-            cache.insert(hash, s.clone());
-            s
-        };
+        let stmt = self.parse_cached(sql)?;
         let res = self.execute(stmt, txn_id);
         let elapsed_us = timer.elapsed_micros();
         self.query_latency.record_micros(elapsed_us);
@@ -573,22 +578,57 @@ impl QueryEngine {
     }
 
     fn set_active_ctx(&self, ctx: Option<Arc<QueryContext>>) {
-        *self.active_ctx.write() = ctx;
+        ACTIVE_CTX.with(|c| *c.borrow_mut() = ctx);
     }
 
     pub fn active_ctx(&self) -> Option<Arc<QueryContext>> {
-        self.active_ctx.read().as_ref().map(Arc::clone)
+        ACTIVE_CTX.with(|c| c.borrow().clone())
+    }
+
+    pub fn set_statement_timeout_ms(&self, ms: u64) {
+        *self.default_stmt_timeout.write() = if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        };
+    }
+
+    pub fn set_resource_limits(&self, max_scan_rows: u64, max_memory_bytes: u64) {
+        let mut limits = ResourceLimits::UNLIMITED;
+        if max_scan_rows > 0 {
+            limits = limits.with_scan_rows(max_scan_rows);
+        }
+        if max_memory_bytes > 0 {
+            limits = limits.with_memory(max_memory_bytes);
+        }
+        *self.default_limits.write() = limits;
+    }
+
+    fn build_default_ctx(&self) -> Option<Arc<QueryContext>> {
+        let timeout = *self.default_stmt_timeout.read();
+        let limits = *self.default_limits.read();
+        let has_limits = limits.max_memory_bytes.is_some()
+            || limits.max_temp_spill_bytes.is_some()
+            || limits.max_scan_rows.is_some();
+        if timeout.is_none() && !has_limits {
+            return None;
+        }
+        let mut builder = QueryContext::builder().limits(limits);
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+        Some(builder.build())
     }
 
     fn poll_ctx(&self) -> Result<()> {
-        if let Some(ctx) = self.active_ctx.read().as_ref() {
+        if let Some(ctx) = self.active_ctx() {
             ctx.check()?;
         }
         Ok(())
     }
 
     fn account_scan_row(&self) -> Result<()> {
-        if let Some(ctx) = self.active_ctx.read().as_ref() {
+        if let Some(ctx) = self.active_ctx() {
             ctx.account_scan_row()?;
             let usage = ctx.usage();
             if usage.scan_rows % 1024 == 0 {
@@ -599,7 +639,7 @@ impl QueryEngine {
     }
 
     fn account_memory(&self, bytes: u64) -> Result<()> {
-        if let Some(ctx) = self.active_ctx.read().as_ref() {
+        if let Some(ctx) = self.active_ctx() {
             ctx.account_memory(bytes)?;
         }
         Ok(())
@@ -613,7 +653,7 @@ impl QueryEngine {
         needed_columns: Option<&[usize]>,
         fast_filter: Option<(usize, BinOp, Value)>,
     ) -> Result<Vec<Vec<Value>>> {
-        let ctx = self.active_ctx.read().as_ref().map(Arc::clone);
+        let ctx = self.active_ctx();
         let fast_op: Option<(usize, u8, Value)> = fast_filter.map(|(ci, op, v)| {
             let code = match op {
                 BinOp::Eq => 0, BinOp::Neq => 1, BinOp::Lt => 2,
@@ -675,7 +715,7 @@ impl QueryEngine {
 
     #[allow(dead_code)]
     fn account_temp_spill(&self, bytes: u64) -> Result<()> {
-        if let Some(ctx) = self.active_ctx.read().as_ref() {
+        if let Some(ctx) = self.active_ctx() {
             ctx.account_temp_spill(bytes)?;
         }
         Ok(())
@@ -707,6 +747,27 @@ impl QueryEngine {
         CURRENT_TXN_ID.with(|c| c.set(txn_id));
         let _guard = TxnGuard;
         let top_level = subquery_depth() == 0;
+
+        struct CtxGuard(bool);
+        impl Drop for CtxGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    ACTIVE_CTX.with(|c| *c.borrow_mut() = None);
+                }
+            }
+        }
+        let _ctx_guard = if top_level && self.active_ctx().is_none() {
+            match self.build_default_ctx() {
+                Some(ctx) => {
+                    self.set_active_ctx(Some(ctx));
+                    CtxGuard(true)
+                }
+                None => CtxGuard(false),
+            }
+        } else {
+            CtxGuard(false)
+        };
+
         if top_level {
             self.subquery_cache.lock().clear();
             *self.pending_subquery_error.lock() = None;
@@ -2627,7 +2688,7 @@ impl QueryEngine {
                 }).map_err(|e| QueryError::Execution(e.to_string()))?;
             } else if filter.is_none() && scan_limit.is_none() && needed_columns.is_none() {
                 rows.reserve(table_data.index.approx_len());
-                let ctx = self.active_ctx.read().as_ref().map(Arc::clone);
+                let ctx = self.active_ctx();
                 let has_scan_limit = ctx.as_ref().map(|c| c.limits().max_scan_rows.is_some()).unwrap_or(false);
                 let mut since_check: u32 = 0;
                 table_data.index.for_each(|_key, data| {
