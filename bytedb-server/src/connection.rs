@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
 use crate::error::{ServerError, Result};
@@ -9,18 +9,21 @@ use crate::auth::credentials::{Credentials, SessionManager};
 use bytedb_query::executor::engine::{QueryEngine, ExecutionResult};
 use bytedb_query::kv::kv_engine::KvEngine;
 use bytedb_query::document::doc_engine::DocEngine;
-use bytedb_query::parser::parser::Parser;
 use bytedb_query::parser::ast::Statement;
 use bytedb_core::tuple::value::Value;
 
-pub async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S>(
+    stream: S,
     query_engine: Arc<QueryEngine>,
     kv_engine: Arc<KvEngine>,
     doc_engine: Arc<DocEngine>,
     credentials: Arc<Credentials>,
     session_manager: Arc<SessionManager>,
-) -> Result<()> {
+    idle_timeout_secs: u64,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut session_id: Option<u64> = None;
     let mut active_txn: Option<u64> = None;
 
@@ -33,6 +36,7 @@ pub async fn handle_connection(
         &session_manager,
         &mut session_id,
         &mut active_txn,
+        idle_timeout_secs,
     )
     .await;
 
@@ -47,8 +51,8 @@ pub async fn handle_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn connection_loop(
-    mut stream: TcpStream,
+async fn connection_loop<S>(
+    mut stream: S,
     query_engine: &Arc<QueryEngine>,
     kv_engine: &Arc<KvEngine>,
     doc_engine: &Arc<DocEngine>,
@@ -56,9 +60,29 @@ async fn connection_loop(
     session_manager: &Arc<SessionManager>,
     session_id: &mut Option<u64>,
     active_txn: &mut Option<u64>,
-) -> Result<()> {
+    idle_timeout_secs: u64,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let idle_timeout = if idle_timeout_secs == 0 {
+        None
+    } else {
+        Some(tokio::time::Duration::from_secs(idle_timeout_secs))
+    };
+
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let read_result = match idle_timeout {
+            Some(dur) => match tokio::time::timeout(dur, read_frame(&mut stream)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!("Idle timeout after {}s, closing connection", idle_timeout_secs);
+                    break;
+                }
+            },
+            None => read_frame(&mut stream).await,
+        };
+        let frame = match read_result {
             Ok(f) => f,
             Err(_) => break,
         };
@@ -138,9 +162,7 @@ async fn execute_query(
     kv_engine: &KvEngine,
     doc_engine: &DocEngine,
 ) -> Result<Response> {
-    let mut parser = Parser::new(sql)
-        .map_err(|e| ServerError::Query(e))?;
-    let stmt = parser.parse()
+    let stmt = query_engine.parse_cached(sql)
         .map_err(|e| ServerError::Query(e))?;
 
     match &stmt {

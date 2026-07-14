@@ -18,10 +18,27 @@ fn hash_password(password: &str) -> Option<String> {
         .map(|h| h.to_string())
 }
 
+pub fn generate_password() -> String {
+    use rand_core::RngCore;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    OsRng.fill_bytes(&mut buf);
+    let mut s = String::with_capacity(buf.len() * 2);
+    for b in buf {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 impl Credentials {
     pub fn new() -> Self {
+        Self::with_admin("admin")
+    }
+
+    pub fn with_admin(password: &str) -> Self {
         let mut users = HashMap::new();
-        if let Some(h) = hash_password("admin") {
+        if let Some(h) = hash_password(password) {
             users.insert("admin".to_string(), h);
         }
         Credentials {
@@ -131,6 +148,22 @@ mod tests {
         assert!(c.authenticate("admin", "admin"));
         assert!(!c.authenticate("admin", "wrong"));
         assert!(!c.authenticate("nobody", "admin"));
+    }
+
+    #[test]
+    fn with_admin_uses_given_password() {
+        let c = Credentials::with_admin("s3cret-xyz");
+        assert!(c.authenticate("admin", "s3cret-xyz"));
+        assert!(!c.authenticate("admin", "admin"), "must not accept the old default");
+    }
+
+    #[test]
+    fn generated_passwords_are_random_hex() {
+        let a = generate_password();
+        let b = generate_password();
+        assert_eq!(a.len(), 36);
+        assert_ne!(a, b, "each generated password must differ");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

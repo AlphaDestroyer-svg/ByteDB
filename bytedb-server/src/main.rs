@@ -7,6 +7,9 @@ mod protocol;
 mod auth;
 mod config;
 mod error;
+mod metrics;
+#[cfg(feature = "tls")]
+mod tls;
 
 use config::Config;
 use server::Server;
@@ -25,7 +28,7 @@ async fn main() {
 |____/ \__, |\__\___|____/|____/
        |___/
     "#);
-    println!("ByteDB v0.1.0 - Universal Database Engine");
+    println!("ByteDB v{} - Universal Database Engine", env!("CARGO_PKG_VERSION"));
     println!("Listening on {}:{}", config.host, config.port);
     println!();
 

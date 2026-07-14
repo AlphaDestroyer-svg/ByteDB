@@ -22,6 +22,33 @@ pub struct Config {
     #[arg(long, default_value_t = 300)]
     pub connection_timeout_secs: u64,
 
+    #[arg(long, default_value_t = 0)]
+    pub statement_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 0)]
+    pub max_scan_rows: u64,
+
+    #[arg(long, default_value_t = 0)]
+    pub max_query_memory_mb: u64,
+
+    #[arg(long, default_value = "strict")]
+    pub durability: String,
+
+    #[arg(long, default_value_t = 0)]
+    pub group_commit_delay_us: u64,
+
+    #[arg(long, default_value_t = 0)]
+    pub metrics_port: u16,
+
+    #[arg(long)]
+    pub admin_password: Option<String>,
+
+    #[arg(long)]
+    pub tls_cert: Option<PathBuf>,
+
+    #[arg(long)]
+    pub tls_key: Option<PathBuf>,
+
     #[arg(long, default_value_t = 1800)]
     pub snapshot_interval_secs: u64,
 

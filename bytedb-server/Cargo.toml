@@ -17,3 +17,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 clap = { version = "4", features = ["derive"] }
 argon2 = { version = "0.5", features = ["rand"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{info, error, warn};
@@ -14,7 +15,7 @@ use bytedb_core::mvcc::transaction::TransactionManager;
 use bytedb_core::mvcc::version_store::VersionStore;
 use bytedb_core::snapshot::format::{FullSnapshot, SnapshotFormat, TableSnapshot};
 use bytedb_core::snapshot::manager::SnapshotManager;
-use bytedb_core::wal::log_manager::LogManager;
+use bytedb_core::wal::log_manager::{LogManager, DurabilityMode};
 use bytedb_core::wal::recovery::RecoveryManager;
 use bytedb_core::workers::{wal_flusher, vacuum, WorkerHandle};
 use bytedb_query::executor::engine::{QueryEngine, TableData};
@@ -54,6 +55,21 @@ impl Server {
         let log_manager = Arc::new(
             LogManager::new(&wal_path).expect("Failed to open WAL")
         );
+
+        match config.durability.to_ascii_lowercase().as_str() {
+            "relaxed" => {
+                log_manager.set_durability_mode(DurabilityMode::Relaxed);
+                warn!("Durability mode: RELAXED (commits ack before fsync; recent commits may be lost on crash)");
+            }
+            _ => {
+                log_manager.set_durability_mode(DurabilityMode::Strict);
+                info!("Durability mode: STRICT (fsync on every commit)");
+            }
+        }
+        if config.group_commit_delay_us > 0 {
+            log_manager.set_group_commit_delay_us(config.group_commit_delay_us);
+            info!("Group commit delay set to {} us", config.group_commit_delay_us);
+        }
 
         let pitr_marker = config.data_dir.join("pitr_target.txt");
         let pitr_target: Option<u64> = if pitr_marker.exists() {
@@ -122,6 +138,12 @@ impl Server {
 
         let query_engine = Arc::new(engine_owned);
 
+        query_engine.set_statement_timeout_ms(config.statement_timeout_ms);
+        query_engine.set_resource_limits(
+            config.max_scan_rows,
+            config.max_query_memory_mb.saturating_mul(1024 * 1024),
+        );
+
         if let Ok(Some(snapshot)) = snapshot_manager.load_latest() {
             info!("Restoring from snapshot (LSN: {}, {} tables)", snapshot.header.lsn, snapshot.tables.len());
             Self::restore_from_snapshot(&query_engine, &snapshot);
@@ -130,7 +152,23 @@ impl Server {
 
         let kv_engine = Arc::new(KvEngine::new());
         let doc_engine = Arc::new(DocEngine::new());
-        let credentials = Arc::new(Credentials::new());
+
+        let admin_password = config.admin_password.clone()
+            .filter(|p| !p.is_empty())
+            .or_else(|| std::env::var("BYTEDB_ADMIN_PASSWORD").ok().filter(|p| !p.is_empty()));
+        let credentials = match admin_password {
+            Some(pw) => {
+                info!("Admin password configured from startup options");
+                Arc::new(Credentials::with_admin(&pw))
+            }
+            None => {
+                let generated = crate::auth::credentials::generate_password();
+                warn!("No admin password set (--admin-password or BYTEDB_ADMIN_PASSWORD).");
+                warn!("Generated one-time admin password: {}", generated);
+                warn!("Set an explicit password before running in production.");
+                Arc::new(Credentials::with_admin(&generated))
+            }
+        };
         let session_manager = Arc::new(SessionManager::new());
         let semaphore = Arc::new(Semaphore::new(config.max_connections));
 
@@ -166,6 +204,13 @@ impl Server {
         use bytedb_core::tuple::schema::SequenceGenerator;
         let mut tables = engine.tables().write();
         for table_snap in &snapshot.tables {
+            if tables.contains_key(&table_snap.name) {
+                info!(
+                    "Table '{}' already restored from disk store; keeping disk state over snapshot",
+                    table_snap.name
+                );
+                continue;
+            }
             let schema = table_snap.schema.clone();
             let index = Arc::new(BPlusTree::new(format!("{}_pk", table_snap.name), 128));
             for (key, value) in &table_snap.entries {
@@ -181,13 +226,16 @@ impl Server {
                     sequences.insert(c.name.clone(), Arc::new(SequenceGenerator::new(start)));
                 }
             }
+            let check_exprs: Vec<_> = schema.check_constraints.iter()
+                .filter_map(|s| bytedb_query::parser::parser::Parser::parse_expression(s).ok())
+                .collect();
             let meta = TableMeta::new(table_snap.name.clone(), schema.clone(), table_snap.table_id);
             let _ = engine.database().create_table(meta);
             tables.insert(table_snap.name.clone(), Arc::new(TableData {
                 schema,
                 index,
                 version_store: Arc::new(VersionStore::new()),
-                check_exprs: Vec::new(),
+                check_exprs,
                 sequences,
                 secondary_indexes: Vec::new(),
                 write_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -230,6 +278,29 @@ impl Server {
 
         let timeout_secs = self.config.connection_timeout_secs;
 
+        #[cfg(feature = "tls")]
+        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> =
+            match (&self.config.tls_cert, &self.config.tls_key) {
+                (Some(cert), Some(key)) => match crate::tls::build_acceptor(cert, key) {
+                    Ok(acc) => {
+                        info!("TLS enabled (cert: {:?})", cert);
+                        Some(acc)
+                    }
+                    Err(e) => {
+                        error!("TLS setup failed: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                (None, None) => {
+                    warn!("TLS not configured; connections are PLAINTEXT");
+                    None
+                }
+                _ => {
+                    error!("Both --tls-cert and --tls-key must be provided to enable TLS");
+                    std::process::exit(1);
+                }
+            };
+
         let snap_interval = self.snapshot_manager.interval();
         let snapshots_disabled = self.config.no_snapshot || snap_interval.as_secs() == 0;
         if snapshots_disabled {
@@ -244,6 +315,43 @@ impl Server {
                 loop {
                     ticker.tick().await;
                     Self::create_snapshot(&snap_engine, &snap_manager);
+                }
+            });
+        }
+
+        if self.config.metrics_port > 0 {
+            let metrics_addr = format!("{}:{}", self.config.host, self.config.metrics_port);
+            let m_engine = Arc::clone(&self.query_engine);
+            let m_wal = Arc::clone(&self.wal);
+            let m_sem = Arc::clone(&self.semaphore);
+            let max_conns = self.config.max_connections as u64;
+            tokio::spawn(async move {
+                match TcpListener::bind(&metrics_addr).await {
+                    Ok(l) => {
+                        info!("Metrics endpoint listening on http://{}/metrics", metrics_addr);
+                        loop {
+                            let (mut sock, _) = match l.accept().await {
+                                Ok(pair) => pair,
+                                Err(_) => continue,
+                            };
+                            let active = max_conns.saturating_sub(m_sem.available_permits() as u64);
+                            let body = crate::metrics::MetricsSnapshot::gather(&m_engine, &m_wal, active, max_conns)
+                                .to_prometheus();
+                            let mut scratch = [0u8; 1024];
+                            let _ = tokio::time::timeout(
+                                tokio::time::Duration::from_millis(200),
+                                sock.read(&mut scratch),
+                            ).await;
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                            let _ = sock.shutdown().await;
+                        }
+                    }
+                    Err(e) => error!("Failed to bind metrics port {}: {}", metrics_addr, e),
                 }
             });
         }
@@ -270,22 +378,54 @@ impl Server {
                     let credentials = Arc::clone(&self.credentials);
                     let session_manager = Arc::clone(&self.session_manager);
 
+                    #[cfg(feature = "tls")]
+                    let tls_for_conn = tls_acceptor.clone();
+
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let timeout = tokio::time::Duration::from_secs(timeout_secs);
-                        let result = tokio::time::timeout(timeout, handle_connection(
+
+                        #[cfg(feature = "tls")]
+                        let result = match tls_for_conn {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(tls_stream) => handle_connection(
+                                    tls_stream,
+                                    query_engine,
+                                    kv_engine,
+                                    doc_engine,
+                                    credentials,
+                                    session_manager,
+                                    timeout_secs,
+                                ).await,
+                                Err(e) => {
+                                    warn!("TLS handshake failed for {}: {}", peer_addr, e);
+                                    Ok(())
+                                }
+                            },
+                            None => handle_connection(
+                                stream,
+                                query_engine,
+                                kv_engine,
+                                doc_engine,
+                                credentials,
+                                session_manager,
+                                timeout_secs,
+                            ).await,
+                        };
+
+                        #[cfg(not(feature = "tls"))]
+                        let result = handle_connection(
                             stream,
                             query_engine,
                             kv_engine,
                             doc_engine,
                             credentials,
                             session_manager,
-                        )).await;
+                            timeout_secs,
+                        ).await;
 
                         match result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => error!("Connection error from {}: {}", peer_addr, e),
-                            Err(_) => warn!("Connection timeout for {}", peer_addr),
+                            Ok(()) => {}
+                            Err(e) => error!("Connection error from {}: {}", peer_addr, e),
                         }
                         info!("Connection closed: {}", peer_addr);
                     });
