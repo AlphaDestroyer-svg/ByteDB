@@ -117,7 +117,20 @@ where
                         let s = sql.trim_start().to_ascii_uppercase();
                         s.starts_with("COMMIT") || s.starts_with("ROLLBACK") || s.starts_with("END")
                     };
-                    match execute_query(&sql, effective_txn, query_engine, kv_engine, doc_engine).await {
+                    let exec_result = {
+                        let qe = Arc::clone(query_engine);
+                        let kv = Arc::clone(kv_engine);
+                        let doc = Arc::clone(doc_engine);
+                        match tokio::task::spawn_blocking(move || {
+                            execute_query(&sql, effective_txn, &qe, &kv, &doc)
+                        })
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => Err(ServerError::Internal(format!("worker join failed: {}", e))),
+                        }
+                    };
+                    match exec_result {
                         Ok(resp) => {
                             if let Response::Ok { ref message } = resp {
                                 if message.starts_with("Transaction ") && message.ends_with(" started") {
@@ -155,7 +168,7 @@ where
     Ok(())
 }
 
-async fn execute_query(
+fn execute_query(
     sql: &str,
     txn_id: Option<u64>,
     query_engine: &QueryEngine,

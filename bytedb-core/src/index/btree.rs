@@ -585,6 +585,28 @@ impl BPlusTree {
         leaves
     }
 
+    pub fn collect_leaf_values(&self) -> Vec<Vec<Vec<u8>>> {
+        let mut leaves = Vec::new();
+        let leaf_node = self.find_leftmost_leaf();
+        let mut current = Some(leaf_node);
+
+        while let Some(node_arc) = current {
+            let node = node_arc.read();
+            match &*node {
+                BTreeNode::Leaf(leaf) => {
+                    if !leaf.values.is_empty() {
+                        leaves.push(leaf.values.clone());
+                    }
+                    current = leaf.right_link.clone();
+                }
+                _ => break,
+            }
+            drop(node);
+        }
+
+        leaves
+    }
+
     pub fn count(&self) -> usize {
         let mut count = 0;
         let leaf_node = self.find_leftmost_leaf();

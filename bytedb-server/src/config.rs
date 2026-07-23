@@ -63,6 +63,12 @@ pub struct Config {
 
     #[arg(long, default_value_t = false)]
     pub no_shutdown_snapshot: bool,
+
+    #[arg(long, default_value_t = 0)]
+    pub max_resident_tables: usize,
+
+    #[arg(long, default_value_t = 60)]
+    pub eviction_interval_secs: u64,
 }
 
 impl Config {

@@ -177,13 +177,30 @@ impl Server {
             let txn_mgr = engine.txn_manager_arc();
             vacuum::MvccVacuum::new(txn_mgr, move || engine.snapshot_version_stores())
         };
-        let workers = vec![
+        let mut workers = vec![
             wal_flusher::start(
                 Arc::clone(&log_manager),
                 wal_flusher::WalFlusherConfig::default(),
             ),
             vacuum::start(vacuum_pass, vacuum::VacuumConfig::default()),
         ];
+
+        if config.max_resident_tables > 0 {
+            let engine = Arc::clone(&query_engine);
+            let max_resident = config.max_resident_tables;
+            let interval = std::time::Duration::from_secs(config.eviction_interval_secs.max(1));
+            info!(
+                "Table tiering enabled: keeping at most {} tables resident (eviction every {}s)",
+                max_resident, interval.as_secs()
+            );
+            workers.push(bytedb_core::workers::spawn_periodic(
+                "table-evictor",
+                interval,
+                move || {
+                    let _ = engine.evict_cold_tables(max_resident);
+                },
+            ));
+        }
 
         Server {
             config,
@@ -239,6 +256,7 @@ impl Server {
                 sequences,
                 secondary_indexes: Vec::new(),
                 write_lock: Arc::new(parking_lot::Mutex::new(())),
+                last_access: std::sync::atomic::AtomicU64::new(0),
             }));
         }
     }

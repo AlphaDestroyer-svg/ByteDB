@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 use std::cmp::Ordering;
 use std::thread_local;
 
@@ -125,6 +126,7 @@ pub struct QueryEngine {
     rowids: parking_lot::Mutex<HashMap<String, u64>>,
     subquery_cache: parking_lot::Mutex<HashMap<usize, Arc<Vec<Vec<Value>>>>>,
     pending_subquery_error: parking_lot::Mutex<Option<String>>,
+    access_clock: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,9 +168,18 @@ pub struct TableData {
     pub sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>>,
     pub secondary_indexes: Vec<Arc<SecondaryIndex>>,
     pub write_lock: Arc<parking_lot::Mutex<()>>,
+    pub last_access: AtomicU64,
 }
 
 impl TableData {
+    pub fn touch(&self, tick: u64) {
+        self.last_access.store(tick, AtomicOrd::Relaxed);
+    }
+
+    pub fn last_access(&self) -> u64 {
+        self.last_access.load(AtomicOrd::Relaxed)
+    }
+
     pub fn read_visible_entries(&self, txn_manager: &TransactionManager, txn_id: Option<TxnId>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if let Some(tid) = txn_id {
             if self.version_store.key_count() == 0 {
@@ -180,21 +191,15 @@ impl TableData {
             let resolved = self.version_store.snapshot_resolved(tid, snapshot.start_ts, &snapshot.active_txns);
             let base = self.index.scan_all()
                 .map_err(|e| QueryError::Execution(e.to_string()))?;
-            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(base.len());
-            let mut seen_keys: std::collections::HashSet<&[u8], ahash::RandomState> = std::collections::HashSet::with_capacity_and_hasher(base.len(), ahash::RandomState::new());
-            for (k, v) in &base {
-                seen_keys.insert(k.as_slice());
-                match resolved.get(k.as_slice()) {
-                    None => out.push((k.clone(), v.clone())),
-                    Some(None) => {}
-                    Some(Some(t)) => out.push((k.clone(), t.serialize())),
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(base.len() + resolved.len());
+            for (k, v) in base.into_iter() {
+                if !resolved.contains_key(k.as_slice()) {
+                    out.push((k, v));
                 }
             }
             for (k, opt) in &resolved {
                 if let Some(t) = opt {
-                    if !seen_keys.contains(k.as_slice()) {
-                        out.push((k.clone(), t.serialize()));
-                    }
+                    out.push((k.clone(), t.serialize()));
                 }
             }
             Ok(out)
@@ -249,6 +254,7 @@ impl QueryEngine {
             rowids: parking_lot::Mutex::new(HashMap::new()),
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
             pending_subquery_error: parking_lot::Mutex::new(None),
+            access_clock: AtomicU64::new(0),
         }
     }
 
@@ -278,6 +284,7 @@ impl QueryEngine {
             rowids: parking_lot::Mutex::new(HashMap::new()),
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
             pending_subquery_error: parking_lot::Mutex::new(None),
+            access_clock: AtomicU64::new(0),
         }
     }
 
@@ -298,45 +305,130 @@ impl QueryEngine {
 
     fn restore_current_db_from_disk(&self) -> Result<()> {
         let Some(ds) = self.disk_store.as_ref() else { return Ok(()); };
+        let cats = ds.list_tables();
         let mut tables = self.tables.write();
         tables.clear();
-        for tcat in ds.list_tables() {
-            let entries = ds.load_table_data(&tcat.name)
-                .map_err(|e| QueryError::Execution(e.to_string()))?;
-            let index = Arc::new(BPlusTree::new(format!("{}_pk", tcat.name), 128));
-            for (k, v) in entries {
-                let _ = index.insert(k, v);
-            }
-            let mut sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>> = HashMap::new();
-            for c in &tcat.schema.columns {
-                if c.auto_increment {
-                    let start = tcat.sequences.iter()
-                        .find(|(n, _)| n == &c.name)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(1);
-                    sequences.insert(c.name.clone(), Arc::new(bytedb_core::tuple::schema::SequenceGenerator::new(start)));
-                }
-            }
-
-            let secondary_indexes = Self::build_secondary_indexes(&tcat.schema, &index, &tcat.indexes)
-                .map_err(|e| QueryError::Execution(e.to_string()))?;
-
-            let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
-            let _ = self.database.create_table(meta);
-            let check_exprs: Vec<Expr> = tcat.schema.check_constraints.iter()
-                .filter_map(|s| crate::parser::parser::Parser::parse_expression(s).ok())
-                .collect();
-            tables.insert(tcat.name.clone(), Arc::new(TableData {
-                schema: tcat.schema,
-                index,
-                version_store: Arc::new(VersionStore::new()),
-                check_exprs,
-                sequences,
-                secondary_indexes,
-                write_lock: Arc::new(parking_lot::Mutex::new(())),
-            }));
+        for tcat in &cats {
+            let td = self.build_table_data(tcat, ds)?;
+            tables.insert(tcat.name.clone(), Arc::new(td));
         }
         Ok(())
+    }
+
+    fn build_table_data(
+        &self,
+        tcat: &bytedb_core::dbstore::TableCatalog,
+        ds: &crate::executor::diskstore::DiskStore,
+    ) -> Result<TableData> {
+        let entries = ds.load_table_data(&tcat.name)
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        let index = Arc::new(BPlusTree::new(format!("{}_pk", tcat.name), 128));
+        for (k, v) in entries {
+            let _ = index.insert(k, v);
+        }
+        let mut sequences: HashMap<String, Arc<bytedb_core::tuple::schema::SequenceGenerator>> = HashMap::new();
+        for c in &tcat.schema.columns {
+            if c.auto_increment {
+                let start = tcat.sequences.iter()
+                    .find(|(n, _)| n == &c.name)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(1);
+                sequences.insert(c.name.clone(), Arc::new(bytedb_core::tuple::schema::SequenceGenerator::new(start)));
+            }
+        }
+        let secondary_indexes = Self::build_secondary_indexes(&tcat.schema, &index, &tcat.indexes)
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        let meta = TableMeta::new(tcat.name.clone(), tcat.schema.clone(), tcat.table_id);
+        let _ = self.database.create_table(meta);
+        let check_exprs: Vec<Expr> = tcat.schema.check_constraints.iter()
+            .filter_map(|s| crate::parser::parser::Parser::parse_expression(s).ok())
+            .collect();
+        Ok(TableData {
+            schema: tcat.schema.clone(),
+            index,
+            version_store: Arc::new(VersionStore::new()),
+            check_exprs,
+            sequences,
+            secondary_indexes,
+            write_lock: Arc::new(parking_lot::Mutex::new(())),
+            last_access: AtomicU64::new(0),
+        })
+    }
+
+    fn next_access_tick(&self) -> u64 {
+        self.access_clock.fetch_add(1, AtomicOrd::Relaxed) + 1
+    }
+
+    fn get_table(&self, name: &str) -> Result<Arc<TableData>> {
+        let tick = self.next_access_tick();
+        if let Some(td) = self.tables.read().get(name) {
+            td.touch(tick);
+            return Ok(Arc::clone(td));
+        }
+        if let Some(td) = self.reload_table_from_disk(name)? {
+            td.touch(tick);
+            return Ok(td);
+        }
+        Err(QueryError::Execution(format!("Table '{}' not found", name)))
+    }
+
+    fn reload_table_from_disk(&self, name: &str) -> Result<Option<Arc<TableData>>> {
+        let Some(ds) = self.disk_store.as_ref() else { return Ok(None); };
+        let cats = ds.list_tables();
+        let Some(tcat) = cats.iter().find(|t| t.name == name) else { return Ok(None); };
+        let td = self.build_table_data(tcat, ds)?;
+        let mut tables = self.tables.write();
+        if let Some(existing) = tables.get(name) {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        let arc = Arc::new(td);
+        tables.insert(name.to_string(), Arc::clone(&arc));
+        Ok(Some(arc))
+    }
+
+    pub fn evict_cold_tables(&self, max_resident: usize) -> usize {
+        if max_resident == 0 {
+            return 0;
+        }
+        let Some(ds) = self.disk_store.as_ref() else { return 0; };
+
+        let catalog = ds.list_tables();
+        let mut fk_involved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &catalog {
+            for fk in &t.schema.foreign_keys {
+                fk_involved.insert(t.name.clone());
+                fk_involved.insert(fk.ref_table.clone());
+            }
+        }
+
+        let mut candidates: Vec<(String, u64)> = {
+            let tables = self.tables.read();
+            if tables.len() <= max_resident {
+                return 0;
+            }
+            tables.iter()
+                .filter(|(name, _)| !fk_involved.contains(name.as_str()))
+                .map(|(name, td)| (name.clone(), td.last_access()))
+                .collect()
+        };
+        candidates.sort_by_key(|(_, la)| *la);
+
+        let mut want = self.tables.read().len().saturating_sub(max_resident);
+        let mut evicted = 0usize;
+        for (name, _) in candidates {
+            if want == 0 {
+                break;
+            }
+            let mut tables = self.tables.write();
+            if let Some(td) = tables.get(&name) {
+                if Arc::strong_count(td) == 1 && td.version_store.key_count() == 0 {
+                    tables.remove(&name);
+                    evicted += 1;
+                    want -= 1;
+                }
+            }
+        }
+        evicted
     }
 
     fn build_secondary_indexes(
@@ -647,7 +739,7 @@ impl QueryEngine {
 
     fn parallel_filter_leaves(
         &self,
-        leaves: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+        leaves: Vec<Vec<Vec<u8>>>,
         schema: &Schema,
         filter: Option<&Expr>,
         needed_columns: Option<&[usize]>,
@@ -673,8 +765,8 @@ impl QueryEngine {
                 if let Some(c) = &ctx {
                     c.check()?;
                 }
-                let mut out = Vec::new();
-                for (_k, data) in leaf {
+                let mut out = Vec::with_capacity(leaf.len());
+                for data in leaf {
                     if let Some((ci, code, lit)) = &fast_op {
                         match raw_filter_matches(data, *ci, *code, lit) {
                             Some(true) => {
@@ -823,9 +915,7 @@ impl QueryEngine {
                 })
             }
             Statement::Describe(name) | Statement::ShowColumns(name) => {
-                let tables = self.tables.read();
-                let table_data = tables.get(&name)
-                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                let table_data = self.get_table(&name)?;
                 let rows: Vec<Vec<Value>> = table_data.schema.columns.iter().map(|c| {
                     vec![
                         Value::Text(c.name.clone()),
@@ -840,9 +930,7 @@ impl QueryEngine {
                 })
             }
             Statement::ShowCreateTable(name) => {
-                let tables = self.tables.read();
-                let table_data = tables.get(&name)
-                    .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                let table_data = self.get_table(&name)?;
                 let mut ddl = format!("CREATE TABLE {} (\n", name);
                 for (i, col) in table_data.schema.columns.iter().enumerate() {
                     if i > 0 { ddl.push_str(",\n"); }
@@ -858,9 +946,7 @@ impl QueryEngine {
             }
             Statement::Truncate(name) => {
                 {
-                    let tables = self.tables.read();
-                    let table_data = tables.get(&name)
-                        .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", name)))?;
+                    let table_data = self.get_table(&name)?;
                     let fresh_index = Arc::new(BPlusTree::new(format!("{}_pk", name), 128));
                     let fresh_secs: Vec<Arc<SecondaryIndex>> = table_data.secondary_indexes.iter()
                         .map(|s| Arc::new(SecondaryIndex::new(s.name.clone(), s.columns.clone(), s.unique)))
@@ -873,8 +959,8 @@ impl QueryEngine {
                         sequences: table_data.sequences.clone(),
                         secondary_indexes: fresh_secs,
                         write_lock: Arc::clone(&table_data.write_lock),
+                        last_access: AtomicU64::new(0),
                     };
-                    drop(tables);
                     self.tables.write().insert(name.clone(), Arc::new(new_td));
                 }
                 self.flush_table_to_disk(&name);
@@ -1223,6 +1309,7 @@ impl QueryEngine {
             sequences: sequences.clone(),
             secondary_indexes: Vec::new(),
             write_lock: Arc::new(parking_lot::Mutex::new(())),
+            last_access: AtomicU64::new(0),
         };
         self.tables.write().insert(ct.name.clone(), Arc::new(table_data));
 
@@ -1295,6 +1382,7 @@ impl QueryEngine {
             sequences: td.sequences.clone(),
             secondary_indexes: new_secs.clone(),
             write_lock: Arc::clone(&td.write_lock),
+            last_access: AtomicU64::new(0),
         };
         self.tables.write().insert(ci.table.clone(), Arc::new(new_td));
 
@@ -1332,6 +1420,7 @@ impl QueryEngine {
             sequences: td.sequences.clone(),
             secondary_indexes: new_secs.clone(),
             write_lock: Arc::clone(&td.write_lock),
+            last_access: AtomicU64::new(0),
         };
         self.tables.write().insert(tname.clone(), Arc::new(new_td));
 
@@ -1477,6 +1566,7 @@ impl QueryEngine {
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: table_data.secondary_indexes.clone(),
                     write_lock: Arc::clone(&table_data.write_lock),
+                    last_access: AtomicU64::new(0),
                 };
                 *table_data = Arc::new(new_td);
 
@@ -1501,6 +1591,7 @@ impl QueryEngine {
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: Vec::new(),
                     write_lock: Arc::clone(&table_data.write_lock),
+                    last_access: AtomicU64::new(0),
                 };
                 *table_data = Arc::new(new_td);
                 if let Some(ds) = &self.disk_store {
@@ -1523,6 +1614,7 @@ impl QueryEngine {
                     sequences: table_data.sequences.clone(),
                     secondary_indexes: Vec::new(),
                     write_lock: Arc::clone(&table_data.write_lock),
+                    last_access: AtomicU64::new(0),
                 };
                 *table_data = Arc::new(new_td);
                 if let Some(ds) = &self.disk_store {
@@ -1628,12 +1720,7 @@ impl QueryEngine {
     fn exec_insert(&self, table: &str, columns: Option<Vec<String>>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
         let rows_to_insert: Vec<Vec<Value>> = match source {
             InsertSource::Values(values) => {
-                let table_data = {
-                    let tables = self.tables.read();
-                    tables.get(table)
-                        .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                        .clone()
-                };
+                let table_data = self.get_table(table)?;
                 let num_cols = table_data.schema.columns.len();
 
                 let col_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
@@ -1672,12 +1759,7 @@ impl QueryEngine {
             }
         };
 
-        let table_data = {
-            let tables = self.tables.read();
-            tables.get(table)
-                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                .clone()
-        };
+        let table_data = self.get_table(table)?;
 
         let table_id = table_data.schema.columns.len() as u32;
         let pk_cols = table_data.schema.primary_key_columns();
@@ -1802,12 +1884,10 @@ impl QueryEngine {
                 }
             }
 
-            {
-                let tup = Tuple::new(row_values.clone());
-                for chk in &table_data.check_exprs {
-                    if !self.eval_check(chk, &tup, &table_data.schema) {
-                        return Err(QueryError::check_violation(table));
-                    }
+            let tuple = Tuple::new(row_values.clone());
+            for chk in &table_data.check_exprs {
+                if !self.eval_check(chk, &tuple, &table_data.schema) {
+                    return Err(QueryError::check_violation(table));
                 }
             }
 
@@ -1832,7 +1912,6 @@ impl QueryEngine {
                 }
             }
 
-            let tuple = Tuple::new(row_values.clone());
             let key = if pk_cols.is_empty() {
                 self.next_rowid(table, &table_data)
             } else {
@@ -1889,7 +1968,7 @@ impl QueryEngine {
                 });
                 let snapshot = self.txn_manager.get_snapshot(tid)
                     .map_err(|e| QueryError::Execution(e.to_string()))?;
-                table_data.version_store.insert(key.clone(), tuple.clone(), tid, snapshot.start_ts);
+                table_data.version_store.insert(key.clone(), tuple, tid, snapshot.start_ts);
                 self.ssi_write(Some(tid), table, &key);
             }
 
@@ -1915,12 +1994,7 @@ impl QueryEngine {
     }
 
     fn exec_update(&self, table: &str, assignments: Vec<(String, Expr)>, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
-        let table_data = {
-            let tables = self.tables.read();
-            tables.get(table)
-                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                .clone()
-        };
+        let table_data = self.get_table(table)?;
 
         let table_id = table_data.schema.columns.len() as u32;
 
@@ -2084,12 +2158,7 @@ impl QueryEngine {
     }
 
     fn exec_delete(&self, table: &str, filter: Option<Expr>, returning: Option<Vec<SelectColumn>>, txn_id: Option<TxnId>) -> Result<ExecutionResult> {
-        let table_data = {
-            let tables = self.tables.read();
-            tables.get(table)
-                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                .clone()
-        };
+        let table_data = self.get_table(table)?;
 
         let table_id = table_data.schema.columns.len() as u32;
 
@@ -2352,7 +2421,7 @@ impl QueryEngine {
         let schema = Schema::new(name, col_schemas);
         let index = Arc::new(BPlusTree::new(name, 64));
         let version_store = Arc::new(VersionStore::new());
-        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new(), secondary_indexes: Vec::new(), write_lock: Arc::new(parking_lot::Mutex::new(())) };
+        let table_data = TableData { schema, index, version_store, check_exprs: Vec::new(), sequences: HashMap::new(), secondary_indexes: Vec::new(), write_lock: Arc::new(parking_lot::Mutex::new(())), last_access: AtomicU64::new(0) };
 
         for (i, row) in rows.into_iter().enumerate() {
             let tuple = Tuple::new(row);
@@ -2420,12 +2489,7 @@ impl QueryEngine {
         limit: Option<usize>,
         txn_id: Option<TxnId>,
     ) -> Result<ExecutionResult> {
-        let table_data = {
-            let tables = self.tables.read();
-            tables.get(table)
-                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                .clone()
-        };
+        let table_data = self.get_table(table)?;
 
         let sec = table_data.secondary_indexes.iter().find(|s| s.name == index_name).cloned();
         let safe = txn_id.is_none() || table_data.version_store.key_count() == 0;
@@ -2515,12 +2579,7 @@ impl QueryEngine {
             return self.exec_information_schema_columns(filter);
         }
 
-        let table_data = {
-            let tables = self.tables.read();
-            tables.get(table)
-                .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?
-                .clone()
-        };
+        let table_data = self.get_table(table)?;
 
         let col_names: Vec<String> = table_data.schema.columns.iter()
             .map(|c| c.name.clone())
@@ -2645,7 +2704,7 @@ impl QueryEngine {
                 && filter.is_some()
                 && table_data.index.approx_len() >= PARALLEL_SCAN_THRESHOLD
             {
-                let leaves = table_data.index.collect_leaves();
+                let leaves = table_data.index.collect_leaf_values();
                 let parallel_rows = self.parallel_filter_leaves(
                     leaves,
                     schema,
@@ -2755,9 +2814,7 @@ impl QueryEngine {
     }
 
     fn exec_scan_top_n(&self, table: &str, filter: Option<&Expr>, txn_id: Option<TxnId>, order_by: &[OrderByExpr], n: usize) -> Result<ExecutionResult> {
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = self.get_table(table)?;
 
         let col_names: Vec<String> = table_data.schema.columns.iter()
             .map(|c| c.name.clone())
@@ -5327,9 +5384,7 @@ impl QueryEngine {
     }
 
     fn collect_table_rows(&self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-        let tables = self.tables.read();
-        let td = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let td = self.get_table(table)?;
         let col_names: Vec<String> = td.schema.columns.iter().map(|c| c.name.clone()).collect();
         let entries = td.index.scan_all()
             .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -5549,9 +5604,7 @@ impl QueryEngine {
     }
 
     pub fn bulk_insert(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = self.get_table(table)?;
 
         let pk_cols = table_data.schema.primary_key_columns();
         let mut count = 0u64;
@@ -5575,9 +5628,7 @@ impl QueryEngine {
         _txn_id: Option<TxnId>,
         limit: Option<usize>,
     ) -> Result<ExecutionResult> {
-        let tables = self.tables.read();
-        let table_data = tables.get(table)
-            .ok_or_else(|| QueryError::Execution(format!("Table '{}' not found", table)))?;
+        let table_data = self.get_table(table)?;
 
         let col_names: Vec<String> = table_data.schema.columns.iter()
             .map(|c| c.name.clone())
