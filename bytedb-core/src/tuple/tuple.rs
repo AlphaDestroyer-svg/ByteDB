@@ -189,6 +189,7 @@ const TAG_DATE: u8 = 8;
 const TAG_DECIMAL: u8 = 9;
 const TAG_UUID: u8 = 10;
 const TAG_INTERVAL: u8 = 11;
+const TAG_BLOB_REF: u8 = 22;
 
 fn encode_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
@@ -357,12 +358,77 @@ fn skip_value(data: &[u8], pos: usize) -> Option<usize> {
             let comp_size = u32::from_le_bytes(data[p+8..p+12].try_into().ok()?) as usize;
             Some(p + 13 + comp_size)
         }
+        TAG_BLOB_REF => {
+            if p + 16 > data.len() { return None; }
+            Some(p + 16)
+        }
         TAG_TEXT | TAG_BYTES | TAG_JSON => {
             if p + 4 > data.len() { return None; }
             let len = u32::from_le_bytes(data[p..p+4].try_into().ok()?) as usize;
             Some(p + 4 + len)
         }
         _ => None,
+    }
+}
+
+pub fn column_ranges(data: &[u8]) -> Option<Vec<(usize, usize)>> {
+    if data.is_empty() {
+        return None;
+    }
+    let count = data[0] as usize;
+    let mut pos = 1;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = pos;
+        let end = skip_value(data, pos)?;
+        ranges.push((start, end));
+        pos = end;
+    }
+    Some(ranges)
+}
+
+pub fn has_blob_ref(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let count = data[0] as usize;
+    let mut pos = 1;
+    for _ in 0..count {
+        if pos >= data.len() {
+            return false;
+        }
+        if data[pos] == TAG_BLOB_REF {
+            return true;
+        }
+        match skip_value(data, pos) {
+            Some(n) => pos = n,
+            None => return false,
+        }
+    }
+    false
+}
+
+pub fn collect_blob_refs(data: &[u8], out: &mut Vec<[u8; 16]>) {
+    if data.is_empty() {
+        return;
+    }
+    let count = data[0] as usize;
+    let mut pos = 1;
+    for _ in 0..count {
+        if pos >= data.len() {
+            return;
+        }
+        if data[pos] == TAG_BLOB_REF {
+            if pos + 17 <= data.len() {
+                let mut u = [0u8; 16];
+                u.copy_from_slice(&data[pos + 1..pos + 17]);
+                out.push(u);
+            }
+        }
+        match skip_value(data, pos) {
+            Some(n) => pos = n,
+            None => return,
+        }
     }
 }
 
@@ -468,4 +534,67 @@ pub fn raw_filter_matches(data: &[u8], col_idx: usize, op: u8, literal: &Value) 
         _ => true,
     };
     Some(matches)
+}
+
+#[cfg(test)]
+mod blob_ref_tests {
+    use super::*;
+
+    fn row_with_blob_ref(uuid: &[u8; 16]) -> Vec<u8> {
+        let mut row = Vec::new();
+        row.push(3);
+        row.push(TAG_TEXT);
+        row.extend_from_slice(&(2u32).to_le_bytes());
+        row.extend_from_slice(b"hi");
+        row.push(TAG_BLOB_REF);
+        row.extend_from_slice(uuid);
+        row.push(TAG_INT64);
+        row.extend_from_slice(&(7i64).to_le_bytes());
+        row
+    }
+
+    #[test]
+    fn column_ranges_span_blob_ref() {
+        let uuid = [9u8; 16];
+        let row = row_with_blob_ref(&uuid);
+        let ranges = column_ranges(&row).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], (1, 8));
+        assert_eq!(ranges[1], (8, 25));
+        assert_eq!(ranges[2], (25, 34));
+    }
+
+    #[test]
+    fn skip_value_steps_over_blob_ref() {
+        let uuid = [1u8; 16];
+        let row = row_with_blob_ref(&uuid);
+        assert_eq!(read_int64_at(&row, 2), Some(7));
+        match read_value_at(&row, 0) {
+            Some(Value::Text(s)) => assert_eq!(s, "hi"),
+            other => panic!("expected text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn detect_and_collect_blob_refs() {
+        let uuid = [42u8; 16];
+        let row = row_with_blob_ref(&uuid);
+        assert!(has_blob_ref(&row));
+        let mut out = Vec::new();
+        collect_blob_refs(&row, &mut out);
+        assert_eq!(out, vec![uuid]);
+
+        let plain = Tuple::new(vec![Value::Int64(1), Value::Text("x".into())]).serialize();
+        assert!(!has_blob_ref(&plain));
+        let mut out2 = Vec::new();
+        collect_blob_refs(&plain, &mut out2);
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn decode_of_unresolved_blob_ref_fails_cleanly() {
+        let uuid = [5u8; 16];
+        let row = row_with_blob_ref(&uuid);
+        assert!(Tuple::deserialize_to_vec(&row).is_none());
+    }
 }

@@ -80,7 +80,15 @@ impl BlobStore {
     }
 
     pub fn load(&self, ref_: &BlobRef) -> std::io::Result<Vec<u8>> {
-        let path = self.blob_path(&ref_.uuid);
+        self.load_uuid(&ref_.uuid)
+    }
+
+    pub fn load_bytes(&self, uuid: &[u8; 16]) -> std::io::Result<Vec<u8>> {
+        self.load_uuid(&Uuid::from_bytes(*uuid))
+    }
+
+    fn load_uuid(&self, uuid: &Uuid) -> std::io::Result<Vec<u8>> {
+        let path = self.blob_path(uuid);
         let mut file = File::open(&path)?;
 
         let mut magic = [0u8; 4];
@@ -125,6 +133,51 @@ impl BlobStore {
             fs::remove_file(path)?;
         }
         Ok(())
+    }
+
+    pub fn delete_bytes(&self, uuid: &[u8; 16]) -> std::io::Result<()> {
+        let path = self.blob_path(&Uuid::from_bytes(*uuid));
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn sweep_unreferenced(
+        &self,
+        live: &std::collections::HashSet<[u8; 16]>,
+        min_age: std::time::Duration,
+    ) -> std::io::Result<usize> {
+        let now = std::time::SystemTime::now();
+        let mut removed = 0usize;
+        let rd = match fs::read_dir(&self.blobs_dir) {
+            Ok(rd) => rd,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        for entry in rd {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".blob") else { continue };
+            let Ok(uuid) = Uuid::parse_str(stem) else { continue };
+            if live.contains(uuid.as_bytes()) {
+                continue;
+            }
+            if min_age > std::time::Duration::ZERO {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if now.duration_since(modified).unwrap_or_default() < min_age {
+                            continue;
+                        }
+                    }
+                }
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     fn blob_path(&self, uuid: &Uuid) -> PathBuf {

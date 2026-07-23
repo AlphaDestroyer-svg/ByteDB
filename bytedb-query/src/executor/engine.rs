@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrd};
 use std::cmp::Ordering;
 use std::thread_local;
 
+use bytedb_core::blob::{BlobStore, TAG_BLOB_FILE_REF};
 use bytedb_core::catalog::database::Database;
 use bytedb_core::catalog::table::TableMeta;
 use bytedb_core::index::btree::BPlusTree;
@@ -12,7 +13,7 @@ use bytedb_core::index::secondary::SecondaryIndex;
 use bytedb_core::mvcc::transaction::{IsolationLevel, TransactionManager, TxnId};
 use bytedb_core::mvcc::version_store::VersionStore;
 use bytedb_core::tuple::schema::{Column, Schema};
-use bytedb_core::tuple::tuple::{Tuple, raw_filter_matches, read_int64_at, read_value_at};
+use bytedb_core::tuple::tuple::{Tuple, raw_filter_matches, read_int64_at, read_value_at, column_ranges, has_blob_ref, collect_blob_refs};
 use bytedb_core::tuple::value::{DataType, Value};
 use bytedb_core::wal::log_manager::LogManager;
 use bytedb_core::wal::log_record::LogRecord;
@@ -43,6 +44,10 @@ thread_local! {
 
 fn subquery_depth() -> u32 {
     SUBQUERY_DEPTH.with(|d| d.get())
+}
+
+fn is_spillable_tag(tag: u8) -> bool {
+    matches!(tag, 4 | 5 | 6 | 12 | 13)
 }
 
 fn current_txn_id() -> Option<TxnId> {
@@ -98,6 +103,47 @@ pub enum ExecutionResult {
     Ok(String),
 }
 
+struct BlobCache {
+    map: HashMap<[u8; 16], Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<[u8; 16]>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl BlobCache {
+    fn new() -> Self {
+        BlobCache {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            budget: 0,
+        }
+    }
+
+    fn get(&self, uuid: &[u8; 16]) -> Option<Arc<Vec<u8>>> {
+        self.map.get(uuid).cloned()
+    }
+
+    fn put(&mut self, uuid: [u8; 16], val: Arc<Vec<u8>>) {
+        if self.budget == 0 || val.len() > self.budget || self.map.contains_key(&uuid) {
+            return;
+        }
+        self.bytes += val.len();
+        self.map.insert(uuid, val);
+        self.order.push_back(uuid);
+        while self.bytes > self.budget {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.map.remove(&old) {
+                        self.bytes -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 pub struct QueryEngine {
     database: Arc<Database>,
     txn_manager: Arc<TransactionManager>,
@@ -127,6 +173,8 @@ pub struct QueryEngine {
     subquery_cache: parking_lot::Mutex<HashMap<usize, Arc<Vec<Vec<Value>>>>>,
     pending_subquery_error: parking_lot::Mutex<Option<String>>,
     access_clock: AtomicU64,
+    blob_spill_threshold: AtomicUsize,
+    blob_cache: parking_lot::Mutex<BlobCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +303,8 @@ impl QueryEngine {
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
             pending_subquery_error: parking_lot::Mutex::new(None),
             access_clock: AtomicU64::new(0),
+            blob_spill_threshold: AtomicUsize::new(0),
+            blob_cache: parking_lot::Mutex::new(BlobCache::new()),
         }
     }
 
@@ -285,6 +335,8 @@ impl QueryEngine {
             subquery_cache: parking_lot::Mutex::new(HashMap::new()),
             pending_subquery_error: parking_lot::Mutex::new(None),
             access_clock: AtomicU64::new(0),
+            blob_spill_threshold: AtomicUsize::new(0),
+            blob_cache: parking_lot::Mutex::new(BlobCache::new()),
         }
     }
 
@@ -451,10 +503,15 @@ impl QueryEngine {
                 continue;
             }
             let sec = Arc::new(SecondaryIndex::new(def.name.clone(), col_idxs.clone(), def.unique));
+            let mut needed = col_idxs.clone();
+            needed.sort_unstable();
+            needed.dedup();
             for (pk, data) in &rows {
-                if let Some(values) = Tuple::deserialize_to_vec(data) {
-                    let key_vals: Vec<&Value> = col_idxs.iter().map(|&i| &values[i]).collect();
-                    sec.insert(&key_vals, pk)?;
+                if let Some(tuple) = Tuple::deserialize_columns(data, &needed) {
+                    let key_vals: Vec<&Value> = col_idxs.iter().filter_map(|&i| tuple.get(i)).collect();
+                    if key_vals.len() == col_idxs.len() {
+                        sec.insert(&key_vals, pk)?;
+                    }
                 }
             }
             out.push(sec);
@@ -519,6 +576,14 @@ impl QueryEngine {
         if self.disk_store.is_some() {
             PENDING_DELTAS.with(|p| p.borrow_mut().push((table.to_string(), OP_DEL, key.to_vec(), Vec::new())));
         }
+    }
+
+    fn put_row(&self, td: &TableData, table: &str, key: Vec<u8>, data: Vec<u8>) -> Result<()> {
+        let stored = self.spill_serialized(td, data);
+        self.log_put(table, &key, &stored);
+        td.index.insert(key, stored)
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        Ok(())
     }
 
     fn clear_pending_deltas(&self) {
@@ -696,6 +761,176 @@ impl QueryEngine {
         *self.default_limits.write() = limits;
     }
 
+    pub fn set_blob_config(&self, spill_threshold_bytes: usize, cache_bytes: usize) {
+        let effective = if spill_threshold_bytes == 0 {
+            0
+        } else {
+            spill_threshold_bytes.max(65537)
+        };
+        self.blob_spill_threshold.store(effective, AtomicOrd::Relaxed);
+        self.blob_cache.lock().budget = cache_bytes;
+    }
+
+    fn blob_store(&self) -> Option<BlobStore> {
+        let ds = self.disk_store.as_ref()?;
+        BlobStore::new(&ds.db_dir()).ok()
+    }
+
+    fn load_blob_cached(&self, uuid: &[u8; 16]) -> Option<Arc<Vec<u8>>> {
+        if let Some(v) = self.blob_cache.lock().get(uuid) {
+            return Some(v);
+        }
+        let bs = self.blob_store()?;
+        let bytes = bs.load_bytes(uuid).ok()?;
+        let arc = Arc::new(bytes);
+        self.blob_cache.lock().put(*uuid, Arc::clone(&arc));
+        Some(arc)
+    }
+
+    fn spill_serialized(&self, td: &TableData, data: Vec<u8>) -> Vec<u8> {
+        let threshold = self.blob_spill_threshold.load(AtomicOrd::Relaxed);
+        if threshold == 0 {
+            return data;
+        }
+        let Some(ranges) = column_ranges(&data) else { return data; };
+        let mut protected: std::collections::HashSet<usize> =
+            td.schema.primary_key_columns().into_iter().collect();
+        for sec in &td.secondary_indexes {
+            for &c in &sec.columns {
+                protected.insert(c);
+            }
+        }
+        let needs_spill = ranges.iter().enumerate().any(|(i, (s, e))| {
+            !protected.contains(&i) && is_spillable_tag(data[*s]) && (e - s) > threshold
+        });
+        if !needs_spill {
+            return data;
+        }
+        let Some(bs) = self.blob_store() else { return data; };
+        let mut out = Vec::with_capacity(data.len());
+        out.push(data[0]);
+        for (i, (s, e)) in ranges.into_iter().enumerate() {
+            let slice = &data[s..e];
+            if !protected.contains(&i) && is_spillable_tag(data[s]) && slice.len() > threshold {
+                match bs.store(slice) {
+                    Ok(bref) => {
+                        out.push(TAG_BLOB_FILE_REF);
+                        out.extend_from_slice(bref.uuid.as_bytes());
+                    }
+                    Err(_) => out.extend_from_slice(slice),
+                }
+            } else {
+                out.extend_from_slice(slice);
+            }
+        }
+        out
+    }
+
+    fn resolve_serialized<'a>(&self, data: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if self.disk_store.is_none() || !has_blob_ref(data) {
+            return std::borrow::Cow::Borrowed(data);
+        }
+        let Some(ranges) = column_ranges(data) else {
+            return std::borrow::Cow::Borrowed(data);
+        };
+        let mut out = Vec::with_capacity(data.len() * 2);
+        out.push(data[0]);
+        for (s, e) in ranges {
+            if data[s] == TAG_BLOB_FILE_REF && (e - s) == 17 {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&data[s + 1..s + 17]);
+                match self.load_blob_cached(&uuid) {
+                    Some(bytes) => out.extend_from_slice(&bytes),
+                    None => out.extend_from_slice(&data[s..e]),
+                }
+            } else {
+                out.extend_from_slice(&data[s..e]);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
+    fn decode_row(&self, data: &[u8]) -> Option<Tuple> {
+        Tuple::deserialize(&self.resolve_serialized(data))
+    }
+
+    fn decode_row_vec(&self, data: &[u8]) -> Option<Vec<Value>> {
+        Tuple::deserialize_to_vec(&self.resolve_serialized(data))
+    }
+
+    fn needed_has_blob(&self, data: &[u8], needed: &[usize]) -> bool {
+        if !has_blob_ref(data) {
+            return false;
+        }
+        match column_ranges(data) {
+            Some(r) => needed
+                .iter()
+                .any(|&i| r.get(i).map(|(s, _)| data[*s] == TAG_BLOB_FILE_REF).unwrap_or(false)),
+            None => false,
+        }
+    }
+
+    fn decode_row_cols(&self, data: &[u8], needed: &[usize]) -> Option<Tuple> {
+        if self.needed_has_blob(data, needed) {
+            Tuple::deserialize_columns(&self.resolve_serialized(data), needed)
+        } else {
+            Tuple::deserialize_columns(data, needed)
+        }
+    }
+
+    pub fn gc_blobs(&self, min_age_secs: u64) -> usize {
+        if self.blob_spill_threshold.load(AtomicOrd::Relaxed) == 0 {
+            return 0;
+        }
+        let Some(bs) = self.blob_store() else { return 0; };
+
+        let tds: Vec<(String, Arc<TableData>)> = {
+            let tables = self.tables.read();
+            tables.iter().map(|(n, td)| (n.clone(), Arc::clone(td))).collect()
+        };
+        let resident: std::collections::HashSet<String> =
+            tds.iter().map(|(n, _)| n.clone()).collect();
+
+        let mut refs: Vec<[u8; 16]> = Vec::new();
+        for (_, td) in &tds {
+            if let Ok(entries) = td.index.scan_all() {
+                for (_, data) in &entries {
+                    collect_blob_refs(data, &mut refs);
+                }
+            }
+        }
+
+        if let Some(ds) = self.disk_store.as_ref() {
+            for tcat in ds.list_tables() {
+                if resident.contains(&tcat.name) {
+                    continue;
+                }
+                if let Ok(entries) = ds.load_table_data(&tcat.name) {
+                    for (_, data) in &entries {
+                        collect_blob_refs(data, &mut refs);
+                    }
+                }
+            }
+        }
+
+        for deltas in self.txn_deltas.lock().values() {
+            for (_t, _op, _k, v) in deltas {
+                collect_blob_refs(v, &mut refs);
+            }
+        }
+        for undo in self.txn_undo.lock().values() {
+            for prev in undo.values() {
+                if let Some(pv) = prev {
+                    collect_blob_refs(pv, &mut refs);
+                }
+            }
+        }
+
+        let live: std::collections::HashSet<[u8; 16]> = refs.into_iter().collect();
+        bs.sweep_unreferenced(&live, std::time::Duration::from_secs(min_age_secs))
+            .unwrap_or(0)
+    }
+
     fn build_default_ctx(&self) -> Option<Arc<QueryContext>> {
         let timeout = *self.default_stmt_timeout.read();
         let limits = *self.default_limits.read();
@@ -770,7 +1005,7 @@ impl QueryEngine {
                     if let Some((ci, code, lit)) = &fast_op {
                         match raw_filter_matches(data, *ci, *code, lit) {
                             Some(true) => {
-                                if let Some(t) = Tuple::deserialize(data) {
+                                if let Some(t) = self.decode_row(data) {
                                     out.push(t.into_vec());
                                 }
                                 continue;
@@ -780,9 +1015,9 @@ impl QueryEngine {
                         }
                     }
                     let tuple = if let Some(nc) = needed_columns {
-                        Tuple::deserialize_columns(data, nc)
+                        self.decode_row_cols(data, nc)
                     } else {
-                        Tuple::deserialize(data)
+                        self.decode_row(data)
                     };
                     if let Some(tuple) = tuple {
                         let matches = match filter {
@@ -1364,7 +1599,7 @@ impl QueryEngine {
         let sec = Arc::new(SecondaryIndex::new(ci.name.clone(), col_idxs.clone(), ci.unique));
         let rows = td.index.scan_all().map_err(|e| QueryError::Execution(e.to_string()))?;
         for (pk, data) in &rows {
-            if let Some(values) = Tuple::deserialize_to_vec(data) {
+            if let Some(values) = self.decode_row_vec(data) {
                 let key_vals: Vec<&Value> = col_idxs.iter().filter_map(|&i| values.get(i)).collect();
                 if key_vals.len() == col_idxs.len() {
                     sec.insert(&key_vals, pk).map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -1461,7 +1696,10 @@ impl QueryEngine {
                 for pk in &pks {
                     if let Some(pdata) = parent.index.search(pk)
                         .map_err(|e| QueryError::Execution(e.to_string()))? {
-                        if let Some(pt) = Tuple::deserialize(&pdata) {
+                        let mut needed = parent_idxs.to_vec();
+                        needed.sort_unstable();
+                        needed.dedup();
+                        if let Some(pt) = Tuple::deserialize_columns(&pdata, &needed) {
                             let mut all_eq = true;
                             for (j, pi) in parent_idxs.iter().enumerate() {
                                 if pt.get(*pi) != Some(&child_vals[j]) { all_eq = false; break; }
@@ -1927,8 +2165,8 @@ impl QueryEngine {
                     match &oc.action {
                         ConflictAction::DoNothing => continue,
                         ConflictAction::DoUpdate(assignments) => {
-                            let old_values = Tuple::deserialize_to_vec(existing.as_ref().unwrap());
-                            let mut existing_tuple = Tuple::deserialize(existing.as_ref().unwrap()).unwrap();
+                            let old_values = self.decode_row_vec(existing.as_ref().unwrap());
+                            let mut existing_tuple = self.decode_row(existing.as_ref().unwrap()).unwrap();
                             for (col_name, expr) in assignments {
                                 if let Some(idx) = table_data.schema.column_index(col_name) {
                                     let new_val = self.eval_value(expr, &existing_tuple, &table_data.schema);
@@ -1940,9 +2178,7 @@ impl QueryEngine {
                                 Self::update_secondary_indexes_update(&table_data, ov, &existing_tuple.to_vec(), &key)?;
                             }
                             self.record_undo(txn_id, table, &key, existing.clone());
-                            self.log_put(table, &key, &new_data);
-                            table_data.index.insert(key, new_data)
-                                .map_err(|e| QueryError::Execution(e.to_string()))?;
+                            self.put_row(&table_data, table, key, new_data)?;
                             if returning.is_some() {
                                 returned_rows.push(existing_tuple.to_vec());
                             }
@@ -1975,9 +2211,7 @@ impl QueryEngine {
             Self::update_secondary_indexes_insert(&table_data, &row_values, &key)?;
 
             self.record_undo(txn_id, table, &key, existing.clone());
-            self.log_put(table, &key, &data);
-            table_data.index.insert(key, data)
-                .map_err(|e| QueryError::Execution(e.to_string()))?;
+            self.put_row(&table_data, table, key, data)?;
 
             if returning.is_some() {
                 returned_rows.push(row_values);
@@ -2015,7 +2249,7 @@ impl QueryEngine {
         let _write_guard = table_data.write_lock.lock();
 
         for (key, data) in entries {
-            if let Some(mut tuple) = Tuple::deserialize(&data) {
+            if let Some(mut tuple) = self.decode_row(&data) {
                 let matches = if let Some(ref f) = filter {
                     self.eval_predicate(f, &tuple, &table_data.schema)
                 } else {
@@ -2137,9 +2371,7 @@ impl QueryEngine {
 
                     Self::update_secondary_indexes_update(&table_data, &old_row_values, &tuple.to_vec(), &key)?;
 
-                    self.log_put(table, &key, &new_data);
-                    table_data.index.insert(key, new_data)
-                        .map_err(|e| QueryError::Execution(e.to_string()))?;
+                    self.put_row(&table_data, table, key, new_data)?;
 
                     if returning.is_some() {
                         returned_rows.push(tuple.to_vec());
@@ -2206,7 +2438,7 @@ impl QueryEngine {
         let mut returned_rows: Vec<Vec<Value>> = Vec::new();
 
         for (key, data) in entries {
-            if let Some(tuple) = Tuple::deserialize(&data) {
+            if let Some(tuple) = self.decode_row(&data) {
                 let matches = if let Some(ref f) = filter {
                     self.eval_predicate(f, &tuple, &table_data.schema)
                 } else {
@@ -2256,8 +2488,11 @@ impl QueryEngine {
                                 .map_err(|e| QueryError::Execution(e.to_string()))?,
                         };
 
+                        let mut child_needed = fkr.child_idxs.clone();
+                        child_needed.sort_unstable();
+                        child_needed.dedup();
                         for (ck, cdata) in &candidates {
-                            if let Some(ct) = Tuple::deserialize(cdata) {
+                            if let Some(ct) = Tuple::deserialize_columns(cdata, &child_needed) {
                                 let mut all_eq = true;
                                 for (j, ci) in fkr.child_idxs.iter().enumerate() {
                                     if ct.get(*ci) != Some(&parent_vals[j]) { all_eq = false; break; }
@@ -2282,7 +2517,7 @@ impl QueryEngine {
                             bytedb_core::tuple::schema::FkAction::Cascade => {
                                 let child_prev = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))?;
                                 if let Some(d) = &child_prev {
-                                    if let Some(cvals) = Tuple::deserialize_to_vec(d) {
+                                    if let Some(cvals) = self.decode_row_vec(d) {
                                         Self::update_secondary_indexes_delete(ctd, &cvals, ck);
                                     }
                                 }
@@ -2292,7 +2527,7 @@ impl QueryEngine {
                             }
                             bytedb_core::tuple::schema::FkAction::SetNull => {
                                 if let Some(d) = ctd.index.search(ck).map_err(|e| QueryError::Execution(e.to_string()))? {
-                                    if let Some(mut ct) = Tuple::deserialize(&d) {
+                                    if let Some(mut ct) = self.decode_row(&d) {
                                         let old_vals = ct.to_vec();
                                         for ci in child_idxs {
                                             ct.set(*ci, Value::Null);
@@ -2300,9 +2535,7 @@ impl QueryEngine {
                                         Self::update_secondary_indexes_update(ctd, &old_vals, &ct.to_vec(), ck)?;
                                         let serialized = ct.serialize();
                                         self.record_undo(txn_id, cname, ck, Some(d.clone()));
-                                        self.log_put(cname, ck, &serialized);
-                                        ctd.index.insert(ck.clone(), serialized)
-                                            .map_err(|e| QueryError::Execution(e.to_string()))?;
+                                        self.put_row(ctd, cname, ck.clone(), serialized)?;
                                     }
                                 }
                             }
@@ -2527,7 +2760,7 @@ impl QueryEngine {
                 table_data.index.search(&pk).map_err(|e| QueryError::Execution(e.to_string()))?
             };
             if let Some(data) = data_opt {
-                if let Some(tuple) = Tuple::deserialize(&data) {
+                if let Some(tuple) = self.decode_row(&data) {
                     self.account_scan_row()?;
                     if let Some(f) = filter {
                         if !self.eval_predicate(f, &tuple, &table_data.schema) {
@@ -2591,7 +2824,7 @@ impl QueryEngine {
             if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
                 self.ssi_read(Some(tid), table, &key);
                 if let Some(data) = table_data.read_visible_one(&self.txn_manager, Some(tid), &key)? {
-                    if let Some(tuple) = Tuple::deserialize(&data) {
+                    if let Some(tuple) = self.decode_row(&data) {
                         self.account_scan_row()?;
                         rows.push(tuple.into_vec());
                     }
@@ -2616,7 +2849,7 @@ impl QueryEngine {
                             Some(Some(t)) => t.serialize(),
                         },
                     };
-                    if let Some(tuple) = Tuple::deserialize(&data) {
+                    if let Some(tuple) = self.decode_row(&data) {
                         self.account_scan_row()?;
                         if let Some(f) = filter {
                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
@@ -2634,7 +2867,7 @@ impl QueryEngine {
                             if k.as_slice() >= lo.as_slice() && k.as_slice() <= hi.as_slice() {
                                 if table_data.index.search(k).map_err(|e| QueryError::Execution(e.to_string()))?.is_none() {
                                     let data = t.serialize();
-                                    if let Some(tuple) = Tuple::deserialize(&data) {
+                                    if let Some(tuple) = self.decode_row(&data) {
                                         if let Some(f) = filter {
                                             if !self.eval_predicate(f, &tuple, &table_data.schema) { continue; }
                                         }
@@ -2658,7 +2891,7 @@ impl QueryEngine {
                     if let Some((col_idx, _, ref lit_val)) = fast_filter {
                         match raw_filter_matches(data, col_idx, op_code, lit_val) {
                             Some(true) => {
-                                if let Some(tuple) = Tuple::deserialize(data) {
+                                if let Some(tuple) = self.decode_row(data) {
                                     self.account_scan_row()?;
                                     self.ssi_read(Some(tid), table, key_ref);
                                     rows.push(tuple.into_vec());
@@ -2672,7 +2905,7 @@ impl QueryEngine {
                             None => {}
                         }
                     }
-                    if let Some(tuple) = Tuple::deserialize(data) {
+                    if let Some(tuple) = self.decode_row(data) {
                         self.account_scan_row()?;
                         let matches = if let Some(f) = filter {
                             self.eval_predicate(f, &tuple, &table_data.schema)
@@ -2691,7 +2924,7 @@ impl QueryEngine {
             }
         } else if let Some(key) = self.try_pk_lookup(filter, &table_data.schema) {
             if let Ok(Some(data)) = table_data.index.search(&key) {
-                if let Some(tuple) = Tuple::deserialize(&data) {
+                if let Some(tuple) = self.decode_row(&data) {
                     rows.push(tuple.into_vec());
                 }
             }
@@ -2733,7 +2966,7 @@ impl QueryEngine {
                     }
                     match raw_filter_matches(data, col_idx, op_code, lit_val) {
                         Some(true) => {
-                            if let Some(tuple) = Tuple::deserialize(data) {
+                            if let Some(tuple) = self.decode_row(data) {
                                 rows.push(tuple.into_vec());
                                 if let Some(lim) = scan_limit {
                                     if rows.len() >= lim { return false; }
@@ -2768,7 +3001,7 @@ impl QueryEngine {
                             }
                         }
                     }
-                    if let Some(values) = Tuple::deserialize_to_vec(data) {
+                    if let Some(values) = self.decode_row_vec(data) {
                         rows.push(values);
                     }
                     true
@@ -2785,9 +3018,9 @@ impl QueryEngine {
                         return false;
                     }
                     let tuple = if let Some(nc) = needed_columns {
-                        Tuple::deserialize_columns(data, nc)
+                        self.decode_row_cols(data, nc)
                     } else {
-                        Tuple::deserialize(data)
+                        self.decode_row(data)
                     };
                     if let Some(tuple) = tuple {
                         let matches = if let Some(f) = filter {
@@ -2914,7 +3147,7 @@ impl QueryEngine {
             .filter_map(|(_, idx)| {
                 let data = &kept_data[idx];
                 if data.is_empty() { return None; }
-                let tuple = Tuple::deserialize(data)?;
+                let tuple = self.decode_row(data)?;
                 let k = match tuple.get(sort_col_idx) {
                     Some(Value::Int64(v)) => *v,
                     _ => i64::MIN,
@@ -5337,20 +5570,20 @@ impl QueryEngine {
             match (current, prev) {
                 (Some(cur), Some(pv)) => {
                     if let (Some(cv), Some(pvv)) =
-                        (Tuple::deserialize_to_vec(&cur), Tuple::deserialize_to_vec(pv))
+                        (self.decode_row_vec(&cur), self.decode_row_vec(pv))
                     {
                         let _ = Self::update_secondary_indexes_update(td, &cv, &pvv, key);
                     }
                     let _ = td.index.insert(key.clone(), pv.clone());
                 }
                 (Some(cur), None) => {
-                    if let Some(cv) = Tuple::deserialize_to_vec(&cur) {
+                    if let Some(cv) = self.decode_row_vec(&cur) {
                         Self::update_secondary_indexes_delete(td, &cv, key);
                     }
                     let _ = td.index.delete(key);
                 }
                 (None, Some(pv)) => {
-                    if let Some(pvv) = Tuple::deserialize_to_vec(pv) {
+                    if let Some(pvv) = self.decode_row_vec(pv) {
                         let _ = Self::update_secondary_indexes_insert(td, &pvv, key);
                     }
                     let _ = td.index.insert(key.clone(), pv.clone());
@@ -5390,7 +5623,7 @@ impl QueryEngine {
             .map_err(|e| QueryError::Execution(e.to_string()))?;
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(entries.len());
         for (_, data) in entries {
-            if let Some(t) = Tuple::deserialize(&data) {
+            if let Some(t) = self.decode_row(&data) {
                 rows.push(t.to_vec());
             }
         }
@@ -5555,7 +5788,7 @@ impl QueryEngine {
         for (_lsn, record) in &result.redo_records {
             match record {
                 LogRecord::Insert { txn_id: _, table_id: _, page_id: _, slot: _, data } => {
-                    if let Some(tuple) = Tuple::deserialize(data) {
+                    if let Some(tuple) = self.decode_row(data) {
                         for (_name, td) in tables.iter() {
                             if td.schema.columns.len() == tuple.len() {
                                 let pk_cols = td.schema.primary_key_columns();

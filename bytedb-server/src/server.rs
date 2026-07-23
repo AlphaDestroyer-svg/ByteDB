@@ -143,6 +143,13 @@ impl Server {
             config.max_scan_rows,
             config.max_query_memory_mb.saturating_mul(1024 * 1024),
         );
+        if config.blob_spill_threshold_bytes > 0 {
+            query_engine.set_blob_config(config.blob_spill_threshold_bytes, config.blob_cache_bytes);
+            info!(
+                "Value spill enabled: threshold {} bytes, hot-value cache {} bytes",
+                config.blob_spill_threshold_bytes, config.blob_cache_bytes
+            );
+        }
 
         if let Ok(Some(snapshot)) = snapshot_manager.load_latest() {
             info!("Restoring from snapshot (LSN: {}, {} tables)", snapshot.header.lsn, snapshot.tables.len());
@@ -198,6 +205,23 @@ impl Server {
                 interval,
                 move || {
                     let _ = engine.evict_cold_tables(max_resident);
+                },
+            ));
+        }
+
+        if config.blob_spill_threshold_bytes > 0 && config.blob_gc_interval_secs > 0 {
+            let engine = Arc::clone(&query_engine);
+            let interval = std::time::Duration::from_secs(config.blob_gc_interval_secs);
+            let min_age = config.blob_gc_min_age_secs;
+            info!(
+                "Blob GC enabled: sweeping every {}s, reclaiming blobs unreferenced for at least {}s",
+                interval.as_secs(), min_age
+            );
+            workers.push(bytedb_core::workers::spawn_periodic(
+                "blob-gc",
+                interval,
+                move || {
+                    let _ = engine.gc_blobs(min_age);
                 },
             ));
         }

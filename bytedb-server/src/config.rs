@@ -69,6 +69,18 @@ pub struct Config {
 
     #[arg(long, default_value_t = 60)]
     pub eviction_interval_secs: u64,
+
+    #[arg(long, default_value_t = 0)]
+    pub blob_spill_threshold_bytes: usize,
+
+    #[arg(long, default_value_t = 67108864)]
+    pub blob_cache_bytes: usize,
+
+    #[arg(long, default_value_t = 300)]
+    pub blob_gc_interval_secs: u64,
+
+    #[arg(long, default_value_t = 600)]
+    pub blob_gc_min_age_secs: u64,
 }
 
 impl Config {
