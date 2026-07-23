@@ -4,11 +4,27 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 
 **v0.2** - full storage rewrite to 8KB slotted pages, LRU-K buffer pool, WAL group commit, background workers (WAL flusher, page flusher, checkpoint, vacuum), and a real cost-based optimizer driven by table statistics.
 
+**v0.2.1** - production hardening + opt-in hybrid RAM/disk tiering: TLS, admin authentication, Prometheus metrics, connection/statement timeouts and a per-query resource governor, plus two memory tiers - cold-table eviction and out-of-line large-value storage (TOAST) with a hot-value cache and safe background blob GC. Every new tier defaults **off**, so a plain `bytedb-server` behaves exactly like v0.2 and existing data dirs load unchanged.
+
 > 📖 Doc language: [English](#english) · [Русский](#русский)
 
 ---
 
 ## English
+
+### What's new in v0.2.1
+
+Production hardening plus an opt-in hybrid RAM/disk memory hierarchy. **Every new knob defaults to off** - an unconfigured `bytedb-server` behaves byte-for-byte like v0.2, and existing data dirs load unchanged.
+
+- **TLS** - `--tls-cert` + `--tls-key` (PEM) wrap every client connection with rustls. Requires a build with `--features tls`; if only one flag is given the server refuses to start, and with neither it logs that connections are plaintext.
+- **Admin authentication** - `--admin-password` (or the `BYTEDB_ADMIN_PASSWORD` env var) sets the admin credential, stored as an Argon2 hash. With neither set the server generates a one-time password, logs it once, and warns you to configure a permanent one before production.
+- **Prometheus metrics** - `--metrics-port N` serves `http://<host>:N/metrics` in Prometheus text format: query count / QPS, latency p50/p95/p99 + mean/max, WAL fsync / commit / relaxed-ack counters, current / flushed LSN, and active / max connection gauges.
+- **Connection & statement timeouts** - `--max-connections` caps concurrent clients (excess connections are rejected), `--connection-timeout-secs` closes idle sockets, and `--statement-timeout-ms` aborts any single statement that runs too long.
+- **Per-query resource governor** - `--max-scan-rows` and `--max-query-memory-mb` are enforced inside the hot loops (sequential scan, hash join, hash aggregate, distinct, sort); a runaway query bails out with `ResourceLimit` instead of OOM-ing the process.
+- **Durability from the CLI** - `--durability strict|relaxed` and `--group-commit-delay-us` expose the WAL fsync/commit trade-off (strict fsyncs every commit; relaxed acks first and batches the fsync).
+- **Table-level RAM/disk tiering** - `--max-resident-tables N` keeps only the hottest N tables in RAM; a background evictor drops the coldest (they already persist in the per-table log) and they are lazily reloaded on next access. A table is evicted only when nothing is reading it and it holds no uncommitted state, so committed rows are never lost.
+- **Out-of-line large values (TOAST)** - `--blob-spill-threshold-bytes N` moves column values larger than N (floored at 64 KB) into a compressed external blob, leaving a 16-byte reference in the row. A size-bounded hot-value cache (`--blob-cache-bytes`, default 64 MiB) keeps recently-read values in RAM, and a time-graced background GC (`--blob-gc-interval-secs`, `--blob-gc-min-age-secs`) reclaims only blobs that no resident row, evicted table, or in-flight transaction references. Primary-key and indexed columns are never spilled, so point lookups, ordering and secondary-index scans keep working; pre-existing inline data reads back byte-for-byte.
+- **Multicore throughput** - client queries now run on Tokio's blocking pool, so a heavy query and its internal rayon parallelism no longer starve the I/O reactor; several hot-path allocations and a redundant full-table clone in transactional scans were removed.
 
 ### What's new in v0.2
 
@@ -53,6 +69,9 @@ A hybrid storage engine in Rust: relational SQL + key-value + document, with MVC
 - ✅ Observability: latency histogram (p50/p95/p99/QPS), GC pause metrics, dead-tuple ratio, slow query log, `EXPLAIN ANALYZE`
 - ✅ Durability: strict / relaxed WAL modes, group commit, fsync metrics
 - ✅ Storage hygiene: throttled MVCC vacuum, free-space map, page compaction
+- ✅ Security: optional TLS (rustls), Argon2 admin authentication
+- ✅ Operations: Prometheus `/metrics`, connection & statement timeouts, per-query resource governor (`ResourceLimit`)
+- ✅ Memory tiering (opt-in): cold-table eviction and out-of-line large-value storage (TOAST) with a hot-value cache and time-graced blob GC
 
 ### Architecture
 
@@ -205,8 +224,8 @@ Prebuilt release archives are published on the [GitHub Releases](../../releases)
 Each archive contains `bytedb-server`, `bytedb-client`, and `bytedb-bench`, plus a `.sha256` checksum file. Cutting a release is a one-liner — push a version tag and CI builds and publishes every target:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 ### Build & test
@@ -216,6 +235,56 @@ cargo build --release
 cargo test
 cargo bench -p bytedb-bench
 ```
+
+### Server configuration
+
+`bytedb-server` is configured with command-line flags (`bytedb-server --help`). Everything below is optional; the defaults reproduce v0.2 behaviour. Snapshot flags are documented separately under [Tuning snapshots](#tuning-snapshots).
+
+**Connections & limits**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--host ADDR` | 127.0.0.1 | Bind address. |
+| `--port N` | 7654 | Listen port. |
+| `--data-dir PATH` | ./bytedb_data | Database directory (created if missing). |
+| `--buffer-pool-size N` | 32768 | Buffer-pool capacity in pages. |
+| `--max-connections N` | 128 | Max concurrent clients; excess connections are rejected. |
+| `--connection-timeout-secs N` | 300 | Idle-connection timeout. |
+| `--statement-timeout-ms N` | 0 | Abort any statement exceeding N ms. `0` disables. |
+| `--max-scan-rows N` | 0 | Cap rows scanned per query. `0` disables. |
+| `--max-query-memory-mb N` | 0 | Cap per-query working memory (MB). `0` disables. |
+
+**Durability**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--durability strict\|relaxed` | strict | strict = fsync on every commit; relaxed = ack first, batch the fsync (faster, may lose the last commits on crash). |
+| `--group-commit-delay-us N` | 0 | Group-commit batching window in microseconds. `0` disables. |
+
+**Security**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--admin-password PW` | (generated) | Admin password; also read from `BYTEDB_ADMIN_PASSWORD`. If unset, a one-time password is generated and logged. |
+| `--tls-cert PATH` | - | PEM certificate. Enables TLS together with `--tls-key`. Needs a `--features tls` build. |
+| `--tls-key PATH` | - | PEM private key. |
+
+**Observability**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--metrics-port N` | 0 | Serve Prometheus metrics at `http://<host>:N/metrics`. `0` disables. |
+
+**Memory tiering (opt-in RAM ↔ disk)**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--max-resident-tables N` | 0 | Keep at most N tables in RAM; evict the coldest to disk. `0` = no eviction. |
+| `--eviction-interval-secs N` | 60 | How often the table evictor runs. |
+| `--blob-spill-threshold-bytes N` | 0 | Store column values larger than N (floored at 64 KB) out-of-line. `0` disables. |
+| `--blob-cache-bytes N` | 67108864 | Hot-value cache budget for spilled values (bytes; default 64 MiB). |
+| `--blob-gc-interval-secs N` | 300 | How often orphaned blobs are swept. `0` disables blob GC. |
+| `--blob-gc-min-age-secs N` | 600 | Only reclaim blobs unreferenced for at least this long. |
 
 ### Physical storage layout
 
@@ -334,6 +403,20 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 
 ## Русский
 
+### Что нового в v0.2.1
+
+Продакшн-упрочнение плюс опциональная гибридная иерархия память/диск. **Каждый новый флаг по умолчанию выключен** - ненастроенный `bytedb-server` ведёт себя ровно как v0.2, а существующие data dir загружаются без изменений.
+
+- **TLS** - `--tls-cert` + `--tls-key` (PEM) оборачивают каждое клиентское соединение в rustls. Требуется сборка с `--features tls`; если задан только один флаг, сервер не стартует, а если ни одного - предупреждает, что соединения идут открытым текстом.
+- **Аутентификация администратора** - `--admin-password` (или переменная окружения `BYTEDB_ADMIN_PASSWORD`) задаёт учётные данные администратора, хранимые как Argon2-хеш. Если не задано ни то ни другое, сервер генерирует одноразовый пароль, один раз пишет его в лог и предупреждает настроить постоянный до продакшена.
+- **Метрики Prometheus** - `--metrics-port N` отдаёт `http://<host>:N/metrics` в текстовом формате Prometheus: число запросов / QPS, латентность p50/p95/p99 + среднее/макс, счётчики fsync / commit / relaxed-ack WAL, текущий / сброшенный LSN и gauge активных / максимальных соединений.
+- **Таймауты соединений и стейтментов** - `--max-connections` ограничивает число одновременных клиентов (лишние соединения отклоняются), `--connection-timeout-secs` закрывает простаивающие сокеты, `--statement-timeout-ms` прерывает слишком долгий одиночный стейтмент.
+- **Resource governor на запрос** - `--max-scan-rows` и `--max-query-memory-mb` проверяются внутри горячих циклов (sequential scan, hash join, hash aggregate, distinct, sort); запрос-беглец завершается с `ResourceLimit` вместо OOM процесса.
+- **Durability из CLI** - `--durability strict|relaxed` и `--group-commit-delay-us` выносят компромисс fsync/commit WAL в командную строку (strict fsync-ит каждый commit; relaxed сперва подтверждает, затем батчит fsync).
+- **Тиринг на уровне таблиц (ОЗУ/диск)** - `--max-resident-tables N` держит в ОЗУ только N самых горячих таблиц; фоновый эвиктор вытесняет самые холодные (они уже персистятся в журнале таблицы), и при следующем обращении они лениво подгружаются. Таблица вытесняется только если её никто не читает и в ней нет незакоммиченного состояния - зафиксированные строки не теряются.
+- **Крупные значения на диске (TOAST)** - `--blob-spill-threshold-bytes N` выносит значения колонок больше N (с полом 64 KB) в сжатый внешний blob, оставляя в строке 16-байтную ссылку. Ограниченный по размеру кеш горячих значений (`--blob-cache-bytes`, по умолчанию 64 MiB) держит недавно прочитанные значения в ОЗУ, а фоновый GC с временной отсрочкой (`--blob-gc-interval-secs`, `--blob-gc-min-age-secs`) освобождает только те blob'ы, на которые не ссылается ни одна резидентная строка, вытесненная таблица или незавершённая транзакция. Колонки первичного ключа и индексируемые колонки не выносятся, поэтому точечные лукапы, сортировка и сканы по вторичным индексам продолжают работать; ранее записанные inline-данные читаются байт-в-байт.
+- **Многоядерная пропускная способность** - клиентские запросы теперь выполняются на блокирующем пуле Tokio, поэтому тяжёлый запрос и его внутренний rayon-параллелизм больше не морят голодом I/O-реактор; убраны несколько аллокаций на горячем пути и лишний полный клон таблицы в транзакционных сканах.
+
 ### Что нового в v0.2
 
 - **Slotted pages (8KB)** - файл каждой таблицы - последовательность страниц фиксированного размера с 32-байтным заголовком и слот-директорией.
@@ -377,6 +460,9 @@ Use `--snapshot-format binary` (default, compact) or `--snapshot-format json` (h
 - ✅ Наблюдаемость: гистограмма латентности (p50/p95/p99/QPS), метрики GC-пауз, dead-tuple ratio, slow query log, `EXPLAIN ANALYZE`
 - ✅ Durability: режимы strict / relaxed WAL, group commit, метрики fsync
 - ✅ Гигиена хранения: throttled MVCC vacuum, free-space map, page compaction
+- ✅ Безопасность: опциональный TLS (rustls), Argon2-аутентификация администратора
+- ✅ Эксплуатация: Prometheus `/metrics`, таймауты соединений и стейтментов, resource governor на запрос (`ResourceLimit`)
+- ✅ Тиринг памяти (опционально): вытеснение холодных таблиц и вынос крупных значений на диск (TOAST) с кешем горячих значений и GC blob'ов с отсрочкой
 
 ### Архитектура
 
@@ -518,6 +604,56 @@ cargo build --release
 cargo test
 cargo bench -p bytedb-bench
 ```
+
+### Конфигурация сервера
+
+`bytedb-server` настраивается флагами командной строки (`bytedb-server --help`). Всё ниже опционально; значения по умолчанию воспроизводят поведение v0.2. Флаги снапшотов описаны отдельно в разделе «Настройка снапшотов» ниже.
+
+**Соединения и лимиты**
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--host ADDR` | 127.0.0.1 | Адрес привязки. |
+| `--port N` | 7654 | Порт прослушивания. |
+| `--data-dir PATH` | ./bytedb_data | Директория базы (создаётся при отсутствии). |
+| `--buffer-pool-size N` | 32768 | Ёмкость buffer pool в страницах. |
+| `--max-connections N` | 128 | Максимум одновременных клиентов; лишние соединения отклоняются. |
+| `--connection-timeout-secs N` | 300 | Таймаут простаивающего соединения. |
+| `--statement-timeout-ms N` | 0 | Прервать стейтмент дольше N мс. `0` отключает. |
+| `--max-scan-rows N` | 0 | Лимит просканированных строк на запрос. `0` отключает. |
+| `--max-query-memory-mb N` | 0 | Лимит рабочей памяти на запрос (МБ). `0` отключает. |
+
+**Durability**
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--durability strict\|relaxed` | strict | strict = fsync на каждый commit; relaxed = сперва ack, затем батч fsync (быстрее, но последние коммиты могут потеряться при крэше). |
+| `--group-commit-delay-us N` | 0 | Окно батчинга group-commit в микросекундах. `0` отключает. |
+
+**Безопасность**
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--admin-password PW` | (генерируется) | Пароль администратора; также читается из `BYTEDB_ADMIN_PASSWORD`. Если не задан, генерируется одноразовый и пишется в лог. |
+| `--tls-cert PATH` | - | PEM-сертификат. Включает TLS вместе с `--tls-key`. Нужна сборка с `--features tls`. |
+| `--tls-key PATH` | - | PEM-приватный ключ. |
+
+**Наблюдаемость**
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--metrics-port N` | 0 | Отдавать метрики Prometheus на `http://<host>:N/metrics`. `0` отключает. |
+
+**Тиринг памяти (опционально ОЗУ ↔ диск)**
+
+| Флаг | По умолчанию | Что делает |
+|------|--------------|-----------|
+| `--max-resident-tables N` | 0 | Держать в ОЗУ не более N таблиц; самые холодные вытеснять на диск. `0` = без вытеснения. |
+| `--eviction-interval-secs N` | 60 | Как часто работает эвиктор таблиц. |
+| `--blob-spill-threshold-bytes N` | 0 | Выносить значения колонок больше N (пол 64 KB) на диск. `0` отключает. |
+| `--blob-cache-bytes N` | 67108864 | Бюджет кеша горячих вынесенных значений (байты; по умолчанию 64 MiB). |
+| `--blob-gc-interval-secs N` | 300 | Как часто подметаются осиротевшие blob'ы. `0` отключает GC blob'ов. |
+| `--blob-gc-min-age-secs N` | 600 | Освобождать только blob'ы, не упоминаемые как минимум столько времени. |
 
 ### Физическая структура хранения
 
